@@ -244,10 +244,11 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
       auto *bundle_resource_req = bundle_selector->add_resource_requests();
       *bundle_resource_req->mutable_resources_bundle() = unit_resources;
 
-      // Parse label selector map into LabelSelector proto in ResourceRequest
-      if (!bundle.label_selector().empty()) {
-        ray::LabelSelector selector(bundle.label_selector());
-        selector.ToProto(bundle_resource_req->add_label_selectors());
+      // Copy label selector into ResourceRequest
+      if (bundle.has_bundle_label_selector() &&
+          !bundle.bundle_label_selector().label_constraints().empty()) {
+        bundle_resource_req->add_label_selectors()->CopyFrom(
+            bundle.bundle_label_selector());
       }
 
       // Add the placement constraint.

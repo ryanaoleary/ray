@@ -678,9 +678,11 @@ message Bundle {
   map<string, double> unit_resources = 2;
   // The location of this bundle.
   bytes node_id = 3;
+  // Deprecated map-based label selector. Do not reuse this tag.
+  reserved 4;
   // Label selector associated with this bundle.
   // Populated from bundle_label_selector if provided.
-  LabelSelector label_selector = 4;
+  LabelSelector bundle_label_selector = 5;
 }
 
 message PlacementGroupSpec {
