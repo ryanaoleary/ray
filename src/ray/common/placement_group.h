@@ -95,8 +95,8 @@ class PlacementGroupSpecBuilder {
       const JobID &creator_job_id,
       const ActorID &creator_actor_id,
       bool is_creator_detached_actor,
-      const std::vector<std::unordered_map<std::string, std::string>>
-          &bundle_label_selector = {}) {
+      const std::vector<LabelSelector> &bundle_label_selector = {},
+      const std::vector<PlacementGroupSchedulingOption> &fallback_strategy = {}) {
     message_->set_placement_group_id(placement_group_id.Binary());
     message_->set_name(name);
     message_->set_strategy(strategy);
@@ -116,6 +116,15 @@ class PlacementGroupSpecBuilder {
     // Populate primary strategy bundles.
     PopulateBundles(message_.get(), placement_group_id, bundles, bundle_label_selector);
 
+    // Populate fallback strategy bundles.
+    for (const auto &option : fallback_strategy) {
+      auto *fallback_message = message_->add_fallback_strategy();
+      PopulateBundles(fallback_message,
+                      placement_group_id,
+                      option.bundles,
+                      option.bundle_label_selector);
+    }
+
     return *this;
   }
 
@@ -128,7 +137,7 @@ class PlacementGroupSpecBuilder {
       ProtoMessageType *proto_message,
       const PlacementGroupID &placement_group_id,
       const std::vector<std::unordered_map<std::string, double>> &bundles,
-      const std::vector<std::unordered_map<std::string, std::string>> &label_selectors) {
+      const std::vector<LabelSelector> &label_selectors) {
     for (size_t i = 0; i < bundles.size(); i++) {
       auto *message_bundle = proto_message->add_bundles();
       auto *mutable_bundle_id = message_bundle->mutable_bundle_id();
@@ -143,13 +152,9 @@ class PlacementGroupSpecBuilder {
         }
       }
 
-      // Convert the unordered_map to the LabelSelector proto
+      // Copy the LabelSelector if specified
       if (label_selectors.size() > i) {
-        ray::LabelSelector c_selector;
-        for (const auto &pair : label_selectors[i]) {
-          c_selector.AddConstraint(pair.first, pair.second);
-        }
-        c_selector.ToProto(message_bundle->mutable_bundle_label_selector());
+        label_selectors[i].ToProto(message_bundle->mutable_bundle_label_selector());
       }
     }
   }
