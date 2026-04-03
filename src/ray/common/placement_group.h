@@ -18,6 +18,7 @@
 #include "ray/common/bundle_spec.h"
 #include "ray/common/grpc_util.h"
 #include "ray/common/id.h"
+#include "ray/common/scheduling/label_selector.h"
 #include "src/ray/protobuf/common.pb.h"
 
 namespace ray {
@@ -69,6 +70,11 @@ class PlacementGroupSpecification : public MessageWrapper<rpc::PlacementGroupSpe
   std::vector<BundleSpecification> bundles_;
 };
 
+struct PlacementGroupSchedulingOption {
+  std::unordered_map<std::string, std::string> label_selector;
+  std::vector<std::unordered_map<std::string, double>> bundles;
+};
+
 class PlacementGroupSpecBuilder {
  public:
   PlacementGroupSpecBuilder() : message_(std::make_shared<rpc::PlacementGroupSpec>()) {}
@@ -88,7 +94,9 @@ class PlacementGroupSpecBuilder {
       const ActorID &creator_actor_id,
       bool is_creator_detached_actor,
       const std::vector<std::unordered_map<std::string, std::string>>
-          &bundle_label_selector = {}) {
+          &bundle_label_selector = {},
+      const std::vector<PlacementGroupSchedulingOption>
+          &placement_group_scheduling_options = {}) {
     message_->set_placement_group_id(placement_group_id.Binary());
     message_->set_name(name);
     message_->set_strategy(strategy);
@@ -129,6 +137,36 @@ class PlacementGroupSpecBuilder {
         }
       }
     }
+
+    if (!placement_group_scheduling_options.empty()) {
+      auto *mutable_scheduling_options =
+          message_->mutable_placement_group_scheduling_options();
+      for (const auto &option : placement_group_scheduling_options) {
+        auto *message_option = mutable_scheduling_options->add_options();
+
+        // Convert label selector
+        if (!option.label_selector.empty()) {
+          LabelSelector selector(option.label_selector);
+          selector.ToProto(message_option->mutable_label_selector());
+        }
+
+        // Convert bundles
+        for (size_t i = 0; i < option.bundles.size(); i++) {
+          auto resources = option.bundles[i];
+          auto *message_bundle = message_option->add_bundles();
+          auto *mutable_bundle_id = message_bundle->mutable_bundle_id();
+          mutable_bundle_id->set_bundle_index(i);
+          mutable_bundle_id->set_placement_group_id(placement_group_id.Binary());
+          auto *mutable_unit_resources = message_bundle->mutable_unit_resources();
+          for (const auto &pair : resources) {
+            if (pair.second > 0) {
+              mutable_unit_resources->insert({pair.first, pair.second});
+            }
+          }
+        }
+      }
+    }
+
     return *this;
   }
 

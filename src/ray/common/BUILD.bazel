@@ -323,6 +323,7 @@ ray_cc_library(
     deps = [
         ":bundle_spec",
         ":id",
+        "//src/ray/common/scheduling:label_selector",
         "//src/ray/protobuf:common_cc_proto",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_protobuf//:protobuf",

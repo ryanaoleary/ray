@@ -688,6 +688,10 @@ message PlacementGroupTableData {
   // The node label key that identifies the label domain for this placement group
   // (e.g. "ray.io/gpu-domain"). Empty if the PG does not use label-domain scheduling.
   string label_domain_key = 18;
+  // A list of all scheduling options defining the primary and fallback strategies for scheduling.
+  PlacementGroupSchedulingOptions placement_group_scheduling_options = 19;
+  // The index in placement_group_scheduling_options that is currently being used.
+  int32 active_scheduling_option_index = 20;
 }
 
 message JobTableData {
