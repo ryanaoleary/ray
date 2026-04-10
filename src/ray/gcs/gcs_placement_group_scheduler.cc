@@ -39,6 +39,38 @@ GcsPlacementGroupScheduler::GcsPlacementGroupScheduler(
       cluster_resource_scheduler_(cluster_resource_scheduler),
       raylet_client_pool_(raylet_client_pool) {}
 
+class ScopedResourceMasker {
+ public:
+  ScopedResourceMasker(
+      ClusterResourceScheduler &scheduler,
+      const std::vector<std::shared_ptr<const BundleSpecification>> &bundles)
+      : scheduler_(scheduler) {
+    for (const auto &bundle : bundles) {
+      if (!bundle->NodeId().IsNil()) {
+        scheduler_.GetClusterResourceManager().AddNodeAvailableResources(
+            scheduling::NodeID(bundle->NodeId().Binary()),
+            bundle->GetRequiredResources().GetResourceSet());
+        masked_nodes_.push_back(scheduling::NodeID(bundle->NodeId().Binary()));
+        masked_resources_.push_back(bundle->GetRequiredResources());
+      }
+    }
+  }
+  ~ScopedResourceMasker() {
+    for (size_t i = 0; i < masked_nodes_.size(); ++i) {
+      scheduler_.GetClusterResourceManager().SubtractNodeAvailableResources(
+          masked_nodes_[i], masked_resources_[i]);
+    }
+  }
+
+  ScopedResourceMasker(const ScopedResourceMasker &) = delete;
+  ScopedResourceMasker &operator=(const ScopedResourceMasker &) = delete;
+
+ private:
+  ClusterResourceScheduler &scheduler_;
+  std::vector<scheduling::NodeID> masked_nodes_;
+  std::vector<ResourceRequest> masked_resources_;
+};
+
 void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
     const SchedulePgRequest &request) {
   const auto &placement_group = request.placement_group;
@@ -57,24 +89,23 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
 
   const auto &bundles = placement_group->GetUnplacedBundles();
   const auto &strategy = placement_group->GetStrategy();
+  const auto &all_bundles = placement_group->GetBundles();
+  bool is_scheduling_all_bundles = (bundles.size() == all_bundles.size());
 
   // For label-domain PGs: if ALL bundles are unplaced (total failure), clear the
   // domain assignment so a new domain can be selected. If only some bundles are
   // unplaced (partial failure), we attempt to reschedule the bundles on the same domain.
   if (placement_group->GetLabelDomainKey().has_value()) {
-    const std::vector<std::shared_ptr<const BundleSpecification>> &all_bundles =
-        placement_group->GetBundles();
-    bool is_total_failure = (bundles.size() == all_bundles.size());
-    if (is_total_failure) {
+    if (is_scheduling_all_bundles) {
       placement_group->ClearLabelDomainAssignments();
       RAY_LOG(INFO) << "All bundles for pg " << placement_group->GetPlacementGroupID()
                     << " are unplaced, rescheduling on a new label domain";
     }
   }
 
-  RAY_LOG(DEBUG) << "Scheduling placement group " << placement_group->GetName()
-                 << ", id: " << placement_group->GetPlacementGroupID()
-                 << ", bundles size = " << bundles.size();
+  RAY_LOG(INFO) << "Scheduling placement group " << placement_group->GetName()
+                << ", id: " << placement_group->GetPlacementGroupID()
+                << ", bundles size = " << bundles.size();
 
   std::vector<const ResourceRequest *> resource_request_list;
   resource_request_list.reserve(bundles.size());
@@ -82,9 +113,98 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
     resource_request_list.emplace_back(&bundle->GetRequiredResources());
   }
 
+  const auto &placement_group_scheduling_options =
+      placement_group->GetPlacementGroupSchedulingOptions();
+
+  int start_index = placement_group->GetActiveSchedulingOptionIndex();
+  if (is_scheduling_all_bundles) {
+    start_index = 0;  // Reset to primary strategy
+  }
+
+  SchedulingResult scheduling_result;
+  int used_index = start_index;
+  bool is_feasible = false;
+
   auto scheduling_options = CreateSchedulingOptions(*placement_group, strategy);
-  auto scheduling_result = cluster_resource_scheduler_.SchedulePlacementGroup(
-      resource_request_list, scheduling_options);
+
+  // If we reset to the primary strategy during a full reschedule, econstruct the primary
+  // resource requests to avoid scheduling with stale shapes.
+  std::vector<ResourceRequest> primary_requests;
+  std::vector<const ResourceRequest *> primary_request_ptrs;
+
+  if (is_scheduling_all_bundles &&
+      placement_group->GetActiveSchedulingOptionIndex() > 0 &&
+      placement_group_scheduling_options.size() > 0) {
+    for (const auto &b : placement_group_scheduling_options.Get(0).bundles()) {
+      BundleSpecification bundle_spec(b);
+      primary_requests.push_back(bundle_spec.GetRequiredResources());
+    }
+    for (size_t j = 0; j < primary_requests.size(); ++j) {
+      primary_request_ptrs.push_back(&primary_requests[j]);
+    }
+  } else {
+    // Otherwise, use the in-memory bundles.
+    primary_request_ptrs = resource_request_list;
+  }
+
+  scheduling_result = cluster_resource_scheduler_.SchedulePlacementGroup(
+      primary_request_ptrs, CreateSchedulingOptions(*placement_group, strategy));
+
+  is_feasible = is_feasible || !scheduling_result.status.IsInfeasible();
+
+  bool needs_full_reschedule = false;
+
+  if (!scheduling_result.status.IsSuccess() &&
+      placement_group_scheduling_options.size() > 1) {
+    ScopedResourceMasker resource_masker(cluster_resource_scheduler_, all_bundles);
+
+    for (int i = 0; i < placement_group_scheduling_options.size(); ++i) {
+      if (i == start_index) {
+        continue;
+      }
+
+      const auto &option = placement_group_scheduling_options.Get(i);
+      std::vector<ResourceRequest> fallback_requests;
+      std::vector<const ResourceRequest *> fallback_request_ptrs;
+
+      if (option.bundles_size() > 0) {
+        for (const auto &b : option.bundles()) {
+          BundleSpecification bundle_spec(b);
+          fallback_requests.push_back(bundle_spec.GetRequiredResources());
+        }
+      } else {
+        continue;
+      }
+
+      for (size_t j = 0; j < fallback_requests.size(); ++j) {
+        fallback_request_ptrs.push_back(&fallback_requests[j]);
+      }
+
+      auto fallback_result = cluster_resource_scheduler_.SchedulePlacementGroup(
+          fallback_request_ptrs, CreateSchedulingOptions(*placement_group, strategy));
+
+      is_feasible = is_feasible || !fallback_result.status.IsInfeasible();
+
+      if (fallback_result.status.IsSuccess()) {
+        scheduling_result = fallback_result;
+        used_index = i;
+        needs_full_reschedule = true;
+        break;
+      }
+    }
+  }
+
+  // If the primary or fallback strategy succeeds during a full reschedule,
+  // clean up any lingering stale resources from the old shape.
+  if (needs_full_reschedule ||
+      (is_scheduling_all_bundles && scheduling_result.status.IsSuccess())) {
+    DestroyPlacementGroupBundleResourcesIfExists(placement_group->GetPlacementGroupID());
+    is_scheduling_all_bundles = true;
+  }
+
+  if (scheduling_result.status.IsSuccess()) {
+    placement_group->UpdateActiveSchedulingOptionIndex(used_index);
+  }
 
   auto result_status = scheduling_result.status;
   const auto &selected_nodes = scheduling_result.selected_nodes;
@@ -94,12 +214,11 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
         << "Failed to schedule placement group " << placement_group->GetName()
         << ", id: " << placement_group->GetPlacementGroupID()
         << ", because current resources can't satisfy the required resource. IsFailed: "
-        << result_status.IsFailed() << " IsInfeasible: " << result_status.IsInfeasible()
+        << result_status.IsFailed() << " IsInfeasible: " << !is_feasible
         << " IsPartialSuccess: " << result_status.IsPartialSuccess();
-    bool infeasible = result_status.IsInfeasible();
     // If the placement group creation has failed,
     // but if it is not infeasible, it is retryable to create.
-    failure_callback(placement_group, /*is_feasible*/ !infeasible);
+    failure_callback(placement_group, is_feasible);
     return;
   }
 
@@ -107,7 +226,13 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
                  << placement_group->GetPlacementGroupID()
                  << ". Selected node size: " << selected_nodes.size();
 
-  RAY_CHECK(bundles.size() == selected_nodes.size());
+  std::vector<std::shared_ptr<const BundleSpecification>> current_bundles;
+  if (is_scheduling_all_bundles) {
+    current_bundles = placement_group->GetBundles();
+  } else {
+    current_bundles = bundles;
+  }
+  RAY_CHECK(current_bundles.size() == selected_nodes.size());
 
   if (scheduling_result.selected_label_domain.has_value()) {
     const auto &[label_domain_key, label_domain_value] =
@@ -121,12 +246,12 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
   // Covert to a map of bundle to node.
   ScheduleMap bundle_to_node;
   for (size_t i = 0; i < selected_nodes.size(); ++i) {
-    bundle_to_node[bundles[i]->BundleId()] =
+    bundle_to_node[current_bundles[i]->BundleId()] =
         NodeID::FromBinary(selected_nodes[i].Binary());
   }
 
-  auto lease_status_tracker =
-      std::make_shared<LeaseStatusTracker>(placement_group, bundles, bundle_to_node);
+  auto lease_status_tracker = std::make_shared<LeaseStatusTracker>(
+      placement_group, current_bundles, bundle_to_node);
   RAY_CHECK(placement_group_leasing_in_progress_
                 .emplace(placement_group->GetPlacementGroupID(), lease_status_tracker)
                 .second);
@@ -140,7 +265,7 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
       node_to_bundles;
   for (size_t i = 0; i < selected_nodes.size(); ++i) {
     node_to_bundles[NodeID::FromBinary(selected_nodes[i].Binary())].emplace_back(
-        bundles[i]);
+        current_bundles[i]);
   }
 
   for (const auto &entry : node_to_bundles) {
@@ -175,7 +300,7 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
 
 void GcsPlacementGroupScheduler::DestroyPlacementGroupBundleResourcesIfExists(
     const PlacementGroupID &placement_group_id) {
-  auto &bundle_locations =
+  auto bundle_locations =
       committed_bundle_location_index_.GetBundleLocations(placement_group_id);
   if (bundle_locations.has_value()) {
     // There could be leasing bundles and committed bundles at the same time if placement
@@ -648,7 +773,7 @@ void GcsPlacementGroupScheduler::DestroyPlacementGroupPreparedBundleResources(
 void GcsPlacementGroupScheduler::DestroyPlacementGroupCommittedBundleResources(
     const PlacementGroupID &placement_group_id) {
   // Get the locations of committed bundles.
-  const auto &maybe_bundle_locations =
+  auto maybe_bundle_locations =
       committed_bundle_location_index_.GetBundleLocations(placement_group_id);
   if (maybe_bundle_locations.has_value()) {
     const auto &committed_bundle_locations = maybe_bundle_locations.value();

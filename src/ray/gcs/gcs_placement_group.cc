@@ -61,7 +61,6 @@ std::string GcsPlacementGroup::GetRayNamespace() const {
 
 std::vector<std::shared_ptr<const BundleSpecification>> &GcsPlacementGroup::GetBundles()
     const {
-  // Fill the cache if it wasn't.
   if (cached_bundle_specs_.empty()) {
     const auto &bundles = placement_group_table_data_.bundles();
     for (const auto &bundle : bundles) {
@@ -194,5 +193,42 @@ void GcsPlacementGroup::ClearLabelDomainAssignments() {
   placement_group_table_data_.mutable_label_domain_assignments()->clear();
 }
 
+const google::protobuf::RepeatedPtrField<rpc::PlacementGroupSchedulingOption>
+    &GcsPlacementGroup::GetPlacementGroupSchedulingOptions() const {
+  return placement_group_table_data_.scheduling_options();
+}
+
+int32_t GcsPlacementGroup::GetActiveSchedulingOptionIndex() const {
+  if (placement_group_table_data_.has_active_scheduling_option_index()) {
+    return placement_group_table_data_.active_scheduling_option_index();
+  }
+  return -1;  // pending PG
+}
+
+void GcsPlacementGroup::UpdateActiveSchedulingOptionIndex(int32_t index) {
+  if (!placement_group_table_data_.has_active_scheduling_option_index() ||
+      index != placement_group_table_data_.active_scheduling_option_index()) {
+    placement_group_table_data_.set_active_scheduling_option_index(index);
+    cached_bundle_specs_.clear();
+
+    const auto &options = GetPlacementGroupSchedulingOptions();
+    if (index >= 0 && index < options.size()) {
+      const auto &active_option = options.Get(index);
+      if (active_option.bundles_size() > 0) {
+        placement_group_table_data_.mutable_bundles()->CopyFrom(active_option.bundles());
+
+        // Ensure all bundle IDs are properly populated with the PG ID and index
+        for (int i = 0; i < placement_group_table_data_.bundles_size(); i++) {
+          auto *bundle = placement_group_table_data_.mutable_bundles(i);
+          if (bundle->bundle_id().placement_group_id().empty()) {
+            bundle->mutable_bundle_id()->set_placement_group_id(
+                placement_group_table_data_.placement_group_id());
+            bundle->mutable_bundle_id()->set_bundle_index(i);
+          }
+        }
+      }
+    }
+  }
+}
 }  // namespace gcs
 }  // namespace ray
