@@ -117,15 +117,13 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
       placement_group->GetPlacementGroupSchedulingOptions();
 
   int start_index = placement_group->GetActiveSchedulingOptionIndex();
-  if (is_scheduling_all_bundles) {
+  if (start_index < 0 || is_scheduling_all_bundles) {
     start_index = 0;  // Reset to primary strategy
   }
 
   SchedulingResult scheduling_result;
   int used_index = start_index;
   bool is_feasible = false;
-
-  auto scheduling_options = CreateSchedulingOptions(*placement_group, strategy);
 
   // If we reset to the primary strategy during a full reschedule, econstruct the primary
   // resource requests to avoid scheduling with stale shapes.
@@ -156,7 +154,17 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
 
   if (!scheduling_result.status.IsSuccess() &&
       placement_group_scheduling_options.size() > 1) {
-    ScopedResourceMasker resource_masker(cluster_resource_scheduler_, all_bundles);
+    // Track the currently committed bundles for the ScopedResourceMasker.
+    std::vector<std::shared_ptr<const BundleSpecification>> committed_bundles;
+    auto maybe_committed = committed_bundle_location_index_.GetBundleLocations(
+        placement_group->GetPlacementGroupID());
+    if (maybe_committed.has_value()) {
+      for (const auto &entry : *maybe_committed.value()) {
+        committed_bundles.push_back(entry.second.second);
+      }
+    }
+
+    ScopedResourceMasker resource_masker(cluster_resource_scheduler_, committed_bundles);
 
     for (int i = 0; i < placement_group_scheduling_options.size(); ++i) {
       if (i == start_index) {
