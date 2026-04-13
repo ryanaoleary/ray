@@ -1475,28 +1475,50 @@ class ResourceDemandScheduler(IResourceScheduler):
         for gang_req in sorted(
             gang_requests, key=_sort_gang_resource_requests, reverse=True
         ):
+            scheduled_successfully = False
+
             if gang_req.bundle_selectors:
-                # TODO: @ryanaoleary multiple `bundle_selectors` will be supported
-                # for `fallback_strategy`.
-                requests = gang_req.bundle_selectors[0].resource_requests
+                # Try evaluating each fallback strategy sequentially in strict index order
+                for bundle_selector in gang_req.bundle_selectors:
+                    requests = bundle_selector.resource_requests
+                    requests = ResourceRequestUtil.combine_requests_with_affinity(
+                        requests
+                    )
+
+                    # Try scheduling this specific option
+                    nodes, infeasible = ResourceDemandScheduler._try_schedule(
+                        ctx, requests, ResourceRequestSource.PENDING_DEMAND
+                    )
+
+                    if not infeasible:
+                        # Successfully bin-packed this option, commit to it and stop evaluating fallbacks.
+                        ctx.update(nodes)
+                        scheduled_successfully = True
+                        break
             else:
-                # Use legacy field if `bundle_selectors` not provided.
+                # Legacy fallback for older placement group representations
                 requests = gang_req.requests
-            # Try to combine requests with affinity constraints into the same request.
-            requests = ResourceRequestUtil.combine_requests_with_affinity(requests)
+                requests = ResourceRequestUtil.combine_requests_with_affinity(requests)
 
-            nodes, infeasible = ResourceDemandScheduler._try_schedule(
-                ctx, requests, ResourceRequestSource.PENDING_DEMAND
-            )
+                nodes, infeasible = ResourceDemandScheduler._try_schedule(
+                    ctx, requests, ResourceRequestSource.PENDING_DEMAND
+                )
 
-            if infeasible:
-                # Unable to satisfy the constraint. We will skip the gang request.
-                # Don't update the context.
-                infeasible_gang_requests.append(gang_req)
-                continue
+                if not infeasible:
+                    ctx.update(nodes)
+                    scheduled_successfully = True
 
-            # We are able to satisfy the constraint and thus update the context.
-            ctx.update(nodes)
+            if not scheduled_successfully:
+                # None of the fallback options (or the primary option) could be satisfied.
+                # To ensure we scale up the cluster based on the user's ideal primary request
+                # rather than their worst-case fallback, we strip lower-priority options.
+                if gang_req.bundle_selectors and len(gang_req.bundle_selectors) > 1:
+                    primary_only = GangResourceRequest()
+                    primary_only.CopyFrom(gang_req)
+                    del primary_only.bundle_selectors[1:]
+                    infeasible_gang_requests.append(primary_only)
+                else:
+                    infeasible_gang_requests.append(gang_req)
 
         return infeasible_gang_requests
 

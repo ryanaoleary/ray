@@ -27,6 +27,26 @@
 namespace ray {
 namespace gcs {
 
+namespace {
+
+void PopulateBundleResourceRequest(
+    const rpc::Bundle &bundle,
+    rpc::autoscaler::ResourceRequest *bundle_resource_req,
+    const std::optional<rpc::autoscaler::PlacementConstraint> &pg_constraint) {
+  *bundle_resource_req->mutable_resources_bundle() = bundle.unit_resources();
+
+  if (!bundle.label_selector().empty()) {
+    ray::LabelSelector selector(bundle.label_selector());
+    selector.ToProto(bundle_resource_req->add_label_selectors());
+  }
+
+  if (pg_constraint.has_value()) {
+    bundle_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
+  }
+}
+
+}  // namespace
+
 GcsAutoscalerStateManager::GcsAutoscalerStateManager(
     std::string session_name,
     GcsNodeManager &gcs_node_manager,
@@ -217,17 +237,14 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
     // Add the strategy as detail info for the gang resource request.
     gang_resource_req->set_details(FormatPlacementGroupDetails(pg_data));
 
-    // Create a BundleSelector. Only one BundleSelector will be created for now.
-    // Multiple will be added when we implement the fallback mechanism.
-    auto *bundle_selector = gang_resource_req->add_bundle_selectors();
-
-    // Copy the PG's bundles to the request.
-    const auto &bundles_to_use = (pg_state == rpc::PlacementGroupTableData::PENDING &&
+    // For backward compatibility, keep the legacy requests list populated using the
+    // primary option.
+    const auto &legacy_bundles = (pg_state == rpc::PlacementGroupTableData::PENDING &&
                                   pg_data.scheduling_options().size() > 0)
                                      ? pg_data.scheduling_options()[0].bundles()
                                      : pg_data.bundles();
 
-    for (const auto &bundle : bundles_to_use) {
+    for (const auto &bundle : legacy_bundles) {
       if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
         // We will be skipping **placed** bundle (which has node id associated with it).
         // This is to avoid double counting the bundles that are already placed when
@@ -237,28 +254,38 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
         // to node crashed.
         continue;
       }
-
-      const auto &unit_resources = bundle.unit_resources();
-
-      // Add the resources. This field will be removed after migrating to
-      // use the BundleSelector for GangResourceRequests.
       auto legacy_resource_req = gang_resource_req->add_requests();
-      *legacy_resource_req->mutable_resources_bundle() = unit_resources;
-
-      // Add ResourceRequest for this bundle.
-      auto *bundle_resource_req = bundle_selector->add_resource_requests();
-      *bundle_resource_req->mutable_resources_bundle() = unit_resources;
-
-      // Parse label selector map into LabelSelector proto in ResourceRequest
-      if (!bundle.label_selector().empty()) {
-        ray::LabelSelector selector(bundle.label_selector());
-        selector.ToProto(bundle_resource_req->add_label_selectors());
-      }
-
-      // Add the placement constraint.
+      *legacy_resource_req->mutable_resources_bundle() = bundle.unit_resources();
       if (pg_constraint.has_value()) {
         legacy_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
-        bundle_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
+      }
+    }
+
+    // If we are in RESCHEDULING, we have already committed to a specific strategy index.
+    // To prevent a "split-brain" PG, we bypass the fallback loop entirely and exclusively
+    // use pg_data.bundles(), which the GCS is guaranteed to keep synchronized with the
+    // committed layout.
+    if (pg_state == rpc::PlacementGroupTableData::PENDING &&
+        pg_data.scheduling_options().size() > 0) {
+      for (const auto &option : pg_data.scheduling_options()) {
+        auto *bundle_selector = gang_resource_req->add_bundle_selectors();
+        for (const auto &bundle : option.bundles()) {
+          if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
+            continue;
+          }
+          PopulateBundleResourceRequest(
+              bundle, bundle_selector->add_resource_requests(), pg_constraint);
+        }
+      }
+    } else {
+      // Single bundle selector for RESCHEDULING or PGs without fallback strategies
+      auto *bundle_selector = gang_resource_req->add_bundle_selectors();
+      for (const auto &bundle : pg_data.bundles()) {
+        if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
+          continue;
+        }
+        PopulateBundleResourceRequest(
+            bundle, bundle_selector->add_resource_requests(), pg_constraint);
       }
     }
   }

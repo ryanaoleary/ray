@@ -24,6 +24,7 @@ from ray.autoscaler.v2.schema import AutoscalerInstance, NodeType
 from ray.autoscaler.v2.tests.util import MockEventLogger, make_autoscaler_instance
 from ray.autoscaler.v2.utils import ResourceRequestUtil
 from ray.core.generated.autoscaler_pb2 import (
+    BundleSelector,
     ClusterResourceConstraint,
     GangResourceRequest,
     NodeState,
@@ -70,7 +71,10 @@ def sched_request(
     return SchedulingRequest(
         resource_requests=ResourceRequestUtil.group_by_count(resource_requests),
         gang_resource_requests=[
-            GangResourceRequest(requests=reqs) for reqs in gang_resource_requests
+            GangResourceRequest(
+                bundle_selectors=[BundleSelector(resource_requests=reqs)]
+            )
+            for reqs in gang_resource_requests
         ],
         cluster_resource_constraints=(
             [
@@ -1853,7 +1857,11 @@ def test_bin_pack():
         if anti_affinity:
             infeasible = []
             for r in reply.infeasible_gang_resource_requests:
-                infeasible.append(ResourceRequestUtil.to_resource_maps(r.requests))
+                infeasible.append(
+                    ResourceRequestUtil.to_resource_maps(
+                        r.bundle_selectors[0].resource_requests
+                    )
+                )
             return infeasible
         else:
             return ResourceRequestUtil.to_resource_maps(
@@ -2645,6 +2653,95 @@ def test_pg_with_bundle_infeasible_label_selectors():
 
     assert to_launch == {}
     assert len(reply.infeasible_gang_resource_requests) == 1
+
+
+def test_placement_group_fallback_strategy_sequential_evaluation():
+    AFFINITY = ResourceRequestUtil.PlacementConstraintType.AFFINITY
+    node_type_configs = {
+        "type_gpu": NodeTypeConfig(
+            name="type_gpu",
+            resources={"CPU": 8, "GPU": 1},
+            min_worker_nodes=0,
+            max_worker_nodes=10,
+        ),
+    }
+
+    scheduler = ResourceDemandScheduler()
+
+    # Primary requires 8 GPUs (infeasible), Fallback requires 1 GPU (feasible)
+    primary_req = ResourceRequestUtil.make(
+        {"CPU": 1, "GPU": 8}, constraints=[(AFFINITY, "pg-fallback", "")]
+    )
+    fallback_req = ResourceRequestUtil.make(
+        {"CPU": 1, "GPU": 1}, constraints=[(AFFINITY, "pg-fallback", "")]
+    )
+
+    gang_proto = GangResourceRequest()
+
+    primary_selector = gang_proto.bundle_selectors.add()
+    primary_selector.resource_requests.extend([primary_req])
+
+    fallback_selector = gang_proto.bundle_selectors.add()
+    fallback_selector.resource_requests.extend([fallback_req])
+
+    request = SchedulingRequest(
+        resource_requests=[],
+        gang_resource_requests=[gang_proto],
+        cluster_resource_constraints=[],
+        current_instances=[],
+        node_type_configs=node_type_configs,
+        max_num_nodes=None,
+        idle_timeout_s=None,
+        disable_launch_config_check=False,
+        cloud_resource_availabilities={},
+    )
+
+    reply = scheduler.schedule(request)
+    to_launch, _ = _launch_and_terminate(reply)
+
+    # Should successfully evaluate and choose index 1 (fallback) since index 0 is infeasible.
+    assert to_launch == {"type_gpu": 1}
+    assert len(reply.infeasible_gang_resource_requests) == 0
+
+    # Case 2: Both Primary and Fallback are infeasible
+    fallback_req_infeasible = ResourceRequestUtil.make(
+        {"CPU": 1, "GPU": 4}, constraints=[(AFFINITY, "pg-infeasible", "")]
+    )
+
+    gang_proto_infeasible = GangResourceRequest()
+    sel0 = gang_proto_infeasible.bundle_selectors.add()
+    sel0.resource_requests.extend([primary_req])
+
+    sel1 = gang_proto_infeasible.bundle_selectors.add()
+    sel1.resource_requests.extend([fallback_req_infeasible])
+
+    request_infeasible = SchedulingRequest(
+        resource_requests=[],
+        gang_resource_requests=[gang_proto_infeasible],
+        cluster_resource_constraints=[],
+        current_instances=[],
+        node_type_configs=node_type_configs,
+        max_num_nodes=None,
+        idle_timeout_s=None,
+        disable_launch_config_check=False,
+        cloud_resource_availabilities={},
+    )
+
+    reply_infeasible = scheduler.schedule(request_infeasible)
+    to_launch_infeasible, _ = _launch_and_terminate(reply_infeasible)
+
+    # Since both fail, no nodes should be launched
+    assert to_launch_infeasible == {}
+    # The returned infeasible request should contain the constraints of index 0!
+    assert len(reply_infeasible.infeasible_gang_resource_requests) == 1
+    reported_infeasible = reply_infeasible.infeasible_gang_resource_requests[0]
+    assert len(reported_infeasible.bundle_selectors) == 1
+    assert (
+        reported_infeasible.bundle_selectors[0]
+        .resource_requests[0]
+        .resources_bundle["GPU"]
+        == 8
+    )
 
 
 def test_get_nodes_with_resource_availabilities():
