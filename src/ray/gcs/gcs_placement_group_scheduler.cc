@@ -146,7 +146,8 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
   }
 
   scheduling_result = cluster_resource_scheduler_.SchedulePlacementGroup(
-      primary_request_ptrs, CreateSchedulingOptions(*placement_group, strategy));
+      primary_request_ptrs,
+      CreateSchedulingOptions(*placement_group, strategy, primary_request_ptrs));
 
   is_feasible = is_feasible || !scheduling_result.status.IsInfeasible();
 
@@ -189,7 +190,8 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
       }
 
       auto fallback_result = cluster_resource_scheduler_.SchedulePlacementGroup(
-          fallback_request_ptrs, CreateSchedulingOptions(*placement_group, strategy));
+          fallback_request_ptrs,
+          CreateSchedulingOptions(*placement_group, strategy, fallback_request_ptrs));
 
       is_feasible = is_feasible || !fallback_result.status.IsInfeasible();
 
@@ -623,10 +625,32 @@ GcsPlacementGroupScheduler::CreateSchedulingContext(
   return std::make_unique<BundleSchedulingContext>(std::move(bundle_locations));
 }
 
+namespace {
+std::optional<std::string> ExtractLabelDomainKey(
+    const std::vector<const ResourceRequest *> &active_requests) {
+  if (active_requests.empty()) {
+    return std::nullopt;
+  }
+
+  const auto &selector = active_requests.front()->GetLabelSelector();
+  for (const auto &constraint : selector.GetConstraints()) {
+    if (constraint.GetLabelKey() == kLabelKeyNodeAcceleratorType &&
+        constraint.GetOperator() == LabelSelectorOperator::LABEL_IN &&
+        (constraint.GetLabelValues().contains(kGB300) ||
+         constraint.GetLabelValues().contains(kGB200))) {
+      return kGpuDomainLabelKey;
+    }
+  }
+  return std::nullopt;
+}
+}  // namespace
+
 SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
-    const GcsPlacementGroup &placement_group, rpc::PlacementStrategy strategy) {
+    const GcsPlacementGroup &placement_group,
+    rpc::PlacementStrategy strategy,
+    const std::vector<const ResourceRequest *> &active_requests) {
   std::optional<std::pair<std::string, std::optional<std::string>>> target_label_domain;
-  std::optional<std::string> label_domain = placement_group.GetLabelDomainKey();
+  std::optional<std::string> label_domain = ExtractLabelDomainKey(active_requests);
   if (label_domain.has_value()) {
     const std::string &label_domain_key = label_domain.value();
     std::optional<std::string> label_value =
