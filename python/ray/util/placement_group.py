@@ -269,7 +269,13 @@ def placement_group(
         fallback_strategy,
     )
 
-    return PlacementGroup(placement_group_id)
+    pg = PlacementGroup(placement_group_id)
+    all_options = [bundles]
+    if fallback_strategy:
+        for opt in fallback_strategy:
+            all_options.append(opt.get("bundles", []))
+    pg._scheduling_options_cache = all_options
+    return pg
 
 
 @PublicAPI

@@ -369,10 +369,7 @@ class GlobalState:
         bundles_dict = {}
         bundles_to_node_id = {}
 
-        if (
-            active_index >= 0
-            and len(placement_group_info.scheduling_options) > active_index
-        ):
+        if active_index >= 0 and len(scheduling_options) > active_index:
             active_option_proto = placement_group_info.scheduling_options[active_index]
             if active_option_proto.bundles:
                 bundles_dict = {
@@ -417,11 +414,7 @@ class GlobalState:
                 ].name,
             },
             "scheduling_options": scheduling_options,
-            "active_scheduling_option_index": (
-                placement_group_info.active_scheduling_option_index
-                if placement_group_info.HasField("active_scheduling_option_index")
-                else -1
-            ),
+            "active_scheduling_option_index": active_index,
         }
 
     def _nanoseconds_to_microseconds(self, time_in_nanoseconds):

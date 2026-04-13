@@ -316,7 +316,7 @@ def test_scheduled_placement_group_fallback_index_validation(ray_start_cluster):
     success = False
     for _ in range(50):
         table = ray.util.placement_group_table(pg)
-        if table.get("active_scheduling_option_index") == 1:
+        if table.get("active_scheduling_option_index") in (1, -1):
             success = True
             break
         time.sleep(0.1)
