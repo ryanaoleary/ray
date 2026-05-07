@@ -4,7 +4,7 @@ import logging
 import warnings
 from enum import Enum
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import (
     BaseModel,
@@ -42,7 +42,7 @@ from ray.serve._private.constants import (
     SERVE_LOGGER_NAME,
 )
 from ray.serve._private.utils import validate_ssl_config
-from ray.util.annotations import Deprecated, PublicAPI
+from ray.util.annotations import Deprecated, DeveloperAPI, PublicAPI
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
@@ -707,6 +707,65 @@ class AutoscalingConfig(BaseModel):
 
     def get_target_ongoing_requests(self) -> PositiveFloat:
         return self.target_ongoing_requests
+
+
+@DeveloperAPI(stability="alpha")
+class TPUSliceSpec(BaseModel):
+    """Specification for a TPU slice reservation.
+
+    Mirrors the parameters of ``ray.util.tpu.slice_placement_group``.
+    """
+
+    topology: str = Field(
+        ..., description="TPU pod topology, e.g. '2x2', '4x4', '2x2x2'."
+    )
+    accelerator_version: str = Field(
+        ..., description="TPU accelerator version, e.g. 'v4', 'v5p', 'v6e'."
+    )
+    num_slices: int = Field(default=1, ge=1, description="Number of slices to reserve.")
+    chips_per_vm: Optional[int] = Field(
+        default=None,
+        description=(
+            "Override for chips per host. Defaults to the canonical value "
+            "for the given accelerator_version."
+        ),
+    )
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
+@DeveloperAPI(stability="alpha")
+class AcceleratorConfig(BaseModel):
+    """Structured accelerator configuration for a Serve deployment.
+
+    Populated by user-facing config layers (e.g. ``LLMConfig``) and consumed
+    by Serve's placement-group creation path. Carries enough information for
+    the controller to provision accelerator-specific placement groups (e.g.
+    TPU slice PGs) at replica-spawn time, without the build-time layer
+    needing to talk to Ray's resource APIs.
+    """
+
+    accelerator_type: Literal["tpu"] = Field(
+        ...,
+        description=(
+            "Discriminator for which accelerator-specific config is set. "
+            "Currently only 'tpu' is supported."
+        ),
+    )
+    tpu: Optional[TPUSliceSpec] = Field(
+        default=None,
+        description="TPU slice specification. Required when accelerator_type='tpu'.",
+    )
+
+    @model_validator(mode="after")
+    def _check_discriminator_payload(self):
+        if self.accelerator_type == "tpu" and self.tpu is None:
+            raise ValueError(
+                "AcceleratorConfig.tpu must be set when accelerator_type='tpu'."
+            )
+        return self
+
+    model_config = {"frozen": True, "extra": "forbid"}
 
 
 # Keep in sync with ServeDeploymentMode in dashboard/client/src/type/serve.ts

@@ -22,6 +22,7 @@ from ray.llm._internal.serve.constants import (
     MODEL_RESPONSE_BATCH_TIMEOUT_MS,
     RAYLLM_VLLM_ENGINE_CLS_ENV,
 )
+from ray.llm._internal.serve.core.configs.accelerators import TPUConfig
 from ray.llm._internal.serve.core.configs.llm_config import (
     DiskMultiplexConfig,
     LLMConfig,
@@ -39,6 +40,8 @@ from ray.llm._internal.serve.utils.lora_serve_utils import (
 from ray.llm._internal.serve.utils.server_utils import (
     get_serve_request_id,
 )
+from ray.serve.config import AcceleratorConfig, TPUSliceSpec
+from ray.util.tpu import get_tpu_version_from_type
 
 if TYPE_CHECKING:
     from ray.llm._internal.serve.core.configs.openai_api_models import (
@@ -736,5 +739,24 @@ class LLMServer(LLMServerProtocol):
             **(llm_config.runtime_env if llm_config.runtime_env else {}),
         }
         deployment_options["ray_actor_options"] = ray_actor_options
+
+        if llm_config.accelerator_config is not None and isinstance(
+            llm_config.accelerator_config, TPUConfig
+        ):
+            if not llm_config.accelerator_type:
+                raise ValueError(
+                    "llm_config.accelerator_type must be specified when "
+                    "accelerator_config is a TPUConfig."
+                )
+            version = get_tpu_version_from_type(llm_config.accelerator_type)
+
+            deployment_options["accelerator_config"] = AcceleratorConfig(
+                accelerator_type="tpu",
+                tpu=TPUSliceSpec(
+                    topology=llm_config.accelerator_config.topology,
+                    accelerator_version=version,
+                    num_slices=1,
+                ),
+            )
 
         return deployment_options

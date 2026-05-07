@@ -27,6 +27,7 @@ from ray.serve._private.constants import (
     RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY,
     SERVE_LOGGER_NAME,
 )
+from ray.serve.config import AcceleratorConfig
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import (
     LabelMatchExpressionsT,
@@ -198,6 +199,7 @@ class ReplicaSchedulingRequest:
     placement_group_strategy: Optional[str] = None
     placement_group_bundle_label_selector: Optional[List[Dict[str, str]]] = None
     placement_group_fallback_strategy: Optional[List[Dict[str, Any]]] = None
+    accelerator_config: Optional[AcceleratorConfig] = None
     max_replicas_per_node: Optional[int] = None
     # Gang scheduling fields -- if set, replica should be scheduled on
     # the reserved gang placement group at the specified bundle index.
@@ -636,6 +638,7 @@ class DeploymentScheduler(ABC):
         replica_id = scheduling_request.replica_id
         deployment_id = replica_id.deployment_id
         placement_group = None
+        sp = None
 
         scheduling_strategy = default_scheduling_strategy
 
@@ -651,21 +654,32 @@ class DeploymentScheduler(ABC):
             target_labels = None
             target_node_id = None
         elif scheduling_request.placement_group_bundles is not None:
+            sp = None
             placement_group_strategy = (
                 scheduling_request.placement_group_strategy
                 if scheduling_request.placement_group_strategy
                 else "PACK"
             )
             try:
-                pg = self._create_placement_group_fn(
+                pg_result = self._create_placement_group_fn(
                     CreatePlacementGroupRequest(
                         bundles=scheduling_request.placement_group_bundles,
                         strategy=placement_group_strategy,
                         target_node_id=target_node_id,
                         name=scheduling_request.actor_options["name"],
                         bundle_label_selector=scheduling_request.placement_group_bundle_label_selector,
-                    )
+                    ),
+                    accelerator_config=scheduling_request.accelerator_config,
                 )
+
+                from ray.serve._private.default_impl import _ReplicaPlacementGroup
+
+                if isinstance(pg_result, _ReplicaPlacementGroup):
+                    pg = pg_result.placement_group
+                    sp = pg_result
+                else:
+                    pg = pg_result
+                    sp = None
             except Exception:
                 # We add a defensive exception here, so the controller can
                 # make progress even if the placement group isn't created.
@@ -731,7 +745,9 @@ class DeploymentScheduler(ABC):
             placement_group = scheduling_strategy.placement_group
 
         scheduling_request.status = ReplicaSchedulingRequestStatus.SUCCEEDED
-        scheduling_request.on_scheduled(actor_handle, placement_group=placement_group)
+        scheduling_request.on_scheduled(
+            actor_handle, placement_group=placement_group, placement_group_manager=sp
+        )
         return True
 
     @abstractmethod
@@ -869,6 +885,10 @@ class DeploymentScheduler(ABC):
                         fallback_strategy=fallback_strategy,
                     )
                 )
+                from ray.serve._private.default_impl import _ReplicaPlacementGroup
+
+                if isinstance(pg, _ReplicaPlacementGroup):
+                    pg = pg.placement_group
                 gang_pgs.append(pg)
                 gang_ids.append(gang_id)
                 gang_pg_names.append(pg_name)

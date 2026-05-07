@@ -40,6 +40,7 @@ from ray.serve._private.utils import (
     wait_for_interrupt,
 )
 from ray.serve.config import (
+    AcceleratorConfig,
     AutoscalingConfig,
     DeploymentActorConfig,
     GangSchedulingConfig,
@@ -464,6 +465,7 @@ def deployment(
     user_config: Default[Optional[Any]] = DEFAULT.VALUE,
     max_ongoing_requests: Default[int] = DEFAULT.VALUE,
     max_queued_requests: Default[int] = DEFAULT.VALUE,
+    accelerator_config: Default[Union[Dict, AcceleratorConfig, None]] = DEFAULT.VALUE,
     autoscaling_config: Default[Union[Dict, AutoscalingConfig, None]] = DEFAULT.VALUE,
     graceful_shutdown_wait_loop_s: Default[float] = DEFAULT.VALUE,
     graceful_shutdown_timeout_s: Default[float] = DEFAULT.VALUE,
@@ -639,6 +641,7 @@ def deployment(
         user_config=user_config,
         max_ongoing_requests=max_ongoing_requests,
         max_queued_requests=max_queued_requests,
+        accelerator_config=accelerator_config,
         autoscaling_config=autoscaling_config,
         graceful_shutdown_wait_loop_s=graceful_shutdown_wait_loop_s,
         graceful_shutdown_timeout_s=graceful_shutdown_timeout_s,

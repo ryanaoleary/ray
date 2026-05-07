@@ -779,6 +779,7 @@ class ActorReplicaWrapper:
         self._last_record_routing_stats_time: float = 0.0
         self._has_user_routing_stats_method: bool = False
         self._ingress: bool = False
+        self._replica_pg = None
 
         # Outbound deployments polling state
         self._outbound_deployments: Optional[List[DeploymentID]] = None
@@ -1152,6 +1153,7 @@ class ActorReplicaWrapper:
             placement_group_fallback_strategy=(
                 deployment_info.replica_config.placement_group_fallback_strategy
             ),
+            accelerator_config=deployment_info.deployment_config.accelerator_config,
             max_replicas_per_node=(
                 deployment_info.replica_config.max_replicas_per_node
             ),
@@ -1164,9 +1166,11 @@ class ActorReplicaWrapper:
         self,
         actor_handle: ActorHandle,
         placement_group: Optional[PlacementGroup] = None,
+        placement_group_manager: Optional[Any] = None,
     ):
         self._actor_handle = actor_handle
         self._placement_group = placement_group
+        self._replica_pg = placement_group_manager
 
         if self._is_cross_language:
             self._actor_handle = JavaActorHandleProxy(self._actor_handle)
@@ -1465,6 +1469,9 @@ class ActorReplicaWrapper:
                 )
                 return ReplicaStartupStatus.FAILED, repr(e)
 
+        if self._replica_pg is not None:
+            self._replica_pg.release_reservation_holders()
+
         return ReplicaStartupStatus.SUCCEEDED, None
 
     @property
@@ -1512,15 +1519,22 @@ class ActorReplicaWrapper:
         finally:
             # Remove the placement group both if the actor has already been deleted or
             # it was just killed above.
-            if stopped and self._placement_group is not None:
-                try:
-                    ray.util.remove_placement_group(self._placement_group)
-                except ValueError:
-                    # ValueError thrown from ray.util.remove_placement_group means the
-                    # placement group has already been removed.
-                    logger.debug(
-                        f"Placement group for {self._replica_id} was already removed."
-                    )
+            if stopped:
+                if self._replica_pg is not None:
+                    self._replica_pg.shutdown()
+                    self._replica_pg = None
+                    self._placement_group = None
+                elif self._placement_group is not None:
+                    try:
+                        ray.util.remove_placement_group(self._placement_group)
+                    except ValueError:
+                        # ValueError thrown from ray.util.remove_placement_group means the
+                        # placement group has already been removed.
+                        logger.debug(
+                            f"Placement group for {self._replica_id} was already removed."
+                        )
+                    finally:
+                        self._placement_group = None
 
         return stopped
 

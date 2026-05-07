@@ -420,13 +420,13 @@ class TestAcceleratorConfigLogic:
     @pytest.mark.parametrize(
         "topology,num_devices,accelerator_type_str,expected_bundles_count,expected_chips_per_host",
         [
-            ("1x1", 1, "v6e", 1, 1.0),
-            ("1x1", 1, "v7x", 1, 4.0),
-            ("4x4", 16, "v6e", 4, 4.0),
-            ("2x2x2", 8, "v5p", 2, 4.0),
-            ("2x2", 4, "v5litepod", 1, 4.0),
-            ("2x2x1", 4, "v4", 1, 4.0),
-            ("2x4", 8, "v6e", 1, 8.0),
+            ("1x1", 1, "v6e", 1, 1),
+            ("1x1", 1, "v7x", 1, 4),
+            ("4x4", 16, "v6e", 4, 4),
+            ("2x2x2", 8, "v5p", 2, 4),
+            ("2x2", 4, "v5litepod", 1, 4),
+            ("2x2x1", 4, "v4", 1, 4),
+            ("2x4", 8, "v6e", 1, 8),
         ],
     )
     def test_default_bundles_topology(
@@ -456,6 +456,40 @@ class TestAcceleratorConfigLogic:
             match="`accelerator_type` must be specified when `topology` is present",
         ):
             tpu_accel.default_bundles(num_devices=16, accelerator_type_str=None)
+
+    def test_default_bundles_v6e_4x4(self):
+        """Test that v6e 4x4 topology returns per-host bundles."""
+        tpu_accel = TPUAccelerator(TPUConfig(kind="tpu", topology="4x4"))
+        bundles = tpu_accel.default_bundles(num_devices=16, accelerator_type_str="v6e")
+
+        # 4x4 v6e = 16 chips. 4 chips per host -> 4 hosts.
+        assert len(bundles) == 4
+        for bundle in bundles:
+            assert bundle["TPU"] == 4.0
+            assert "accelerator_type:v6e" in bundle
+
+    def test_default_bundles_v5p_2x2x2(self):
+        """Test that v5p 2x2x2 topology returns per-host bundles."""
+        tpu_accel = TPUAccelerator(TPUConfig(kind="tpu", topology="2x2x2"))
+        bundles = tpu_accel.default_bundles(num_devices=8, accelerator_type_str="v5p")
+
+        # 2x2x2 v5p = 8 chips. 4 chips per host -> 2 hosts.
+        assert len(bundles) == 2
+        for bundle in bundles:
+            assert bundle["TPU"] == 4.0
+            assert "accelerator_type:v5p" in bundle
+
+    def test_default_bundles_single_host_topology(self):
+        """Test that a single-host topology returns a single bundle."""
+        tpu_accel = TPUAccelerator(TPUConfig(kind="tpu", topology="2x2"))
+        bundles = tpu_accel.default_bundles(
+            num_devices=4, accelerator_type_str="v5litepod"
+        )
+
+        # 2x2 v5litepod = 4 chips on 1 host.
+        assert len(bundles) == 1
+        assert bundles[0]["TPU"] == 4.0
+        assert "accelerator_type:v5litepod" in bundles[0]
 
 
 if __name__ == "__main__":

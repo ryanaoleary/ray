@@ -37,11 +37,11 @@ def test_tpu_slice_placement_group_creation_default_resources(ray_tpu_cluster):
     pg_table = placement_group_table(pg)
     assert pg_table["strategy"] == "PACK"
 
-    # 4x4 v6e = 16 chips. We default to 1 TPU chip per bundle.
-    assert len(pg_table["bundles"]) == 16
+    # 4x4 v6e = 16 chips. We default to 4 TPU chips per bundle (per-host).
+    assert len(pg_table["bundles"]) == 4
     for bundle in pg_table["bundles"].values():
         assert "TPU" in bundle
-        assert bundle["TPU"] == 1
+        assert bundle["TPU"] == 4.0
 
     # Let the backend tear down its own resources if it has any
     engine_config.accelerator.shutdown()
@@ -62,7 +62,7 @@ def test_tpu_slice_placement_group_creation_host_resources(ray_tpu_cluster):
         accelerator_config={"kind": "tpu", "topology": "4x4"},
         placement_group_config={
             "strategy": "STRICT_SPREAD",
-            "bundles": [{"TPU": 4}],
+            "bundles": [{"TPU": 4}] * 4,
         },
     )
 
@@ -256,10 +256,10 @@ def test_tpu_serve_deployment_default_chip_level_bundles(ray_tpu_cluster):
     worker_pg = [pg for pg in active_pgs if pg not in head_pgs][0]
 
     assert worker_pg["strategy"] == "PACK"
-    # 4x4 topology = 16 chips. Default is 16 bundles of 1 TPU.
-    assert len(worker_pg["bundles"]) == 16
+    # 4x4 topology = 16 chips. Default is 4 bundles of 4 TPUs (per-host).
+    assert len(worker_pg["bundles"]) == 4
     for bundle in worker_pg["bundles"].values():
-        assert bundle.get("TPU", 0) == 1
+        assert bundle.get("TPU", 0) == 4.0
 
     serve.shutdown()
 

@@ -199,7 +199,7 @@ class TPUAccelerator(AcceleratorBackend):
 
         num_hosts = max(1, num_devices // chips_per_host)
 
-        bundle = {"TPU": float(chips_per_host)}
+        bundle = {"TPU": chips_per_host}
         bundle[format_ray_accelerator_resource(accelerator_type_str)] = 0.001
 
         return [bundle.copy() for _ in range(num_hosts)]
@@ -293,7 +293,3 @@ class TPUAccelerator(AcceleratorBackend):
                 logger.warning(f"Failed to shut down TPU slice PG: {e}")
             finally:
                 self._slice_pg_wrapper = None
-
-    def __del__(self):
-        """Ensure placement groups are cleaned up when this backend is garbage collected."""
-        self.shutdown()
