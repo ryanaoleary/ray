@@ -270,7 +270,13 @@ class LLMServer(LLMServerProtocol):
         """Add the request id to the request."""
         request_id = get_serve_request_id()
         if request_id:
-            request.request_id = request_id
+            try:
+                request.request_id = request_id
+            except ValueError:
+                # Some OpenAI request schemas (Pydantic v2 strict) do not declare a
+                # `request_id` field. The id is also propagated via headers/log context,
+                # so this assignment is best-effort.
+                pass
 
     async def _maybe_resolve_lora_from_multiplex(self) -> None:
         """Handle the lora model for the request."""

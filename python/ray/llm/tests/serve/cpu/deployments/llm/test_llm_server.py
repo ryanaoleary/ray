@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from pydantic import ConfigDict, create_model
 
 from ray import serve
 from ray.llm._internal.serve.core.configs.llm_config import (
@@ -431,6 +432,48 @@ class TestLLMServer:
 
         assert len(chunks) == 1
         assert chunks[0].id == "test_request_id"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra_policy,should_have_request_id,has_request_id_field",
+        [
+            ("forbid", False, False),
+            ("forbid", True, True),
+        ],
+    )
+    async def test_request_id_handling_pydantic_v2(
+        self,
+        mock_llm_config,
+        extra_policy,
+        should_have_request_id,
+        has_request_id_field,
+    ):
+        """Test that request_id assignment is safe against Pydantic v2 schemas."""
+
+        # Dynamically create the model based on parameters
+        fields = {"prompt": (str, ...)}
+        if has_request_id_field:
+            fields["request_id"] = (Optional[str], None)
+
+        TestModel = create_model(
+            "TestModel", **fields, __config__=ConfigDict(extra=extra_policy)
+        )
+
+        request = TestModel(prompt="test")
+        server = LLMServer.sync_init(mock_llm_config, engine_cls=MockVLLMEngine)
+        await server.start()
+
+        serve.context._serve_request_context.set(
+            serve.context._RequestContext(**{"request_id": "test_request_id"})
+        )
+
+        await server._maybe_add_request_id_to_request(request)
+
+        if should_have_request_id:
+            assert hasattr(request, "request_id")
+            assert request.request_id == "test_request_id"
+        else:
+            assert not hasattr(request, "request_id")
 
     @pytest.mark.parametrize("api_type", ["chat", "completion"])
     @pytest.mark.parametrize("stream", [False, True])
