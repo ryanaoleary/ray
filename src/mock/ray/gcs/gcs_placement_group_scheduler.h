@@ -41,6 +41,11 @@ class MockGcsPlacementGroupSchedulerInterface
               (const PlacementGroupID &placement_group_id),
               (override));
   MOCK_METHOD(void,
+              DestroyPlacementGroupBundleIndices,
+              (const PlacementGroupID &placement_group_id,
+               const std::vector<int64_t> &bundle_indices),
+              (override));
+  MOCK_METHOD(void,
               MarkScheduleCancelled,
               (const PlacementGroupID &placement_group_id),
               (override));
@@ -93,6 +98,11 @@ class MockGcsPlacementGroupScheduler : public GcsPlacementGroupScheduler {
   MOCK_METHOD(void,
               DestroyPlacementGroupBundleResourcesIfExists,
               (const PlacementGroupID &placement_group_id),
+              (override));
+  MOCK_METHOD(void,
+              DestroyPlacementGroupBundleIndices,
+              (const PlacementGroupID &placement_group_id,
+               const std::vector<int64_t> &bundle_indices),
               (override));
   MOCK_METHOD(void,
               MarkScheduleCancelled,

@@ -152,24 +152,30 @@ rpc::PlacementGroupStats *GcsPlacementGroup::GetMutableStats() {
   return placement_group_table_data_.mutable_stats();
 }
 
-std::optional<std::vector<std::string>> GcsPlacementGroup::GetTopologyStrategyKeys()
-    const {
-  const auto &entries = placement_group_table_data_.topology_strategy();
-  if (entries.empty()) {
-    return std::nullopt;
-  }
-  std::vector<std::string> keys;
-  for (const auto &layer : entries) {
-    for (const auto &entry : layer.entries()) {
-      if (entry.first != kLabelKeyNodeID) {
-        keys.push_back(entry.first);
+const std::optional<std::vector<std::string>>
+    &GcsPlacementGroup::GetTopologyStrategyKeys() const {
+  if (!topology_strategy_keys_cached_) {
+    const auto &entries = placement_group_table_data_.topology_strategy();
+    if (entries.empty()) {
+      cached_topology_strategy_keys_ = std::nullopt;
+    } else {
+      std::vector<std::string> keys;
+      for (const auto &layer : entries) {
+        for (const auto &entry : layer.entries()) {
+          if (entry.first != kLabelKeyNodeID) {
+            keys.push_back(entry.first);
+          }
+        }
+      }
+      if (keys.empty()) {
+        cached_topology_strategy_keys_ = std::nullopt;
+      } else {
+        cached_topology_strategy_keys_ = std::move(keys);
       }
     }
+    topology_strategy_keys_cached_ = true;
   }
-  if (keys.empty()) {
-    return std::nullopt;
-  }
-  return keys;
+  return cached_topology_strategy_keys_;
 }
 
 std::optional<std::string> GcsPlacementGroup::GetTopologyAssignment(

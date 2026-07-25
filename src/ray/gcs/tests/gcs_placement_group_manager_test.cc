@@ -47,6 +47,10 @@ class MockPlacementGroupScheduler : public gcs::GcsPlacementGroupSchedulerInterf
   MOCK_METHOD1(DestroyPlacementGroupBundleResourcesIfExists,
                void(const PlacementGroupID &placement_group_id));
 
+  MOCK_METHOD2(DestroyPlacementGroupBundleIndices,
+               void(const PlacementGroupID &placement_group_id,
+                    const std::vector<int64_t> &bundle_indices));
+
   MOCK_METHOD1(MarkScheduleCancelled, void(const PlacementGroupID &placement_group_id));
 
   MOCK_METHOD1(

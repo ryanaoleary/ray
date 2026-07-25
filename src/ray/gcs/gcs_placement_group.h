@@ -164,9 +164,7 @@ class GcsPlacementGroup {
 
   rpc::PlacementGroupStats *GetMutableStats();
 
-  /// Get the non-node topology label keys (e.g. {"ray.io/gpu-domain"}), or
-  /// std::nullopt if this PG doesn't use a topology strategy.
-  std::optional<std::vector<std::string>> GetTopologyStrategyKeys() const;
+  const std::optional<std::vector<std::string>> &GetTopologyStrategyKeys() const;
 
   /// Get the topology assignment value selected for `label_key` (e.g. the
   /// chosen ray.io/gpu-domain for this PG).
@@ -249,6 +247,8 @@ class GcsPlacementGroup {
   /// formatted strings for all resources (heavy string operations). To optimize the CPU
   /// usage, we cache bundle specs.
   mutable std::vector<std::shared_ptr<const BundleSpecification>> cached_bundle_specs_;
+  mutable std::optional<std::vector<std::string>> cached_topology_strategy_keys_;
+  mutable bool topology_strategy_keys_cached_ = false;
 
   /// Reference to the counter to use for placement group state metrics tracking.
   std::shared_ptr<CounterMap<rpc::PlacementGroupTableData::PlacementGroupState>> counter_;
