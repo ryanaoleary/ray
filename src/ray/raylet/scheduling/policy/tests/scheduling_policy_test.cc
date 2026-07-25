@@ -1054,6 +1054,244 @@ TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingSpreadTest) {
   ASSERT_EQ(result.selected_nodes.size(), 4);
 }
 
+TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingStrictSpreadPerfectMatch) {
+  // 1. Perfectly matched bipartite graph
+  const std::string kDomainLabelKey = "ray.io/az";
+  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
+  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
+  absl::flat_hash_map<std::string, std::string> az3_labels = {{kDomainLabelKey, "az-3"}};
+
+  nodes.emplace(scheduling::NodeID(0),
+                CreateNodeResourcesWithLabels(2, 2, az1_labels));  // CPU: 2
+  nodes.emplace(scheduling::NodeID(1),
+                CreateNodeResourcesWithLabels(0, 0, az2_labels));  // CPU: 0
+  nodes.emplace(scheduling::NodeID(2),
+                CreateNodeResourcesWithLabels(0, 0, az3_labels));  // CPU: 0
+
+  // Actually let's manually set GPU
+  NodeResources n1 = CreateNodeResourcesWithLabels(2, 2, az1_labels);
+  NodeResources n2 = CreateNodeResourcesWithLabels(2, 2, az2_labels);
+  NodeResources n3 = CreateNodeResourcesWithLabels(2, 2, az3_labels);
+
+  // Make az-1 have 2 CPU, az-2 have 2 GPU, az-3 have 2 CPU + 2 GPU
+  n1.available.Set(ResourceID::GPU(), 0);
+  n1.total.Set(ResourceID::GPU(), 0);
+  n2.available.Set(ResourceID::GPU(), 2);
+  n2.total.Set(ResourceID::GPU(), 2);
+  n3.available.Set(ResourceID::GPU(), 2);
+  n3.total.Set(ResourceID::GPU(), 2);
+
+  nodes.clear();
+  nodes.emplace(scheduling::NodeID(0), n1);
+  nodes.emplace(scheduling::NodeID(1), n2);
+  nodes.emplace(scheduling::NodeID(2), n3);
+
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
+  ResourceRequest req_gpu = ResourceMapToResourceRequest({{"GPU", 2}}, false);
+  ResourceRequest req_both =
+      ResourceMapToResourceRequest({{"CPU", 2}, {"GPU", 2}}, false);
+
+  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_gpu, &req_both};
+
+  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
+  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
+
+  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
+      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
+  options.bundle_group_indices_ = {{0}, {1}, {2}};
+
+  NodeScheduleFn node_schedule_fn =
+      [&](const std::vector<const ResourceRequest *> &reqs,
+          SchedulingOptions opts,
+          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+        return inner_policy.Schedule(reqs, opts, candidate_nodes);
+      };
+
+  // The perfect match:
+  // req_both (CPU+GPU) MUST go to AZ-3.
+  // req_gpu MUST go to AZ-2.
+  // req_cpu MUST go to AZ-1.
+  // All matched perfectly!
+  SchedulingResult result = policy.Schedule(
+      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
+
+  ASSERT_TRUE(result.status.IsSuccess());
+  ASSERT_EQ(result.selected_nodes.size(), 3);
+}
+
+TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingStrictSpreadUnmatched) {
+  // 2. Unmatched vertices (cannot be satisfied)
+  const std::string kDomainLabelKey = "ray.io/az";
+  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
+  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
+  absl::flat_hash_map<std::string, std::string> az3_labels = {{kDomainLabelKey, "az-3"}};
+
+  nodes.clear();
+  nodes.emplace(scheduling::NodeID(0), CreateNodeResourcesWithLabels(2, 2, az1_labels));
+  nodes.emplace(scheduling::NodeID(1), CreateNodeResourcesWithLabels(2, 2, az2_labels));
+  nodes.emplace(scheduling::NodeID(2),
+                CreateNodeResourcesWithLabels(0, 0, az3_labels));  // az-3 is empty
+
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
+  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_cpu, &req_cpu};
+
+  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
+  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
+
+  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
+      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
+  options.bundle_group_indices_ = {{0}, {1}, {2}};
+
+  NodeScheduleFn node_schedule_fn =
+      [&](const std::vector<const ResourceRequest *> &reqs,
+          SchedulingOptions opts,
+          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+        return inner_policy.Schedule(reqs, opts, candidate_nodes);
+      };
+
+  // 3 CPU requests, but only 2 AZs have CPUs. So this is infeasible.
+  SchedulingResult result = policy.Schedule(
+      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
+
+  ASSERT_TRUE(result.status.IsInfeasible());
+}
+
+TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingStrictSpreadDisconnected) {
+  // 3. Disconnected graphs (perfectly fine matching, but bipartite graph is disjoint
+  // components)
+  const std::string kDomainLabelKey = "ray.io/az";
+  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
+  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
+
+  nodes.clear();
+  NodeResources n1 = CreateNodeResourcesWithLabels(2, 2, az1_labels);
+  n1.available.Set(ResourceID::GPU(), 0);
+  n1.total.Set(ResourceID::GPU(), 0);
+  NodeResources n2 = CreateNodeResourcesWithLabels(0, 0, az2_labels);
+  n2.available.Set(ResourceID::GPU(), 2);
+  n2.total.Set(ResourceID::GPU(), 2);
+
+  nodes.emplace(scheduling::NodeID(0), n1);
+  nodes.emplace(scheduling::NodeID(1), n2);
+
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
+  ResourceRequest req_gpu = ResourceMapToResourceRequest({{"GPU", 2}}, false);
+  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_gpu};
+
+  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
+  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
+
+  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
+      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
+  options.bundle_group_indices_ = {{0}, {1}};
+
+  NodeScheduleFn node_schedule_fn =
+      [&](const std::vector<const ResourceRequest *> &reqs,
+          SchedulingOptions opts,
+          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+        return inner_policy.Schedule(reqs, opts, candidate_nodes);
+      };
+
+  // Disjoint bipartite graph:
+  // CPU req -> AZ-1
+  // GPU req -> AZ-2
+  SchedulingResult result = policy.Schedule(
+      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
+
+  ASSERT_TRUE(result.status.IsSuccess());
+  ASSERT_EQ(result.selected_nodes.size(), 2);
+}
+
+TEST_F(SchedulingPolicyTest,
+       HierarchicalBundleSchedulingStrictSpreadMoreNodesThanBundles) {
+  // 4. Graph with more nodes than bundles
+  const std::string kDomainLabelKey = "ray.io/az";
+  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
+  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
+  absl::flat_hash_map<std::string, std::string> az3_labels = {{kDomainLabelKey, "az-3"}};
+
+  nodes.clear();
+  nodes.emplace(scheduling::NodeID(0), CreateNodeResourcesWithLabels(2, 2, az1_labels));
+  nodes.emplace(scheduling::NodeID(1), CreateNodeResourcesWithLabels(2, 2, az2_labels));
+  nodes.emplace(scheduling::NodeID(2), CreateNodeResourcesWithLabels(2, 2, az3_labels));
+
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
+  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_cpu};  // Only 2 bundles
+
+  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
+  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
+
+  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
+      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
+  options.bundle_group_indices_ = {{0}, {1}};  // 2 groups
+
+  NodeScheduleFn node_schedule_fn =
+      [&](const std::vector<const ResourceRequest *> &reqs,
+          SchedulingOptions opts,
+          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+        return inner_policy.Schedule(reqs, opts, candidate_nodes);
+      };
+
+  // 2 groups into 3 AZs should succeed
+  SchedulingResult result = policy.Schedule(
+      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
+
+  ASSERT_TRUE(result.status.IsSuccess());
+  ASSERT_EQ(result.selected_nodes.size(), 2);
+}
+
+TEST_F(SchedulingPolicyTest,
+       HierarchicalBundleSchedulingStrictSpreadMoreBundlesThanNodes) {
+  // 5. Graph with more bundles than nodes
+  const std::string kDomainLabelKey = "ray.io/az";
+  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
+  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
+
+  nodes.clear();
+  nodes.emplace(scheduling::NodeID(0), CreateNodeResourcesWithLabels(2, 2, az1_labels));
+  nodes.emplace(scheduling::NodeID(1), CreateNodeResourcesWithLabels(2, 2, az2_labels));
+
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 1}}, false);
+  std::vector<const ResourceRequest *> req_list = {
+      &req_cpu, &req_cpu, &req_cpu};  // 3 bundles
+
+  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
+  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
+
+  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
+      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
+  options.bundle_group_indices_ = {{0}, {1}, {2}};  // 3 groups
+
+  NodeScheduleFn node_schedule_fn =
+      [&](const std::vector<const ResourceRequest *> &reqs,
+          SchedulingOptions opts,
+          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+        return inner_policy.Schedule(reqs, opts, candidate_nodes);
+      };
+
+  // 3 groups into 2 AZs should fail as INFEASIBLE because STRICT_SPREAD requires
+  // different domains for all groups.
+  SchedulingResult result = policy.Schedule(
+      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
+
+  ASSERT_TRUE(result.status.IsInfeasible());
+}
+
 }  // namespace raylet
 
 }  // namespace ray
