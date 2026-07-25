@@ -89,8 +89,22 @@ struct SchedulingResult {
   // structure will need to be extended.
   // TODO(#61777): Extend to support multiple tiers of topology strategy scheduling.
   std::optional<std::pair<std::string, std::string>> selected_topology_assignment;
+
+  // The per-group topology assignments for hierarchical PGs.
+  // Each entry is <bundle_group_index, <label_key, label_value>>.
+  std::vector<std::pair<int, std::pair<std::string, std::string>>>
+      selected_group_assignments;
 };
 
+/// A callback function type used by hierarchical policies to delegate to a lower-level
+/// policy.
+///
+/// Contract:
+/// 1. The returned `SchedulingResult::selected_nodes` must have the exact same size
+///    as `resource_request_list`, and the element at index `i` must correspond
+///    to the `ResourceRequest` at index `i`.
+/// 2. The function must NOT leave resources subtracted from the cluster manager
+///    before returning. Any temporarily subtracted resources must be restored.
 using NodeScheduleFn =
     std::function<SchedulingResult(const std::vector<const ResourceRequest *> &,
                                    SchedulingOptions,
