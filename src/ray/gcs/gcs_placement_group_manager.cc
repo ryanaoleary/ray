@@ -382,24 +382,35 @@ void GcsPlacementGroupManager::HandleCreatePlacementGroup(
     ray::rpc::CreatePlacementGroupReply *reply,
     ray::rpc::SendReplyCallback send_reply_callback) {
   const auto &spec = request.placement_group_spec();
-  if (spec.topology_strategy_size() > 1) {
-    bool has_groups = false;
-    for (int i = 0; i < spec.bundles_size(); i++) {
-      if (spec.bundles(i).has_bundle_group_index()) {
-        has_groups = true;
-        break;
-      }
+  bool has_grouped_bundles = false;
+  bool has_flat_bundles = false;
+  for (int i = 0; i < spec.bundles_size(); i++) {
+    if (spec.bundles(i).has_bundle_group_index()) {
+      has_grouped_bundles = true;
+    } else {
+      has_flat_bundles = true;
     }
-    if (!has_groups && spec.bundles_size() > 0) {
-      std::ostringstream stream;
-      stream << "Topology strategy requires bundles to be grouped into inner lists "
-             << "where each inner list represents the bundles that must fit within "
-             << "one logical instance of the inner-most topology level. Flat bundle "
-             << "lists are not supported with multi-layer topology strategies.";
-      RAY_LOG(WARNING) << stream.str();
-      GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::Invalid(stream.str()));
-      return;
-    }
+  }
+
+  if (has_grouped_bundles && has_flat_bundles) {
+    std::string error_msg =
+        "Placement groups cannot contain a mix of grouped bundles (bundles with a "
+        "bundle_group_index) and flat bundles. All bundles must either belong to a "
+        "group or none must belong to a group.";
+    RAY_LOG(WARNING) << error_msg;
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::Invalid(error_msg));
+    return;
+  }
+
+  if (spec.topology_strategy_size() > 1 && has_flat_bundles) {
+    std::string error_msg =
+        "Topology strategy requires bundles to be grouped into inner lists "
+        "where each inner list represents the bundles that must fit within "
+        "one logical instance of the inner-most topology level. Flat bundle "
+        "lists are not supported with multi-layer topology strategies.";
+    RAY_LOG(WARNING) << error_msg;
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::Invalid(error_msg));
+    return;
   }
 
   const JobID &job_id =
