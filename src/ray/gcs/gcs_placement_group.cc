@@ -191,5 +191,56 @@ void GcsPlacementGroup::ClearTopologyAssignments() {
   placement_group_table_data_.mutable_topology_assignments()->clear();
 }
 
+std::optional<std::string> GcsPlacementGroup::GetGroupTopologyAssignment(
+    int group_index, const std::string &label_key) const {
+  for (const auto &assignment :
+       placement_group_table_data_.group_topology_assignments()) {
+    if (assignment.bundle_group_index() == group_index) {
+      auto it = assignment.assignments().find(label_key);
+      if (it != assignment.assignments().end()) {
+        return it->second;
+      }
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+void GcsPlacementGroup::SetGroupTopologyAssignment(int group_index,
+                                                   const std::string &label_key,
+                                                   const std::string &label_value) {
+  auto *assignments_list =
+      placement_group_table_data_.mutable_group_topology_assignments();
+  rpc::PlacementGroupTableData::GroupTopologyAssignment *target = nullptr;
+  for (int i = 0; i < assignments_list->size(); i++) {
+    if (assignments_list->Mutable(i)->bundle_group_index() == group_index) {
+      target = assignments_list->Mutable(i);
+      break;
+    }
+  }
+  if (!target) {
+    target = assignments_list->Add();
+    target->set_bundle_group_index(group_index);
+  }
+  (*target->mutable_assignments())[label_key] = label_value;
+}
+
+void GcsPlacementGroup::ClearGroupTopologyAssignments(
+    const std::vector<int> &group_indices) {
+  auto *assignments_list =
+      placement_group_table_data_.mutable_group_topology_assignments();
+  for (int i = assignments_list->size() - 1; i >= 0; i--) {
+    if (std::find(group_indices.begin(),
+                  group_indices.end(),
+                  assignments_list->Get(i).bundle_group_index()) != group_indices.end()) {
+      assignments_list->erase(assignments_list->begin() + i);
+    }
+  }
+}
+
+void GcsPlacementGroup::ClearAllGroupTopologyAssignments() {
+  placement_group_table_data_.mutable_group_topology_assignments()->Clear();
+}
+
 }  // namespace gcs
 }  // namespace ray

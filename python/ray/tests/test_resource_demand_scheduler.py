@@ -1197,6 +1197,47 @@ class TestPlacementGroupScaling:
         assert to_launch == {"p2.8xlarge": 2}
         assert not rem
 
+    def test_hierarchical_strict_spread(self):
+        provider = MockProvider()
+        scheduler = ResourceDemandScheduler(
+            provider,
+            TYPES_A,
+            10,
+            head_node_type="p2.8xlarge",
+            upscaling_speed=1,
+        )
+
+        provider.create_node({}, {TAG_RAY_USER_NODE_TYPE: "p2.8xlarge"}, 2)
+        nodes = provider.non_terminated_nodes({})
+
+        resource_demands = []
+
+        from ray.core.generated.common_pb2 import TopologyStrategyLayer
+
+        pending_placement_groups = [
+            PlacementGroupTableData(
+                state=PlacementGroupTableData.PENDING,
+                strategy=PlacementStrategy.STRICT_SPREAD,
+                bundles=[Bundle(unit_resources={"GPU": 2})] * 3,
+                topology_strategy=[TopologyStrategyLayer(), TopologyStrategyLayer()],
+            ),
+        ]
+        # In a hierarchical placement group, the autoscaler converts the bundles to shapes.
+        # Ensure that it asks for exactly 3 distinct nodes (since we need 3 nodes to STRICT_SPREAD 3 bundles).
+        # We currently have 2 nodes, so it should ask for 1 more.
+        to_launch, rem = scheduler.get_nodes_to_launch(
+            nodes,
+            {},
+            resource_demands,
+            {},
+            pending_placement_groups,
+            {},
+            [],
+            EMPTY_AVAILABILITY_SUMMARY,
+        )
+        assert to_launch == {"p2.8xlarge": 1}
+        assert not rem
+
     def test_many_strict_spreads(self):
         provider = MockProvider()
         scheduler = ResourceDemandScheduler(

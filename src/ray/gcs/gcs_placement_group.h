@@ -180,6 +180,16 @@ class GcsPlacementGroup {
   /// strategy PG becomes unplaced, so a fresh selection can be made).
   void ClearTopologyAssignments();
 
+  std::optional<std::string> GetGroupTopologyAssignment(
+      int group_index, const std::string &label_key) const;
+
+  void SetGroupTopologyAssignment(int group_index,
+                                  const std::string &label_key,
+                                  const std::string &label_value);
+
+  void ClearGroupTopologyAssignments(const std::vector<int> &group_indices);
+  void ClearAllGroupTopologyAssignments();
+
   /**
    * @brief Check if any bundle in this placement group has a bundle_group_index.
    *

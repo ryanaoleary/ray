@@ -218,10 +218,31 @@ void GcsPlacementGroupManager::OnPlacementGroupCreationFailed(
 
   auto stats = placement_group->GetMutableStats();
   if (!is_feasible) {
-    // We will attempt to schedule this placement_group once an eligible node is
-    // registered.
-    stats->set_scheduling_state(rpc::PlacementGroupStats::INFEASIBLE);
-    infeasible_placement_groups_.emplace_back(std::move(placement_group));
+    if (placement_group->GetState() == rpc::PlacementGroupTableData::RESCHEDULING &&
+        placement_group->GetTopologyStrategyKeys().has_value()) {
+      RAY_LOG(WARNING)
+          << "Topology-aware placement group " << placement_group->GetName()
+          << " is infeasible to reschedule on its current topology pins. "
+          << "Self-healing by destroying all placed bundles and resetting to PENDING.";
+      gcs_placement_group_scheduler_->DestroyPlacementGroupBundleResourcesIfExists(
+          placement_group->GetPlacementGroupID());
+      placement_group->ClearAllGroupTopologyAssignments();
+      placement_group->ClearTopologyAssignments();
+
+      for (int i = 0; i < placement_group->GetPlacementGroupTableData().bundles_size();
+           i++) {
+        placement_group->GetMutableBundle(i)->clear_node_id();
+      }
+
+      placement_group->UpdateState(rpc::PlacementGroupTableData::PENDING);
+      stats->set_scheduling_state(rpc::PlacementGroupStats::QUEUED);
+      AddToPendingQueue(std::move(placement_group), /*rank=*/0);
+    } else {
+      // We will attempt to schedule this placement_group once an eligible node is
+      // registered.
+      stats->set_scheduling_state(rpc::PlacementGroupStats::INFEASIBLE);
+      infeasible_placement_groups_.emplace_back(std::move(placement_group));
+    }
   } else {
     auto state = placement_group->GetState();
     RAY_CHECK(state == rpc::PlacementGroupTableData::RESCHEDULING ||
@@ -360,6 +381,27 @@ void GcsPlacementGroupManager::HandleCreatePlacementGroup(
     ray::rpc::CreatePlacementGroupRequest request,
     ray::rpc::CreatePlacementGroupReply *reply,
     ray::rpc::SendReplyCallback send_reply_callback) {
+  const auto &spec = request.placement_group_spec();
+  if (spec.topology_strategy_size() > 1) {
+    bool has_groups = false;
+    for (int i = 0; i < spec.bundles_size(); i++) {
+      if (spec.bundles(i).has_bundle_group_index()) {
+        has_groups = true;
+        break;
+      }
+    }
+    if (!has_groups && spec.bundles_size() > 0) {
+      std::ostringstream stream;
+      stream << "Topology strategy requires bundles to be grouped into inner lists "
+             << "where each inner list represents the bundles that must fit within "
+             << "one logical instance of the inner-most topology level. Flat bundle "
+             << "lists are not supported with multi-layer topology strategies.";
+      RAY_LOG(WARNING) << stream.str();
+      GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::Invalid(stream.str()));
+      return;
+    }
+  }
+
   const JobID &job_id =
       JobID::FromBinary(request.placement_group_spec().creator_job_id());
   auto placement_group = std::make_shared<GcsPlacementGroup>(

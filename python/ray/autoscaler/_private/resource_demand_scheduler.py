@@ -1021,14 +1021,8 @@ def placement_groups_to_resource_demands(
                 resource_demand_vector.append(combined)
         elif placement_group.strategy == PlacementStrategy.STRICT_SPREAD:
             if is_hierarchical:
-                combined_shapes = []
                 for shapes in shapes_by_group.values():
-                    combined = collections.defaultdict(float)
-                    for shape in shapes:
-                        for label, quantity in shape.items():
-                            combined[label] += quantity
-                    combined_shapes.append(combined)
-                unconverted.append(combined_shapes)
+                    resource_demand_vector.extend(shapes)
             else:
                 shapes = []
                 for bundle in placement_group.bundles:
