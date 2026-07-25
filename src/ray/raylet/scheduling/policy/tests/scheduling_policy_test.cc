@@ -1293,6 +1293,57 @@ TEST_F(SchedulingPolicyTest,
   ASSERT_TRUE(result.status.IsInfeasible());
 }
 
+TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingHeterogeneousGroupTest) {
+  const std::string kDomainLabelKey = "ray.io/az";
+  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
+
+  nodes.clear();
+  // Node 0: 3 CPUs
+  scheduling::NodeID node0 = scheduling::NodeID(0);
+  NodeResources res0 = CreateNodeResources(3, 3, 0, 0, 0, 0);
+  res0.labels = az1_labels;
+  nodes.emplace(node0, res0);
+
+  // Node 1: 1 CPU
+  scheduling::NodeID node1 = scheduling::NodeID(1);
+  NodeResources res1 = CreateNodeResources(1, 1, 0, 0, 0, 0);
+  res1.labels = az1_labels;
+  nodes.emplace(node1, res1);
+
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req3 = ResourceMapToResourceRequest(
+      absl::flat_hash_map<std::string, double>{{"CPU", 3}}, false);
+  ResourceRequest req1 = ResourceMapToResourceRequest(
+      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
+
+  // Input order: [1-CPU, 3-CPU]
+  std::vector<const ResourceRequest *> req_list = {&req1, &req3};
+
+  SchedulingOptions options = SchedulingOptions::BundlePack(
+      std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+  options.bundle_group_indices_ = {{0, 1}};
+
+  raylet_scheduling_policy::CompositeBundleSchedulingPolicy policy(
+      *cluster_resource_manager);
+
+  SchedulingResult result =
+      policy.Schedule(req_list, options, GetCandidateNodes(*cluster_resource_manager));
+
+  ASSERT_TRUE(result.status.IsSuccess());
+  ASSERT_EQ(result.selected_nodes.size(), 2);
+
+  // The first bundle (1 CPU) should be placed. It can go on either node.
+  // The second bundle (3 CPU) MUST go on node0.
+  // Wait, if it packs, the 3-CPU bundle goes on node0.
+  // The 1-CPU bundle will also go on node0 because PACK will fit it there, EXCEPT node0
+  // only has 3 CPUs total! Wait, if node0 has 3 CPUs, it can't fit BOTH 3-CPU and 1-CPU.
+  // So the 1-CPU bundle MUST go on node1.
+  // Let's assert exactly that.
+  ASSERT_EQ(result.selected_nodes[0], node1);
+  ASSERT_EQ(result.selected_nodes[1], node0);
+}
+
 }  // namespace raylet
 
 }  // namespace ray
