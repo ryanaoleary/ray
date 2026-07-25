@@ -533,7 +533,7 @@ def _validate_topology_strategy(
     else:
         layers = topology_strategy
 
-    for layer in layers:
+    for i, layer in enumerate(layers):
         if not isinstance(layer, dict):
             raise ValueError(
                 "`topology_strategy` layers must be dicts, "
@@ -561,7 +561,7 @@ def _validate_topology_strategy(
                 )
             if not key == NODE_ID_LABEL_KEY:
                 topology_label_keys.append(key)
-                if layer is not layers[0] and value not in ["STRICT_PACK", "PACK"]:
+                if i > 0 and value not in ["STRICT_PACK", "PACK"]:
                     raise ValueError(
                         f"Invalid strategy {value!r} for inner topology label {key!r}. "
                         "Inner custom topology layers currently only support "

@@ -57,10 +57,13 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
           opts.topology_scheduling_strategy_ =
               !inner_domain.first.empty() ? TopologySchedulingStrategy::STRICT_PACK
                                           : TopologySchedulingStrategy::NONE;
-          RAY_CHECK(inner_domain.first.empty() ||
-                    opts.inner_strategy_ == rpc::PlacementStrategy::STRICT_PACK ||
-                    opts.inner_strategy_ == rpc::PlacementStrategy::PACK)
-              << "Inner topology labels currently only support STRICT_PACK or PACK.";
+          if (!inner_domain.first.empty() &&
+              opts.inner_strategy_ != rpc::PlacementStrategy::STRICT_PACK &&
+              opts.inner_strategy_ != rpc::PlacementStrategy::PACK) {
+            RAY_LOG(ERROR)
+                << "Inner topology labels currently only support STRICT_PACK or PACK.";
+            return SchedulingResult::Failed();
+          }
           return this->Schedule(reqs, std::move(opts), std::move(nodes));
         };
     return hierarchical_bundle_policy_.Schedule(

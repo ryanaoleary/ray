@@ -1022,7 +1022,7 @@ def placement_groups_to_resource_demands(
         elif placement_group.strategy == PlacementStrategy.STRICT_SPREAD:
             if is_hierarchical:
                 for shapes in shapes_by_group.values():
-                    resource_demand_vector.extend(shapes)
+                    unconverted.append(shapes)
             else:
                 shapes = []
                 for bundle in placement_group.bundles:
