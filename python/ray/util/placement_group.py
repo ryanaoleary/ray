@@ -137,7 +137,7 @@ def placement_group(
     lifetime: Optional[str] = None,
     _soft_target_node_id: Optional[str] = None,
     bundle_label_selector: List[Dict[str, str]] = None,
-    topology_strategy: Optional[Dict[str, str]] = None,
+    topology_strategy: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
 ) -> PlacementGroup:
     """Asynchronously creates a PlacementGroup.
 
@@ -486,10 +486,14 @@ def validate_placement_group(
                     idx += 1
                     for k, v in selector.items():
                         if k in group_labels and group_labels[k] != v:
-                            raise ValueError(
-                                f"Conflicting label selector values for key '{k}' "
-                                "within the same bundle group."
-                            )
+                            if node_level_strategy == "STRICT_PACK":
+                                import logging
+
+                                logger = logging.getLogger(__name__)
+                                logger.warning(
+                                    f"Conflicting label selector values for key '{k}' "
+                                    "within the same bundle group. The autoscaler may not provision correctly."
+                                )
                         group_labels[k] = v
 
     if lifetime not in [None, "detached"]:

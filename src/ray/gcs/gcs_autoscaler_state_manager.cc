@@ -251,6 +251,9 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
         gang_resource_req->set_details(FormatPlacementGroupDetails(pg_data));
         auto *bundle_selector = gang_resource_req->add_bundle_selectors();
 
+        const auto group_pg_constraint = GenPlacementConstraintForPlacementGroup(
+            pg_id.Hex() + "_" + std::to_string(group_idx), pg_data.strategy());
+
         if (is_strict_pack) {
           google::protobuf::Map<std::string, double> aggregated_resources;
           std::map<std::string, std::string> aggregated_label_selectors;
@@ -281,11 +284,11 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
             selector.ToProto(bundle_resource_req->add_label_selectors());
           }
 
-          if (pg_constraint.has_value()) {
+          if (group_pg_constraint.has_value()) {
             legacy_resource_req->add_placement_constraints()->CopyFrom(
-                pg_constraint.value());
+                group_pg_constraint.value());
             bundle_resource_req->add_placement_constraints()->CopyFrom(
-                pg_constraint.value());
+                group_pg_constraint.value());
           }
         } else {
           for (const auto *bundle_ptr : group_bundles) {
@@ -302,11 +305,11 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
               selector.ToProto(bundle_resource_req->add_label_selectors());
             }
 
-            if (pg_constraint.has_value()) {
+            if (group_pg_constraint.has_value()) {
               legacy_resource_req->add_placement_constraints()->CopyFrom(
-                  pg_constraint.value());
+                  group_pg_constraint.value());
               bundle_resource_req->add_placement_constraints()->CopyFrom(
-                  pg_constraint.value());
+                  group_pg_constraint.value());
             }
           }
         }
@@ -330,14 +333,31 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
             locality_constraint->set_label_name(topology_label_key);
             locality_constraint->set_placement_strategy(strategy);
 
-            const auto &assignments = pg_data.topology_assignments();
-            if (auto it = assignments.find(topology_label_key); it != assignments.end()) {
+            std::optional<std::string> pin_value;
+            for (const auto &assignment : pg_data.group_topology_assignments()) {
+              if (assignment.bundle_group_index() == group_idx) {
+                auto it = assignment.assignments().find(topology_label_key);
+                if (it != assignment.assignments().end()) {
+                  pin_value = it->second;
+                }
+                break;
+              }
+            }
+            if (!pin_value.has_value() && group_idx < 0) {
+              const auto &assignments = pg_data.topology_assignments();
+              auto it = assignments.find(topology_label_key);
+              if (it != assignments.end()) {
+                pin_value = it->second;
+              }
+            }
+
+            if (pin_value.has_value()) {
               auto *label_constraint =
                   locality_req->mutable_label_selector()->add_label_constraints();
               label_constraint->set_label_key(topology_label_key);
               label_constraint->set_operator_(
                   rpc::LabelSelectorOperator::LABEL_OPERATOR_IN);
-              label_constraint->add_label_values(it->second);
+              label_constraint->add_label_values(*pin_value);
             }
           }
         }
