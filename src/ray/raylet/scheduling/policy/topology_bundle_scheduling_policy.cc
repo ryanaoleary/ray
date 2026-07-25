@@ -55,7 +55,7 @@ bool TopologySchedulingPolicyInterface::IsRequestFeasible(
 SchedulingResult TopologyStrictPackSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     const SchedulingOptions &options,
-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
+    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
     NodeScheduleFn node_schedule_fn) {
   RAY_CHECK(!resource_request_list.empty());
 
@@ -67,22 +67,21 @@ SchedulingResult TopologyStrictPackSchedulingPolicy::Schedule(
   // schedule the bundles.
   if (options.target_topology_assignment_.second.has_value()) {
     const std::string &target = *options.target_topology_assignment_.second;
-    for (auto it = candidate_nodes.begin(); it != candidate_nodes.end();) {
-      const auto &labels = cluster_resource_manager_.GetNodeLabels(*it);
+    absl::flat_hash_set<scheduling::NodeID> filtered_nodes;
+    for (const auto &node_id : candidate_nodes) {
+      const auto &labels = cluster_resource_manager_.GetNodeLabels(node_id);
       auto label_it = labels.find(label_key);
-      if (label_it == labels.end() || label_it->second != target) {
-        candidate_nodes.erase(it++);
-      } else {
-        ++it;
+      if (label_it != labels.end() && label_it->second == target) {
+        filtered_nodes.insert(node_id);
       }
     }
-    if (!IsRequestFeasible(resource_request_list, candidate_nodes)) {
+    if (!IsRequestFeasible(resource_request_list, filtered_nodes)) {
       RAY_LOG(DEBUG) << "Target topology value '" << target
                      << "' has insufficient resources; infeasible.";
       return SchedulingResult::Infeasible();
     }
     SchedulingResult result =
-        node_schedule_fn(resource_request_list, options, std::move(candidate_nodes));
+        node_schedule_fn(resource_request_list, options, filtered_nodes);
     if (result.status.IsSuccess()) {
       result.selected_topology_assignment =
           std::make_pair(label_key, std::string(target));

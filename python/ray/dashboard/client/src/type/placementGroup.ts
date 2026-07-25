@@ -26,14 +26,18 @@ export type PlacementGroup = {
     [key: string]: number | string;
   } | null;
   bundles: Bundle[];
-  // Topology strategy: map from label key (e.g. "ray.io/gpu-domain") to
-  // corresponding placement strategy.
-  topology_strategy?: {
+  // Topology strategy: list of maps from label key (e.g. "ray.io/gpu-domain") to
+  // corresponding placement strategy, ordered from outermost to innermost.
+  topology_strategy?: Array<{
     [key: string]: string;
-  } | null;
+  }> | null;
   // Topology assignments: map from topology label key to the value the
   // scheduler selected for this PG (e.g. {"ray.io/gpu-domain": "rack-1"}).
   topology_assignments?: {
     [key: string]: string;
   } | null;
+  // Group topology assignments: list mapping each group index to its topology assignments.
+  group_topology_assignments?: Array<{
+    [key: string]: string;
+  }> | null;
 };

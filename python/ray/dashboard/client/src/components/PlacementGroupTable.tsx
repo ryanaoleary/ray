@@ -196,6 +196,7 @@ const PlacementGroupTable = ({
                 bundles,
                 topology_strategy,
                 topology_assignments,
+                group_topology_assignments,
               }) => (
                 <TableRow key={placement_group_id}>
                   <TableCell align="center">
@@ -215,7 +216,7 @@ const PlacementGroupTable = ({
                     <LabelSelector bundles={bundles} />
                   </TableCell>
                   <TableCell align="center">
-                    {topology_strategy ? (
+                    {topology_strategy && topology_strategy.length > 0 ? (
                       <Box sx={{ textAlign: "left" }}>
                         <div>
                           <b>strategy:</b> {JSON.stringify(topology_strategy)}
@@ -224,6 +225,8 @@ const PlacementGroupTable = ({
                           <b>assignment:</b>{" "}
                           {topology_assignments
                             ? JSON.stringify(topology_assignments)
+                            : group_topology_assignments
+                            ? JSON.stringify(group_topology_assignments)
                             : "-"}
                         </div>
                       </Box>

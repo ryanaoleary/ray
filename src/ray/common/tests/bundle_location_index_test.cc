@@ -93,4 +93,31 @@ TEST_F(BundleLocationIndexTest, BesicTest) {
   ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_1)), node_1);
 }
 
+TEST_F(BundleLocationIndexTest, EraseBundleTest) {
+  BundleLocationIndex pg_location_index;
+
+  auto bundle_locations = std::make_shared<BundleLocations>();
+  (*bundle_locations)[bundle_0] = std::make_pair(node_0, nullptr);
+  (*bundle_locations)[bundle_1] = std::make_pair(node_1, nullptr);
+  pg_location_index.AddOrUpdateBundleLocations(bundle_locations);
+
+  ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_0)), node_0);
+  ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_1)), node_1);
+
+  // Test erase-then-lookup
+  ASSERT_TRUE(pg_location_index.EraseBundle(bundle_0));
+  ASSERT_FALSE(pg_location_index.GetBundleLocation(bundle_0));
+  ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_1)), node_1);
+
+  // Test idempotent double-erase
+  ASSERT_FALSE(pg_location_index.EraseBundle(bundle_0));
+  ASSERT_FALSE(pg_location_index.GetBundleLocation(bundle_0));
+
+  // Test erasing non-existent bundle in existing PG
+  ASSERT_FALSE(pg_location_index.EraseBundle(bundle_2));
+
+  // Test erasing from non-existent PG
+  ASSERT_FALSE(pg_location_index.EraseBundle(pg_2_bundle_0));
+}
+
 }  // namespace ray

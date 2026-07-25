@@ -108,7 +108,7 @@ struct SchedulingResult {
 using NodeScheduleFn =
     std::function<SchedulingResult(const std::vector<const ResourceRequest *> &,
                                    SchedulingOptions,
-                                   absl::flat_hash_set<scheduling::NodeID>)>;
+                                   const absl::flat_hash_set<scheduling::NodeID> &)>;
 
 /// IBundleSchedulingPolicy picks a set of nodes from the cluster, according to the
 /// resource requirement list as well as the scheduling options.
@@ -127,7 +127,7 @@ class IBundleSchedulingPolicy {
   virtual SchedulingResult Schedule(
       const std::vector<const ResourceRequest *> &resource_request_list,
       SchedulingOptions options,
-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) = 0;
+      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) = 0;
 };
 
 /// ISchedulingPolicy picks a node to from the cluster, according to the resource

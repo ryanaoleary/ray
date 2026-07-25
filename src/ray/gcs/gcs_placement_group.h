@@ -188,11 +188,9 @@ class GcsPlacementGroup {
   void ClearGroupTopologyAssignments(const std::vector<int> &group_indices);
   void ClearAllGroupTopologyAssignments();
 
-  /**
-   * @brief Check if any bundle in this placement group has a bundle_group_index.
-   *
-   * @return True if any bundle has a bundle_group_index, False otherwise.
-   */
+  /// Check if any bundle in this placement group has a bundle_group_index.
+  ///
+  /// \return True if any bundle has a bundle_group_index, False otherwise.
   bool HasBundleGroups() const {
     for (int i = 0; i < placement_group_table_data_.bundles_size(); i++) {
       if (placement_group_table_data_.bundles(i).has_bundle_group_index()) {
@@ -203,7 +201,6 @@ class GcsPlacementGroup {
   }
 
  private:
-  // XXX.
   FRIEND_TEST(GcsPlacementGroupManagerTest, TestPlacementGroupBundleCache);
 
   /// Setup states other than placement_group_table_data_.

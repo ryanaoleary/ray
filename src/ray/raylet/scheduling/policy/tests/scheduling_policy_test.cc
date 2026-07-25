@@ -740,12 +740,12 @@ TEST_F(SchedulingPolicyTest, GpuDomainSchedulingFeasibleTest) {
       std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
 
   BundlePackSchedulingPolicy bundle_pack_policy(*cluster_resource_manager);
-  NodeScheduleFn node_schedule_fn = [&bundle_pack_policy](
-                                        const std::vector<const ResourceRequest *> &reqs,
-                                        SchedulingOptions opts,
-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
-    return bundle_pack_policy.Schedule(reqs, opts, std::move(nodes));
-  };
+  NodeScheduleFn node_schedule_fn =
+      [&bundle_pack_policy](const std::vector<const ResourceRequest *> &reqs,
+                            SchedulingOptions opts,
+                            const absl::flat_hash_set<scheduling::NodeID> &nodes) {
+        return bundle_pack_policy.Schedule(reqs, opts, nodes);
+      };
 
   // Schedule should return SUCCESS with 15 nodes all from rack-1
   SchedulingResult result_1 = topology_policy.Schedule(
@@ -835,12 +835,12 @@ TEST_F(SchedulingPolicyTest, GpuDomainSchedulingInfeasibleTest) {
       std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
 
   BundlePackSchedulingPolicy bundle_pack_policy(*cluster_resource_manager);
-  NodeScheduleFn node_schedule_fn = [&bundle_pack_policy](
-                                        const std::vector<const ResourceRequest *> &reqs,
-                                        SchedulingOptions opts,
-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
-    return bundle_pack_policy.Schedule(reqs, opts, std::move(nodes));
-  };
+  NodeScheduleFn node_schedule_fn =
+      [&bundle_pack_policy](const std::vector<const ResourceRequest *> &reqs,
+                            SchedulingOptions opts,
+                            const absl::flat_hash_set<scheduling::NodeID> &nodes) {
+        return bundle_pack_policy.Schedule(reqs, opts, nodes);
+      };
 
   SchedulingResult result = topology_policy.Schedule(
       req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
@@ -870,18 +870,18 @@ TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingTest) {
 
   int inner_schedule_calls = 0;
 
-  NodeScheduleFn node_schedule_fn = [&inner_schedule_calls](
-                                        const std::vector<const ResourceRequest *> &reqs,
-                                        SchedulingOptions opts,
-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
-    inner_schedule_calls++;
+  NodeScheduleFn node_schedule_fn =
+      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
+                              SchedulingOptions opts,
+                              const absl::flat_hash_set<scheduling::NodeID> &nodes) {
+        inner_schedule_calls++;
 
-    SchedulingResult result;
-    result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
-    result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
-    result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
-    return result;
-  };
+        SchedulingResult result;
+        result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
+        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
+        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
+        return result;
+      };
 
   SchedulingResult result = policy.Schedule(
       req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
@@ -917,23 +917,24 @@ TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingInfeasibleTest) {
 
   int inner_schedule_calls = 0;
 
-  NodeScheduleFn node_schedule_fn = [&inner_schedule_calls](
-                                        const std::vector<const ResourceRequest *> &reqs,
-                                        SchedulingOptions opts,
-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
-    inner_schedule_calls++;
+  NodeScheduleFn node_schedule_fn =
+      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
+                              SchedulingOptions opts,
+                              const absl::flat_hash_set<scheduling::NodeID> &nodes) {
+        inner_schedule_calls++;
 
-    SchedulingResult result;
-    if (inner_schedule_calls == 2) {
-      result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::INFEASIBLE;
-      return result;
-    }
+        SchedulingResult result;
+        if (inner_schedule_calls == 2) {
+          result.status.code =
+              SchedulingResultStatus::SchedulingResultStatusCode::INFEASIBLE;
+          return result;
+        }
 
-    result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
-    result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
-    result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
-    return result;
-  };
+        result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
+        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
+        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
+        return result;
+      };
 
   SchedulingResult result = policy.Schedule(
       req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
@@ -964,23 +965,23 @@ TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingFailedTest) {
 
   int inner_schedule_calls = 0;
 
-  NodeScheduleFn node_schedule_fn = [&inner_schedule_calls](
-                                        const std::vector<const ResourceRequest *> &reqs,
-                                        SchedulingOptions opts,
-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
-    inner_schedule_calls++;
+  NodeScheduleFn node_schedule_fn =
+      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
+                              SchedulingOptions opts,
+                              const absl::flat_hash_set<scheduling::NodeID> &nodes) {
+        inner_schedule_calls++;
 
-    SchedulingResult result;
-    if (inner_schedule_calls == 1) {
-      result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::FAILED;
-      return result;
-    }
+        SchedulingResult result;
+        if (inner_schedule_calls == 1) {
+          result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::FAILED;
+          return result;
+        }
 
-    result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
-    result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
-    result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
-    return result;
-  };
+        result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
+        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
+        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
+        return result;
+      };
 
   SchedulingResult result = policy.Schedule(
       req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);

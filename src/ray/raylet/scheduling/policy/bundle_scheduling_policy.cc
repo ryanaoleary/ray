@@ -145,7 +145,8 @@ scheduling::NodeID BundleSchedulingPolicy::GetBestNode(
 SchedulingResult BundlePackSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     SchedulingOptions options,
-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes_in) {
+  absl::flat_hash_set<scheduling::NodeID> candidate_nodes = candidate_nodes_in;
   RAY_CHECK(!resource_request_list.empty());
   if (candidate_nodes.empty()) {
     RAY_LOG(DEBUG) << "The candidate nodes is empty, return directly.";
@@ -225,7 +226,8 @@ SchedulingResult BundlePackSchedulingPolicy::Schedule(
 SchedulingResult BundleSpreadSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     SchedulingOptions options,
-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes_in) {
+  absl::flat_hash_set<scheduling::NodeID> candidate_nodes = candidate_nodes_in;
   RAY_CHECK(!resource_request_list.empty());
   if (candidate_nodes.empty()) {
     RAY_LOG(DEBUG) << "The candidate nodes is empty, return directly.";
@@ -290,7 +292,7 @@ SchedulingResult BundleSpreadSchedulingPolicy::Schedule(
 SchedulingResult BundleStrictPackSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     SchedulingOptions options,
-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) {
   RAY_CHECK(!resource_request_list.empty());
   if (candidate_nodes.empty()) {
     RAY_LOG(DEBUG) << "The candidate nodes is empty, return directly.";
@@ -315,17 +317,16 @@ SchedulingResult BundleStrictPackSchedulingPolicy::Schedule(
   }
   aggregated_resource_request.SetLabelSelector(std::move(aggregated_label_selector));
 
-  // Remove any node that does not satisfy the aggregated request.
-  for (auto it = candidate_nodes.begin(); it != candidate_nodes.end();) {
-    if (!cluster_resource_manager_.HasFeasibleResources(*it,
-                                                        aggregated_resource_request)) {
-      candidate_nodes.erase(it++);
-    } else {
-      ++it;
+  bool is_infeasible = true;
+  for (const auto &node_id : candidate_nodes) {
+    if (cluster_resource_manager_.HasFeasibleResources(node_id,
+                                                       aggregated_resource_request)) {
+      is_infeasible = false;
+      break;
     }
   }
 
-  if (candidate_nodes.empty()) {
+  if (is_infeasible) {
     RAY_LOG(DEBUG) << "The required resource is bigger than the maximum resource in the "
                       "whole cluster or no node satisfies the label constraints, "
                       "schedule failed.";
@@ -382,7 +383,8 @@ void BundleStrictSpreadSchedulingPolicy::ExcludeNodesAlreadyContainingBundles(
 SchedulingResult BundleStrictSpreadSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     SchedulingOptions options,
-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes_in) {
+  absl::flat_hash_set<scheduling::NodeID> candidate_nodes = candidate_nodes_in;
   RAY_CHECK(!resource_request_list.empty());
 
   ExcludeNodesAlreadyContainingBundles(candidate_nodes,
@@ -440,7 +442,7 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
     absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
     NodeScheduleFn node_schedule_fn) {
   if (options.bundle_group_indices_.empty()) {
-    return node_schedule_fn(resource_request_list, options, std::move(candidate_nodes));
+    return node_schedule_fn(resource_request_list, options, candidate_nodes);
   }
 
   std::vector<std::vector<int>> group_indices = std::move(options.bundle_group_indices_);
@@ -449,9 +451,7 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
   std::vector<scheduling::NodeID> final_nodes(resource_request_list.size(),
                                               scheduling::NodeID::Nil());
 
-  const auto &target_domain = !options.target_topology_assignment_.first.empty()
-                                  ? options.target_topology_assignment_
-                                  : options.target_label_domain_;
+  const auto &target_domain = options.target_topology_assignment_;
   const std::string &label_key = target_domain.first;
 
   // Filter candidates by label_key and populate domain_buckets
@@ -483,9 +483,36 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
   int num_groups = group_indices.size();
   int num_domains = domain_vals.size();
 
+  std::vector<std::string> group_to_domain_str(num_groups);
+
+  // Pre-calculate raw resources for each domain and each group to short-circuit
+  // infeasible domains.
+  std::vector<ResourceSet> domain_raw_resources(num_domains);
+  for (int d = 0; d < num_domains; ++d) {
+    for (const auto &node_id : domain_buckets[domain_vals[d]]) {
+      const auto &node_resources = cluster_resource_manager_.GetNodeResources(node_id);
+      for (auto resource_id : node_resources.total.ExplicitResourceIds()) {
+        domain_raw_resources[d].Set(resource_id,
+                                    domain_raw_resources[d].Get(resource_id) +
+                                        node_resources.total.Get(resource_id));
+      }
+    }
+  }
+
+  std::vector<ResourceSet> group_raw_resources(num_groups);
+  for (int g = 0; g < num_groups; ++g) {
+    for (int idx : group_indices[g]) {
+      group_raw_resources[g] += resource_request_list[idx]->GetResourceSet();
+    }
+  }
+
   // Helper to schedule a single group and revert resources.
   auto check_feasibility = [&](int group_idx,
-                               const std::string &domain_val) -> SchedulingResult {
+                               const std::string &domain_val,
+                               int domain_idx) -> SchedulingResult {
+    if (!(group_raw_resources[group_idx] <= domain_raw_resources[domain_idx])) {
+      return SchedulingResult::Infeasible();
+    }
     const auto &indices = group_indices[group_idx];
     std::vector<const ResourceRequest *> sub_list;
     for (int idx : indices) {
@@ -498,20 +525,50 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
     return bucket_res;
   };
 
-  bool is_infeasible = false;
-
   if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD) {
+    std::vector<std::string> group_shapes(num_groups);
+    for (int i = 0; i < num_groups; i++) {
+      std::vector<std::string> shapes;
+      for (int idx : group_indices[i]) {
+        shapes.push_back(resource_request_list[idx]->GetResourceSet().DebugString());
+      }
+      std::sort(shapes.begin(), shapes.end());
+      for (const auto &s : shapes) {
+        group_shapes[i] += s + "|";
+      }
+    }
+
     std::vector<std::vector<SchedulingResult>> feasible_results(
         num_groups, std::vector<SchedulingResult>(num_domains));
     std::vector<std::vector<int>> adj(num_groups);
+    std::vector<std::vector<int>> adj_possible(num_groups);
+    absl::flat_hash_map<std::string, SchedulingResult> memo;
 
     for (int i = 0; i < num_groups; i++) {
+      int orig_group_idx = options.original_bundle_group_indices_.empty()
+                               ? i
+                               : options.original_bundle_group_indices_[i];
+      auto pin_it = options.group_topology_pins_.find(orig_group_idx);
+      std::string pin =
+          pin_it != options.group_topology_pins_.end() ? pin_it->second : "";
+
       for (int j = 0; j < num_domains; j++) {
-        feasible_results[i][j] = check_feasibility(i, domain_vals[j]);
+        if (!pin.empty() && domain_vals[j] != pin) {
+          continue;
+        }
+        std::string cache_key = group_shapes[i] + ":" + std::to_string(j);
+        auto it = memo.find(cache_key);
+        if (it != memo.end()) {
+          feasible_results[i][j] = it->second;
+        } else {
+          feasible_results[i][j] = check_feasibility(i, domain_vals[j], j);
+          memo[cache_key] = feasible_results[i][j];
+        }
         if (feasible_results[i][j].status.IsSuccess()) {
           adj[i].push_back(j);
-        } else if (feasible_results[i][j].status.IsInfeasible()) {
-          is_infeasible = true;
+          adj_possible[i].push_back(j);
+        } else if (!feasible_results[i][j].status.IsInfeasible()) {
+          adj_possible[i].push_back(j);
         }
       }
     }
@@ -528,27 +585,38 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
     std::vector<int> match(num_domains, -1);
     std::vector<bool> visited(num_domains, false);
 
-    std::function<bool(int)> dfs = [&](int u) {
-      for (int v : adj[u]) {
-        if (visited[v]) continue;
-        visited[v] = true;
-        if (match[v] < 0 || dfs(match[v])) {
-          match[v] = u;
-          return true;
-        }
-      }
-      return false;
-    };
+    std::function<bool(int, const std::vector<std::vector<int>> &, std::vector<int> &)>
+        dfs =
+            [&](int u, const std::vector<std::vector<int>> &graph, std::vector<int> &m) {
+              for (int v : graph[u]) {
+                if (visited[v]) continue;
+                visited[v] = true;
+                if (m[v] < 0 || dfs(m[v], graph, m)) {
+                  m[v] = u;
+                  return true;
+                }
+              }
+              return false;
+            };
 
     int matched_count = 0;
     for (int i : group_order) {
       std::fill(visited.begin(), visited.end(), false);
-      if (dfs(i)) {
+      if (dfs(i, adj, match)) {
         matched_count++;
       }
     }
 
     if (matched_count < num_groups) {
+      std::vector<int> match_possible(num_domains, -1);
+      int matched_possible_count = 0;
+      for (int i : group_order) {
+        std::fill(visited.begin(), visited.end(), false);
+        if (dfs(i, adj_possible, match_possible)) {
+          matched_possible_count++;
+        }
+      }
+      bool is_infeasible = (matched_possible_count < num_groups);
       return is_infeasible ? SchedulingResult::Infeasible() : SchedulingResult::Failed();
     }
 
@@ -563,6 +631,10 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
       int domain_idx = group_to_domain[i];
       const auto &res = feasible_results[i][domain_idx];
       const auto &indices = group_indices[i];
+      if (!label_key.empty()) {
+        group_to_domain_str[i] = domain_vals[domain_idx];
+      }
+
       for (size_t k = 0; k < indices.size(); k++) {
         final_nodes[indices[k]] = res.selected_nodes[k];
         RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
@@ -572,17 +644,41 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
   } else if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK ||
              options.outer_strategy_ == rpc::PlacementStrategy::PACK) {
     bool overall_success = false;
-    std::string selected_domain;
+    bool all_infeasible = true;
 
     for (const auto &domain_val : domain_vals) {
       bool domain_success = true;
+      bool domain_infeasible = false;
       std::vector<std::pair<scheduling::NodeID, const ResourceRequest *>> rollback_log;
+
+      bool satisfies_pin = true;
+      for (int i = 0; i < num_groups; i++) {
+        int orig_group_idx = options.original_bundle_group_indices_.empty()
+                                 ? i
+                                 : options.original_bundle_group_indices_[i];
+        auto pin_it = options.group_topology_pins_.find(orig_group_idx);
+        if (pin_it != options.group_topology_pins_.end() &&
+            pin_it->second != domain_val) {
+          satisfies_pin = false;
+          break;
+        }
+      }
+      if (!satisfies_pin) continue;
 
       for (int i = 0; i < num_groups; i++) {
         const auto &indices = group_indices[i];
         std::vector<const ResourceRequest *> sub_list;
         for (int idx : indices) {
           sub_list.push_back(resource_request_list[idx]);
+        }
+
+        int domain_idx =
+            std::distance(domain_vals.begin(),
+                          std::find(domain_vals.begin(), domain_vals.end(), domain_val));
+        if (!(group_raw_resources[i] <= domain_raw_resources[domain_idx])) {
+          domain_success = false;
+          domain_infeasible = true;
+          break;
         }
 
         SchedulingResult bucket_res =
@@ -598,7 +694,7 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
         } else {
           domain_success = false;
           if (bucket_res.status.IsInfeasible()) {
-            is_infeasible = true;
+            domain_infeasible = true;
           }
           break;
         }
@@ -606,9 +702,14 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
 
       if (domain_success) {
         overall_success = true;
-        selected_domain = domain_val;
+        for (int i = 0; i < num_groups; i++) {
+          group_to_domain_str[i] = domain_val;
+        }
         break;
       } else {
+        if (!domain_infeasible) {
+          all_infeasible = false;
+        }
         for (auto &entry : rollback_log) {
           RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
               entry.first, entry.second->GetResourceSet()));
@@ -617,14 +718,16 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
     }
 
     if (!overall_success) {
-      return is_infeasible ? SchedulingResult::Infeasible() : SchedulingResult::Failed();
+      return all_infeasible ? SchedulingResult::Infeasible() : SchedulingResult::Failed();
     }
   } else if (options.outer_strategy_ == rpc::PlacementStrategy::SPREAD) {
     absl::flat_hash_set<std::string> used_domains;
     bool overall_success = true;
+    bool any_group_infeasible = false;
 
     for (int i = 0; i < num_groups; i++) {
       bool group_success = false;
+      bool group_has_failed_domain = false;
       const auto &indices = group_indices[i];
       std::vector<const ResourceRequest *> sub_list;
       for (int idx : indices) {
@@ -632,9 +735,22 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
       }
 
       auto try_domains = [&](bool require_unused) -> bool {
+        int orig_group_idx = options.original_bundle_group_indices_.empty()
+                                 ? i
+                                 : options.original_bundle_group_indices_[i];
+        auto pin_it = options.group_topology_pins_.find(orig_group_idx);
+        std::string pin =
+            pin_it != options.group_topology_pins_.end() ? pin_it->second : "";
+
         for (const auto &domain_val : domain_vals) {
+          if (!pin.empty() && domain_val != pin) continue;
           if (require_unused && used_domains.contains(domain_val)) continue;
           if (!require_unused && !used_domains.contains(domain_val)) continue;
+
+          int domain_idx = std::distance(
+              domain_vals.begin(),
+              std::find(domain_vals.begin(), domain_vals.end(), domain_val));
+          if (!(group_raw_resources[i] <= domain_raw_resources[domain_idx])) continue;
 
           SchedulingResult bucket_res =
               node_schedule_fn(sub_list, options, domain_buckets[domain_val]);
@@ -645,9 +761,10 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
                   final_nodes[indices[k]], *sub_list[k]));
             }
             used_domains.insert(domain_val);
+            group_to_domain_str[i] = domain_val;
             return true;
-          } else if (bucket_res.status.IsInfeasible()) {
-            is_infeasible = true;
+          } else if (!bucket_res.status.IsInfeasible()) {
+            group_has_failed_domain = true;
           }
         }
         return false;
@@ -660,6 +777,9 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
 
       if (!group_success) {
         overall_success = false;
+        if (!group_has_failed_domain) {
+          any_group_infeasible = true;
+        }
         break;
       }
     }
@@ -673,7 +793,8 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
           final_nodes[i] = scheduling::NodeID::Nil();
         }
       }
-      return is_infeasible ? SchedulingResult::Infeasible() : SchedulingResult::Failed();
+      return any_group_infeasible ? SchedulingResult::Infeasible()
+                                  : SchedulingResult::Failed();
     }
   }
 
@@ -686,11 +807,16 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
   }
 
   auto success_result = SchedulingResult::Success(std::move(final_nodes));
-  if ((options.outer_strategy_ == rpc::PlacementStrategy::PACK ||
-       options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK) &&
-      target_domain.second.has_value()) {
-    success_result.selected_topology_assignment =
-        std::make_pair(target_domain.first, *target_domain.second);
+  if (!label_key.empty()) {
+    for (int i = 0; i < num_groups; i++) {
+      if (!group_to_domain_str[i].empty()) {
+        int orig_group_idx = options.original_bundle_group_indices_.empty()
+                                 ? i
+                                 : options.original_bundle_group_indices_[i];
+        success_result.selected_group_assignments.push_back(
+            {orig_group_idx, {label_key, group_to_domain_str[i]}});
+      }
+    }
   }
   return success_result;
 }

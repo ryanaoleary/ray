@@ -80,7 +80,7 @@ class CompositeBundleSchedulingPolicy : public IBundleSchedulingPolicy {
   SchedulingResult Schedule(
       const std::vector<const ResourceRequest *> &resource_request_list,
       SchedulingOptions options,
-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) override;
+      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) override;
 
  private:
   BundlePackSchedulingPolicy bundle_pack_policy_;

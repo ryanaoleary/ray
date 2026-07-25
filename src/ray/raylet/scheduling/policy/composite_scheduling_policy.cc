@@ -46,17 +46,14 @@ scheduling::NodeID CompositeSchedulingPolicy::Schedule(
 SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     SchedulingOptions options,
-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
+    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) {
   if (!options.bundle_group_indices_.empty()) {
     NodeScheduleFn node_schedule_fn =
         [this](const std::vector<const ResourceRequest *> &reqs,
                SchedulingOptions opts,
                absl::flat_hash_set<scheduling::NodeID> nodes) {
-          const auto &inner_domain = !opts.inner_target_topology_assignment_.first.empty()
-                                         ? opts.inner_target_topology_assignment_
-                                         : opts.inner_target_label_domain_;
+          const auto &inner_domain = opts.inner_target_topology_assignment_;
           opts.target_topology_assignment_ = inner_domain;
-          opts.target_label_domain_ = inner_domain;
           opts.topology_scheduling_strategy_ =
               !inner_domain.first.empty() ? TopologySchedulingStrategy::STRICT_PACK
                                           : TopologySchedulingStrategy::NONE;
@@ -66,10 +63,8 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
               << "Inner topology labels currently only support STRICT_PACK or PACK.";
           return this->Schedule(reqs, std::move(opts), std::move(nodes));
         };
-    return hierarchical_bundle_policy_.Schedule(resource_request_list,
-                                                std::move(options),
-                                                std::move(candidate_nodes),
-                                                node_schedule_fn);
+    return hierarchical_bundle_policy_.Schedule(
+        resource_request_list, std::move(options), candidate_nodes, node_schedule_fn);
   }
 
   if (options.topology_scheduling_strategy_ != TopologySchedulingStrategy::NONE) {
@@ -83,7 +78,7 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
     switch (options.topology_scheduling_strategy_) {
     case TopologySchedulingStrategy::STRICT_PACK:
       return topology_strict_pack_policy_.Schedule(
-          resource_request_list, options, std::move(candidate_nodes), node_schedule_fn);
+          resource_request_list, options, candidate_nodes, node_schedule_fn);
     default:
       RAY_LOG(FATAL) << "Unsupported topology scheduling strategy: "
                      << static_cast<int>(options.topology_scheduling_strategy_);
@@ -93,17 +88,16 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
 
   switch (options.scheduling_type_) {
   case SchedulingType::BUNDLE_PACK:
-    return bundle_pack_policy_.Schedule(
-        resource_request_list, options, std::move(candidate_nodes));
+    return bundle_pack_policy_.Schedule(resource_request_list, options, candidate_nodes);
   case SchedulingType::BUNDLE_SPREAD:
     return bundle_spread_policy_.Schedule(
-        resource_request_list, options, std::move(candidate_nodes));
+        resource_request_list, options, candidate_nodes);
   case SchedulingType::BUNDLE_STRICT_PACK:
     return bundle_strict_pack_policy_.Schedule(
-        resource_request_list, options, std::move(candidate_nodes));
+        resource_request_list, options, candidate_nodes);
   case SchedulingType::BUNDLE_STRICT_SPREAD:
     return bundle_strict_spread_policy_.Schedule(
-        resource_request_list, options, std::move(candidate_nodes));
+        resource_request_list, options, candidate_nodes);
   default:
     RAY_LOG(FATAL) << "Unsupported scheduling type: "
                    << static_cast<typename std::underlying_type<SchedulingType>::type>(

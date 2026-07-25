@@ -108,7 +108,10 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
       global_to_local_idx[bundles[i]->BundleId().second] = i;
     }
     std::vector<std::vector<int>> unplaced_group_indices;
-    for (const auto &group : scheduling_options.bundle_group_indices_) {
+    std::vector<int> unplaced_original_group_indices;
+    for (size_t i = 0; i < scheduling_options.bundle_group_indices_.size(); i++) {
+      const auto &group = scheduling_options.bundle_group_indices_[i];
+      int original_idx = scheduling_options.original_bundle_group_indices_[i];
       std::vector<int> local_group;
       for (int idx : group) {
         auto it = global_to_local_idx.find(idx);
@@ -118,15 +121,19 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
       }
       if (!local_group.empty()) {
         if (local_group.size() != group.size()) {
-          RAY_LOG(ERROR) << "Bundle group " << group.front()
-                         << " cannot be partially unplaced. Failing scheduling.";
+          RAY_LOG(ERROR).WithField(placement_group->GetPlacementGroupID())
+              << "Bundle group " << original_idx
+              << " cannot be partially unplaced. Failing scheduling.";
           failure_callback(placement_group, /*is_feasible*/ true);
           return;
         }
         unplaced_group_indices.push_back(std::move(local_group));
+        unplaced_original_group_indices.push_back(original_idx);
       }
     }
     scheduling_options.bundle_group_indices_ = std::move(unplaced_group_indices);
+    scheduling_options.original_bundle_group_indices_ =
+        std::move(unplaced_original_group_indices);
   }
 
   auto scheduling_result = cluster_resource_scheduler_.SchedulePlacementGroup(
@@ -162,6 +169,16 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
     RAY_LOG(INFO) << "Placement group " << placement_group->GetPlacementGroupID()
                   << " assigned to topology label " << topology_label_key << ": "
                   << topology_label_value;
+  }
+
+  if (!scheduling_result.selected_group_assignments.empty()) {
+    for (const auto &pair : scheduling_result.selected_group_assignments) {
+      placement_group->SetGroupTopologyAssignment(
+          pair.first, pair.second.first, pair.second.second);
+      RAY_LOG(INFO) << "Placement group " << placement_group->GetPlacementGroupID()
+                    << " group " << pair.first << " assigned to topology label "
+                    << pair.second.first << ": " << pair.second.second;
+    }
   }
 
   // Covert to a map of bundle to node.
@@ -635,36 +652,43 @@ GcsPlacementGroupScheduler::CreateSchedulingContext(
   return std::make_unique<BundleSchedulingContext>(std::move(bundle_locations));
 }
 
+std::optional<std::pair<std::string, rpc::PlacementStrategy>> FirstNonNodeEntry(
+    const rpc::TopologyStrategyLayer &layer) {
+  if (layer.entries().size() > 0) {
+    for (const auto &pair : layer.entries()) {
+      if (pair.first != kLabelKeyNodeID) {
+        return std::make_pair(pair.first, pair.second);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
     const GcsPlacementGroup &placement_group, rpc::PlacementStrategy strategy) {
+  const auto &topology_layers =
+      placement_group.GetPlacementGroupTableData().topology_strategy();
+
+  auto outer_entry =
+      topology_layers.size() > 0 ? FirstNonNodeEntry(topology_layers[0]) : std::nullopt;
+  auto inner_entry =
+      topology_layers.size() > 1 ? FirstNonNodeEntry(topology_layers[1]) : std::nullopt;
+
   std::optional<std::pair<std::string, std::optional<std::string>>>
       target_topology_assignment;
   std::optional<std::pair<std::string, std::optional<std::string>>>
       inner_target_topology_assignment;
 
-  const auto &topology_layers =
-      placement_group.GetPlacementGroupTableData().topology_strategy();
-
-  if (topology_layers.size() > 0 && topology_layers[0].entries().size() > 0) {
-    for (const auto &pair : topology_layers[0].entries()) {
-      if (pair.first != kLabelKeyNodeID) {
-        std::optional<std::string> topology_label_value =
-            placement_group.GetTopologyAssignment(pair.first);
-        target_topology_assignment = {pair.first, topology_label_value};
-        break;
-      }
-    }
+  if (outer_entry.has_value()) {
+    std::optional<std::string> topology_label_value =
+        placement_group.GetTopologyAssignment(outer_entry->first);
+    target_topology_assignment = {outer_entry->first, topology_label_value};
   }
 
-  if (topology_layers.size() > 1 && topology_layers[1].entries().size() > 0) {
-    for (const auto &pair : topology_layers[1].entries()) {
-      if (pair.first != kLabelKeyNodeID) {
-        std::optional<std::string> inner_topology_label_value =
-            placement_group.GetTopologyAssignment(pair.first);
-        inner_target_topology_assignment = {pair.first, inner_topology_label_value};
-        break;
-      }
-    }
+  if (inner_entry.has_value()) {
+    std::optional<std::string> inner_topology_label_value =
+        placement_group.GetTopologyAssignment(inner_entry->first);
+    inner_target_topology_assignment = {inner_entry->first, inner_topology_label_value};
   }
 
   NodeID soft_target_node_id = placement_group.GetSoftTargetNodeID();
@@ -696,39 +720,13 @@ SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
 
   if (inner_target_topology_assignment.has_value()) {
     options.inner_target_topology_assignment_ = *inner_target_topology_assignment;
-    options.inner_target_label_domain_ = *inner_target_topology_assignment;
   }
 
-  if (topology_layers.size() > 1 && topology_layers[1].entries().size() > 0) {
-    for (const auto &pair : topology_layers[1].entries()) {
-      if (pair.first != kLabelKeyNodeID) {
-        options.inner_strategy_ = pair.second;
-        break;
-      }
-    }
-  } else {
-    options.inner_strategy_ = strategy;
-  }
+  options.inner_strategy_ = inner_entry.has_value() ? inner_entry->second : strategy;
+  options.outer_strategy_ = outer_entry.has_value() ? outer_entry->second : strategy;
 
   bool has_groups = placement_group.HasBundleGroups();
-  if (topology_layers.size() > 0 && topology_layers[0].entries().size() > 0) {
-    for (const auto &pair : topology_layers[0].entries()) {
-      if (pair.first != kLabelKeyNodeID) {
-        options.outer_strategy_ = pair.second;
-        break;
-      }
-    }
-  }
-
-  bool has_custom_topology_layer = false;
-  if (topology_layers.size() == 1) {
-    for (const auto &pair : topology_layers[0].entries()) {
-      if (pair.first != kLabelKeyNodeID) {
-        has_custom_topology_layer = true;
-        break;
-      }
-    }
-  }
+  bool has_custom_topology_layer = outer_entry.has_value();
 
   if (!has_groups && topology_layers.size() <= 1) {
     if (!has_custom_topology_layer ||
@@ -768,33 +766,24 @@ SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
   std::sort(sorted_group_indices.begin(), sorted_group_indices.end());
   for (int group_idx : sorted_group_indices) {
     options.bundle_group_indices_.push_back(group_to_indices[group_idx]);
+    options.original_bundle_group_indices_.push_back(group_idx);
   }
-  options.outer_strategy_ = strategy;
-  if (topology_layers.size() > 0 && topology_layers[0].entries().size() > 0) {
-    std::string outer_key;
-    for (const auto &pair : topology_layers[0].entries()) {
-      if (pair.first != kLabelKeyNodeID) {
-        options.outer_strategy_ = pair.second;
-        outer_key = pair.first;
-        break;
-      }
-    }
 
-    if (!outer_key.empty() &&
-        (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD ||
-         options.outer_strategy_ == rpc::PlacementStrategy::SPREAD)) {
-      for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size();
-           i++) {
-        const auto &bundle = placement_group.GetPlacementGroupTableData().bundles(i);
-        if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
-          scheduling::NodeID placed_node(bundle.node_id());
-          const auto &labels =
-              cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
-                  placed_node);
-          auto it = labels.find(outer_key);
-          if (it != labels.end()) {
-            options.previously_occupied_topologies_.insert(it->second);
-          }
+  if (outer_entry.has_value() &&
+      (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD ||
+       options.outer_strategy_ == rpc::PlacementStrategy::SPREAD)) {
+    const std::string &outer_key = outer_entry->first;
+    for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size();
+         i++) {
+      const auto &bundle = placement_group.GetPlacementGroupTableData().bundles(i);
+      if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
+        scheduling::NodeID placed_node(bundle.node_id());
+        const auto &labels =
+            cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
+                placed_node);
+        auto it = labels.find(outer_key);
+        if (it != labels.end()) {
+          options.previously_occupied_topologies_.insert(it->second);
         }
       }
     }

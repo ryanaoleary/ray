@@ -772,9 +772,10 @@ How it works
 ~~~~~~~~~~~~
 
 Pass ``topology_strategy=`` to :func:`ray.util.placement_group` to enable topology strategy
-placement. The argument is a dict that maps a label key to the placement strategy used at that level.
+placement. The argument is a dict that maps a label key to the placement strategy used at that level,
+or a list of such dicts for hierarchical layers (ordered from outermost to innermost topology).
 
-Currently, ``topology_strategy`` is a dictionary that may contain up to two keys:
+Currently, a ``topology_strategy`` dictionary may contain up to two keys:
 
 - The special key ``ray.io/node-id`` sets the **node-level** strategy and accepts any value
   in ``{"PACK", "STRICT_PACK", "SPREAD", "STRICT_SPREAD"}``. If you omit it, the node-level

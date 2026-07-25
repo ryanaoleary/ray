@@ -205,8 +205,6 @@ struct SchedulingOptions {
   //   (bundle rescheduling). If nullopt, a new group is selected.
   std::pair<std::string, std::optional<std::string>> target_topology_assignment_{};
   std::pair<std::string, std::optional<std::string>> inner_target_topology_assignment_{};
-  std::pair<std::string, std::optional<std::string>> target_label_domain_{};
-  std::pair<std::string, std::optional<std::string>> inner_target_label_domain_{};
   // ID of the target node where bundles should be placed
   // iff the target node has enough available resources.
   // Otherwise, the bundles can be placed elsewhere.
@@ -229,8 +227,12 @@ struct SchedulingOptions {
   rpc::PlacementStrategy inner_strategy_ = rpc::PlacementStrategy::PACK;
   // Hierarchical bundle group indices.
   std::vector<std::vector<int>> bundle_group_indices_;
+  // Original group IDs for each positional group index in bundle_group_indices_.
+  std::vector<int> original_bundle_group_indices_;
   // Topology domains already occupied by placed groups.
   absl::flat_hash_set<std::string> previously_occupied_topologies_;
+  // Group topology pins from previous placement
+  absl::flat_hash_map<int, std::string> group_topology_pins_;
 
  private:
   SchedulingOptions(
@@ -257,7 +259,6 @@ struct SchedulingOptions {
             target_topology_assignment.has_value()
                 ? std::move(*target_topology_assignment)
                 : std::pair<std::string, std::optional<std::string>>{}),
-        target_label_domain_(target_topology_assignment_),
         scheduling_context_(std::move(scheduling_context)),
         preferred_node_id_(preferred_node_id),
         schedule_top_k_absolute_(schedule_top_k_absolute),

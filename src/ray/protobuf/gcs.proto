@@ -687,7 +687,14 @@ message PlacementGroupTableData {
   // Topology strategy that applies to this PG. Mirrors
   // PlacementGroupSpec.topology_strategy. Empty if the PG does not use
   // topology-aware scheduling.
-  repeated TopologyStrategyLayer topology_strategy = 18;
+  reserved 18;
+  repeated TopologyStrategyLayer topology_strategy = 19;
+
+  message GroupTopologyAssignment {
+    int32 bundle_group_index = 1;
+    map<string, string> assignments = 2;
+  }
+  repeated GroupTopologyAssignment group_topology_assignments = 20;
 }
 
 message JobTableData {

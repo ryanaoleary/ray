@@ -570,7 +570,9 @@ class PlacementGroupState(StateSchema):
     #: a topology strategy.
     #:
     #: NOTE: This field is experimental and may change in the future.
-    topology_strategy: Optional[dict] = state_column(filterable=False, detail=True)
+    topology_strategy: Optional[List[dict]] = state_column(
+        filterable=False, detail=True
+    )
     #: Topology assignments: a dict mapping each topology label key to the
     #: value the scheduler has selected for this PG (e.g.
     #: {"ray.io/gpu-domain": "rack-1"}). Empty dict if no topology values
@@ -578,6 +580,12 @@ class PlacementGroupState(StateSchema):
     #:
     #: NOTE: This field is experimental and may change in the future.
     topology_assignments: Optional[dict] = state_column(filterable=False, detail=True)
+    #: Group topology assignments: a list mapping each group index to its topology values.
+    #:
+    #: NOTE: This field is experimental and may change in the future.
+    group_topology_assignments: Optional[List[dict]] = state_column(
+        filterable=False, detail=True
+    )
 
 
 @dataclass(init=not IS_PYDANTIC_2)

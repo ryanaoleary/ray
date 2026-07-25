@@ -191,6 +191,91 @@ void GcsAutoscalerStateManager::MakeClusterResourceStateInternal(
   GetClusterResourceConstraints(state);
 }
 
+namespace {
+
+void AddBundleToGangResourceRequest(
+    const google::protobuf::Map<std::string, double> &unit_resources,
+    const google::protobuf::Map<std::string, std::string> &label_selector,
+    const std::optional<rpc::autoscaler::PlacementConstraint> &pg_constraint,
+    rpc::autoscaler::GangResourceRequest *gang_resource_req,
+    rpc::autoscaler::BundleSelector *bundle_selector) {
+  auto legacy_resource_req = gang_resource_req->add_requests();
+  *legacy_resource_req->mutable_resources_bundle() = unit_resources;
+
+  auto *bundle_resource_req = bundle_selector->add_resource_requests();
+  *bundle_resource_req->mutable_resources_bundle() = unit_resources;
+
+  if (!label_selector.empty()) {
+    ray::LabelSelector selector(label_selector);
+    selector.ToProto(bundle_resource_req->add_label_selectors());
+  }
+
+  if (pg_constraint.has_value()) {
+    legacy_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
+    bundle_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
+  }
+}
+
+void PopulateTopologyLocalityRequirement(
+    const rpc::PlacementGroupTableData &pg_data,
+    rpc::autoscaler::BundleSelector *bundle_selector,
+    std::optional<int32_t> group_idx = std::nullopt) {
+  const auto &topology_strategy = pg_data.topology_strategy();
+  if (topology_strategy.empty()) {
+    return;
+  }
+
+  std::string topology_label_key;
+  rpc::PlacementStrategy strategy = rpc::PlacementStrategy::PACK;
+  for (const auto &pair : topology_strategy[0].entries()) {
+    if (pair.first != kLabelKeyNodeID) {
+      topology_label_key = pair.first;
+      strategy = pair.second;
+      break;
+    }
+  }
+
+  if (topology_label_key.empty()) {
+    return;
+  }
+
+  auto *locality_req = bundle_selector->mutable_locality_requirement();
+  auto *locality_constraint = locality_req->mutable_locality_constraint();
+  locality_constraint->set_label_name(topology_label_key);
+  locality_constraint->set_placement_strategy(strategy);
+
+  std::optional<std::string> pin_value;
+  if (group_idx.has_value() && group_idx.value() >= 0) {
+    for (const auto &assignment : pg_data.group_topology_assignments()) {
+      if (assignment.bundle_group_index() == group_idx.value()) {
+        auto it = assignment.assignments().find(topology_label_key);
+        if (it != assignment.assignments().end()) {
+          pin_value = it->second;
+        }
+        break;
+      }
+    }
+  }
+
+  if (!pin_value.has_value()) {
+    const auto &assignments = pg_data.topology_assignments();
+    auto it = assignments.find(topology_label_key);
+    if (it != assignments.end()) {
+      pin_value = it->second;
+    }
+  }
+
+  if (pin_value.has_value()) {
+    auto *label_constraint =
+        locality_req->mutable_label_selector()->add_label_constraints();
+    label_constraint->set_label_key(topology_label_key);
+    label_constraint->set_operator_(rpc::LabelSelectorOperator::LABEL_OPERATOR_IN);
+    label_constraint->add_label_values(*pin_value);
+  }
+}
+
+}  // namespace
+
 void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
     rpc::autoscaler::ClusterResourceState *state) {
   RAY_CHECK(thread_checker_.IsOnSameThread());
@@ -226,7 +311,6 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
         break;
       }
     }
-
     if (has_bundle_group_indices) {
       std::map<int32_t, std::vector<const rpc::Bundle *>> groups;
       int32_t next_flat_idx = -1;
@@ -273,94 +357,26 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
             }
           }
 
-          auto legacy_resource_req = gang_resource_req->add_requests();
-          *legacy_resource_req->mutable_resources_bundle() = aggregated_resources;
-
-          auto *bundle_resource_req = bundle_selector->add_resource_requests();
-          *bundle_resource_req->mutable_resources_bundle() = aggregated_resources;
-
-          if (!aggregated_label_selectors.empty()) {
-            ray::LabelSelector selector(aggregated_label_selectors);
-            selector.ToProto(bundle_resource_req->add_label_selectors());
+          google::protobuf::Map<std::string, std::string> proto_label_selectors;
+          for (const auto &[key, val] : aggregated_label_selectors) {
+            proto_label_selectors[key] = val;
           }
-
-          if (group_pg_constraint.has_value()) {
-            legacy_resource_req->add_placement_constraints()->CopyFrom(
-                group_pg_constraint.value());
-            bundle_resource_req->add_placement_constraints()->CopyFrom(
-                group_pg_constraint.value());
-          }
+          AddBundleToGangResourceRequest(aggregated_resources,
+                                         proto_label_selectors,
+                                         group_pg_constraint,
+                                         gang_resource_req,
+                                         bundle_selector);
         } else {
           for (const auto *bundle_ptr : group_bundles) {
-            const auto &unit_resources = bundle_ptr->unit_resources();
-
-            auto legacy_resource_req = gang_resource_req->add_requests();
-            *legacy_resource_req->mutable_resources_bundle() = unit_resources;
-
-            auto *bundle_resource_req = bundle_selector->add_resource_requests();
-            *bundle_resource_req->mutable_resources_bundle() = unit_resources;
-
-            if (!bundle_ptr->label_selector().empty()) {
-              ray::LabelSelector selector(bundle_ptr->label_selector());
-              selector.ToProto(bundle_resource_req->add_label_selectors());
-            }
-
-            if (group_pg_constraint.has_value()) {
-              legacy_resource_req->add_placement_constraints()->CopyFrom(
-                  group_pg_constraint.value());
-              bundle_resource_req->add_placement_constraints()->CopyFrom(
-                  group_pg_constraint.value());
-            }
+            AddBundleToGangResourceRequest(bundle_ptr->unit_resources(),
+                                           bundle_ptr->label_selector(),
+                                           group_pg_constraint,
+                                           gang_resource_req,
+                                           bundle_selector);
           }
         }
 
-        // Add topology strategy to this group's bundle_selector
-        const auto &topology_strategy = pg_data.topology_strategy();
-        if (!topology_strategy.empty()) {
-          std::string topology_label_key;
-          rpc::PlacementStrategy strategy = rpc::PlacementStrategy::PACK;
-          for (const auto &pair : topology_strategy[0].entries()) {
-            if (pair.first != kLabelKeyNodeID) {
-              topology_label_key = pair.first;
-              strategy = pair.second;
-              break;
-            }
-          }
-
-          if (!topology_label_key.empty()) {
-            auto *locality_req = bundle_selector->mutable_locality_requirement();
-            auto *locality_constraint = locality_req->mutable_locality_constraint();
-            locality_constraint->set_label_name(topology_label_key);
-            locality_constraint->set_placement_strategy(strategy);
-
-            std::optional<std::string> pin_value;
-            for (const auto &assignment : pg_data.group_topology_assignments()) {
-              if (assignment.bundle_group_index() == group_idx) {
-                auto it = assignment.assignments().find(topology_label_key);
-                if (it != assignment.assignments().end()) {
-                  pin_value = it->second;
-                }
-                break;
-              }
-            }
-            if (!pin_value.has_value() && group_idx < 0) {
-              const auto &assignments = pg_data.topology_assignments();
-              auto it = assignments.find(topology_label_key);
-              if (it != assignments.end()) {
-                pin_value = it->second;
-              }
-            }
-
-            if (pin_value.has_value()) {
-              auto *label_constraint =
-                  locality_req->mutable_label_selector()->add_label_constraints();
-              label_constraint->set_label_key(topology_label_key);
-              label_constraint->set_operator_(
-                  rpc::LabelSelectorOperator::LABEL_OPERATOR_IN);
-              label_constraint->add_label_values(*pin_value);
-            }
-          }
-        }
+        PopulateTopologyLocalityRequirement(pg_data, bundle_selector, group_idx);
       }
     } else {
       auto *gang_resource_req = state->add_pending_gang_resource_requests();
@@ -373,63 +389,14 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
           continue;
         }
 
-        const auto &unit_resources = bundle.unit_resources();
-
-        auto legacy_resource_req = gang_resource_req->add_requests();
-        *legacy_resource_req->mutable_resources_bundle() = unit_resources;
-
-        auto *bundle_resource_req = bundle_selector->add_resource_requests();
-        *bundle_resource_req->mutable_resources_bundle() = unit_resources;
-
-        if (!bundle.label_selector().empty()) {
-          ray::LabelSelector selector(bundle.label_selector());
-          selector.ToProto(bundle_resource_req->add_label_selectors());
-        }
-
-        if (pg_constraint.has_value()) {
-          legacy_resource_req->add_placement_constraints()->CopyFrom(
-              pg_constraint.value());
-          bundle_resource_req->add_placement_constraints()->CopyFrom(
-              pg_constraint.value());
-        }
+        AddBundleToGangResourceRequest(bundle.unit_resources(),
+                                       bundle.label_selector(),
+                                       pg_constraint,
+                                       gang_resource_req,
+                                       bundle_selector);
       }
 
-      // TODO: Currently, the autoscaler only supports a single LocalityRequirement per
-      // BundleSelector. If the placement group defines multiple layers in its topology
-      // strategy, only the first layer is passed to the autoscaler. Future extensions
-      // should update GangResourceRequest to support a hierarchy of locality
-      // requirements.
-      const auto &topology_strategy = pg_data.topology_strategy();
-      if (!topology_strategy.empty()) {
-        std::string topology_label_key;
-        rpc::PlacementStrategy strategy = rpc::PlacementStrategy::PACK;
-        for (const auto &pair : topology_strategy[0].entries()) {
-          if (pair.first != kLabelKeyNodeID) {
-            topology_label_key = pair.first;
-            strategy = pair.second;
-            break;
-          }
-        }
-
-        if (!topology_label_key.empty()) {
-          auto *locality_req = bundle_selector->mutable_locality_requirement();
-          auto *locality_constraint = locality_req->mutable_locality_constraint();
-          locality_constraint->set_label_name(topology_label_key);
-          locality_constraint->set_placement_strategy(strategy);
-
-          // If the scheduler has already picked a value for this topology label
-          // (rescheduling case), pin the autoscaler request to that value.
-          const auto &assignments = pg_data.topology_assignments();
-          if (auto it = assignments.find(topology_label_key); it != assignments.end()) {
-            auto *label_constraint =
-                locality_req->mutable_label_selector()->add_label_constraints();
-            label_constraint->set_label_key(topology_label_key);
-            label_constraint->set_operator_(
-                rpc::LabelSelectorOperator::LABEL_OPERATOR_IN);
-            label_constraint->add_label_values(it->second);
-          }
-        }
-      }
+      PopulateTopologyLocalityRequirement(pg_data, bundle_selector);
     }
   }
 }

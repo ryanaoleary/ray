@@ -58,7 +58,7 @@ class TopologySchedulingPolicyInterface {
   virtual SchedulingResult Schedule(
       const std::vector<const ResourceRequest *> &resource_request_list,
       const SchedulingOptions &options,
-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
+      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
       NodeScheduleFn node_schedule_fn) = 0;
 
  protected:
@@ -92,7 +92,7 @@ class TopologyStrictPackSchedulingPolicy : public TopologySchedulingPolicyInterf
   SchedulingResult Schedule(
       const std::vector<const ResourceRequest *> &resource_request_list,
       const SchedulingOptions &options,
-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
+      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
       NodeScheduleFn node_schedule_fn) override;
 };
 

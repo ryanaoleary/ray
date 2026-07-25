@@ -410,7 +410,7 @@ SchedulingResult ClusterResourceScheduler::SchedulePlacementGroup(
     }
   }
   return bundle_scheduling_policy_->Schedule(
-      resource_request_list, options, std::move(candidate_nodes));
+      resource_request_list, options, candidate_nodes);
 }
 
 }  // namespace ray

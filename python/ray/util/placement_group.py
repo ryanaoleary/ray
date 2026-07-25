@@ -168,7 +168,8 @@ def placement_group(
         topology_strategy: Topology strategy placement. A dict mapping each
             topology label key to a placement strategy (e.g.,
             ``{"ray.io/gpu-domain": "STRICT_PACK"}``), or a list of such dicts
-            for hierarchical strategy layers.
+            for hierarchical strategy layers. If a list of layers is provided,
+            the layers must be ordered from outermost to innermost topology.
             Mutually exclusive with `strategy`.
 
     Raises:
@@ -209,9 +210,11 @@ def placement_group(
         elif isinstance(topology_strategy, list):
             topology_strategy_layers = []
             for layer in topology_strategy:
-                l = {k: v for k, v in layer.items() if k != NODE_ID_LABEL_KEY}
-                if l:
-                    topology_strategy_layers.append(l)
+                stripped_layer = {
+                    k: v for k, v in layer.items() if k != NODE_ID_LABEL_KEY
+                }
+                if stripped_layer:
+                    topology_strategy_layers.append(stripped_layer)
         else:
             raise ValueError(
                 "`topology_strategy` must be a dict or a list of dicts, "

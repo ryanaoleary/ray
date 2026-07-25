@@ -726,7 +726,9 @@ message PlacementGroupSpec {
   bytes soft_target_node_id = 11;
   // Topology strategy. Maps non-node topology label keys (e.g.
   // "ray.io/gpu-domain") to the placement strategy applied at that label.
-  repeated TopologyStrategyLayer topology_strategy = 12;
+  // Layers are ordered from outermost to innermost topology.
+  reserved 12;
+  repeated TopologyStrategyLayer topology_strategy = 13;
 }
 
 message ObjectReference {
