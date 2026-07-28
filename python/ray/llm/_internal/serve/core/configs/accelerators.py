@@ -19,29 +19,6 @@ logger = get_logger(__name__)
 AcceleratorType = Enum("AcceleratorType", vars(accelerators))
 
 
-class AcceleratorFamily(Enum):
-    GPU = "GPU"
-    TPU = "TPU"
-    NPU = "NPU"
-    CPU = "CPU"
-
-
-def get_accelerator_family(accelerator_type: Optional[str]) -> AcceleratorFamily:
-    if not accelerator_type:
-        return AcceleratorFamily.CPU
-    accelerator_type_upper = accelerator_type.upper()
-    if accelerator_type_upper.startswith("TPU"):
-        return AcceleratorFamily.TPU
-    if (
-        accelerator_type_upper.startswith("ASCEND")
-        or accelerator_type_upper.startswith("MXC")
-        or accelerator_type_upper.startswith("FURIOSA")
-    ):
-        return AcceleratorFamily.NPU
-    # Default to GPU for unknown or NVIDIA/AMD/INTEL/AWS types, to preserve backward compatibility
-    return AcceleratorFamily.GPU
-
-
 # Set of TPU string values from Ray's known accelerators.
 TPU_ACCELERATOR_VALUES = {
     member.value
@@ -139,6 +116,24 @@ class AcceleratorBackend(ABC):
         """Returns the hardware-specific kwargs for ray.remote().options()."""
         pass
 
+    @abstractmethod
+    def get_batch_remote_args(
+        self, accelerator_type_str: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Returns the hardware-specific kwargs for the map_batches remote task."""
+        pass
+
+    @abstractmethod
+    def create_batch_placement_group(
+        self,
+        *,
+        num_bundles_per_replica: int,
+        accelerator_type_str: Optional[str] = None,
+        placement_group_config: Optional[Dict[str, Any]] = None,
+    ):
+        """Returns the PlacementGroup to use for the batch engine stage."""
+        pass
+
     def shutdown(self) -> None:
         """Release any resources owned by this backend. Idempotent."""
         return
@@ -167,6 +162,24 @@ class CPUAccelerator(AcceleratorBackend):
 
     def get_remote_options(self, accelerator_type_str: str = None):
         return {}
+
+    def get_batch_remote_args(
+        self, accelerator_type_str: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return {}
+
+    def create_batch_placement_group(
+        self,
+        *,
+        num_bundles_per_replica: int,
+        accelerator_type_str: Optional[str] = None,
+        placement_group_config: Optional[Dict[str, Any]] = None,
+    ):
+        import copy
+
+        if placement_group_config:
+            return placement_group(**copy.deepcopy(placement_group_config))
+        return placement_group([{"CPU": 1}] * num_bundles_per_replica, strategy="PACK")
 
 
 class GPUAccelerator(AcceleratorBackend):
@@ -198,6 +211,35 @@ class GPUAccelerator(AcceleratorBackend):
         if accelerator_type_str:
             options["accelerator_type"] = accelerator_type_str
         return options
+
+    def get_batch_remote_args(
+        self, accelerator_type_str: Optional[str] = None
+    ) -> Dict[str, Any]:
+        args = {}
+        if accelerator_type_str:
+            args["accelerator_type"] = accelerator_type_str
+        return args
+
+    def create_batch_placement_group(
+        self,
+        *,
+        num_bundles_per_replica: int,
+        accelerator_type_str: Optional[str] = None,
+        placement_group_config: Optional[Dict[str, Any]] = None,
+    ):
+        import copy
+
+        if placement_group_config:
+            config = copy.deepcopy(placement_group_config)
+            if accelerator_type_str:
+                for bundle in config["bundles"]:
+                    bundle[f"accelerator_type:{accelerator_type_str}"] = 0.001
+            return placement_group(**config)
+
+        bundle = {"GPU": 1, "CPU": 1}
+        if accelerator_type_str:
+            bundle[f"accelerator_type:{accelerator_type_str}"] = 0.001
+        return placement_group([bundle] * num_bundles_per_replica, strategy="PACK")
 
 
 class TPUAccelerator(AcceleratorBackend):
@@ -327,3 +369,54 @@ class TPUAccelerator(AcceleratorBackend):
                 logger.warning(f"Failed to shut down TPU slice PG: {e}")
             finally:
                 self._slice_pg_wrapper = None
+
+    def get_batch_remote_args(
+        self, accelerator_type_str: Optional[str] = None
+    ) -> Dict[str, Any]:
+        args = {}
+        if accelerator_type_str:
+            args["label_selector"] = {"ray.io/accelerator-type": accelerator_type_str}
+        return args
+
+    def create_batch_placement_group(
+        self,
+        *,
+        num_bundles_per_replica: int,
+        accelerator_type_str: Optional[str] = None,
+        placement_group_config: Optional[Dict[str, Any]] = None,
+    ):
+        import copy
+
+        if placement_group_config:
+            return placement_group(**copy.deepcopy(placement_group_config))
+        # TPU bundles must explicitly request a TPU bundle for the placement group
+        # as a single bundle with all chips to ensure atomic scheduling across a slice
+        return placement_group(
+            [{"TPU": num_bundles_per_replica, "CPU": 1}],
+            strategy="PACK",
+        )
+
+
+
+
+
+def get_accelerator_backend(
+    accelerator_type: Optional[str] = None,
+    accelerator_config: Optional[AnyAcceleratorConfig] = None,
+) -> AcceleratorBackend:
+    if accelerator_config:
+        if isinstance(accelerator_config, TPUConfig):
+            return TPUAccelerator(accelerator_config)
+        elif isinstance(accelerator_config, CPUConfig):
+            return CPUAccelerator()
+        elif isinstance(accelerator_config, GPUConfig):
+            return GPUAccelerator()
+
+    if not accelerator_type:
+        return CPUAccelerator()
+
+    accelerator_type_upper = accelerator_type.upper()
+    if accelerator_type_upper.startswith("TPU"):
+        return TPUAccelerator(TPUConfig())
+
+    return GPUAccelerator()

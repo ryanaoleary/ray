@@ -1,7 +1,6 @@
 """The stage that runs vLLM engine."""
 
 import asyncio
-import copy
 import dataclasses
 import logging
 import math
@@ -25,7 +24,6 @@ if TYPE_CHECKING:
 else:
     MultiModalDataDict = Any
 
-import ray
 from ray.llm._internal.batch.constants import TypeVLLMTaskType, vLLMTaskType
 from ray.llm._internal.batch.stages.base import (
     StatefulStage,
@@ -43,10 +41,7 @@ from ray.llm._internal.common.utils.download_utils import (
     download_model_files,
 )
 from ray.llm._internal.common.utils.lora_utils import download_lora_adapter
-from ray.llm._internal.serve.core.configs.accelerators import (
-    AcceleratorFamily,
-    get_accelerator_family,
-)
+from ray.llm._internal.serve.core.configs.accelerators import get_accelerator_backend
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logger = logging.getLogger(__name__)
@@ -860,62 +855,13 @@ def _ray_scheduling_strategy_fn(
     accelerator_type: Optional[str] = None,
     placement_group_config: Optional[Dict[str, Any]] = None,
 ):
-    """Create a Ray scheduling strategy for the engine.
-
-    Args:
-        num_bundles_per_replica: The number of device bundles per
-            engine replica.
-        accelerator_type: The accelerator type. If None, the
-            accelerator_type label will not be set.
-        placement_group_config: The custom placement group configuration.
-            If None, we use the default placement group configuration.
-
-    Returns:
-        The Ray scheduling strategy.
-    """
-    accelerator_family = get_accelerator_family(accelerator_type)
-
-    def _get_bundle() -> Dict[str, float]:
-        if accelerator_family == AcceleratorFamily.TPU:
-            return {"TPU": 1, "CPU": 1}
-        elif accelerator_family == AcceleratorFamily.NPU:
-            bundle = {"NPU": 1, "CPU": 1}
-            if accelerator_type:
-                bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-            return bundle
-        else:
-            # GPU bundles
-            bundle = {"GPU": 1, "CPU": 1}
-
-            # Accelerator type
-            if accelerator_type:
-                bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-            return bundle
-
-    if placement_group_config:
-        placement_group_config = copy.deepcopy(placement_group_config)
-
-        if accelerator_type and accelerator_family not in (
-            AcceleratorFamily.TPU,
-            AcceleratorFamily.NPU,
-        ):
-            for bundle in placement_group_config["bundles"]:
-                bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-
-        pg = ray.util.placement_group(**placement_group_config)
-    else:
-        if accelerator_family == AcceleratorFamily.TPU:
-            # TPU bundles must explicitly request a TPU bundle for the placement group
-            # as a single bundle with all chips to ensure atomic scheduling across a slice
-            pg = ray.util.placement_group(
-                [{"TPU": num_bundles_per_replica, "CPU": 1}],
-                strategy="PACK",
-            )
-        else:
-            pg = ray.util.placement_group(
-                [_get_bundle()] * num_bundles_per_replica,
-                strategy="PACK",
-            )
+    """Create a Ray scheduling strategy for the engine."""
+    backend = get_accelerator_backend(accelerator_type)
+    pg = backend.create_batch_placement_group(
+        num_bundles_per_replica=num_bundles_per_replica,
+        accelerator_type_str=accelerator_type,
+        placement_group_config=placement_group_config,
+    )
     return dict(
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             pg, placement_group_capture_child_tasks=True
@@ -946,17 +892,8 @@ class vLLMEngineStage(StatefulStage):
         fn_constructor_kwargs = values["fn_constructor_kwargs"]
         engine_kwargs = fn_constructor_kwargs.get("engine_kwargs", {})
 
-        accelerator_family = get_accelerator_family(accelerator_type)
-
-        ray_remote_args = {}
-        if accelerator_type:
-            if accelerator_family in (AcceleratorFamily.TPU, AcceleratorFamily.NPU):
-                # TPUs schedule by label, not by Ray's GPU accelerator_type mechanism
-                ray_remote_args["label_selector"] = {
-                    "ray.io/accelerator-type": accelerator_type
-                }
-            else:
-                ray_remote_args["accelerator_type"] = accelerator_type
+        backend = get_accelerator_backend(accelerator_type)
+        ray_remote_args = backend.get_batch_remote_args(accelerator_type)
 
         # Setup num_workers required per vLLM engine.
         tp_size = engine_kwargs.get("tensor_parallel_size", 1)
