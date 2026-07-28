@@ -1,0 +1,35 @@
+diff --git a/src/ray/protobuf/common.proto b/src/ray/protobuf/common.proto
+index 6ab6df9c31..c241f01170 100644
+--- a/src/ray/protobuf/common.proto
++++ b/src/ray/protobuf/common.proto
+@@ -726,7 +726,9 @@ message PlacementGroupSpec {
+   bytes soft_target_node_id = 11;
+   // Topology strategy. Maps non-node topology label keys (e.g.
+   // "ray.io/gpu-domain") to the placement strategy applied at that label.
+-  repeated TopologyStrategyLayer topology_strategy = 12;
++  // Layers are ordered from outermost to innermost topology.
++  reserved 12;
++  repeated TopologyStrategyLayer topology_strategy = 13;
+ }
+
+ message ObjectReference {
+diff --git a/src/ray/protobuf/gcs.proto b/src/ray/protobuf/gcs.proto
+index 0c1b2f281c..bab8a444d7 100644
+--- a/src/ray/protobuf/gcs.proto
++++ b/src/ray/protobuf/gcs.proto
+@@ -687,7 +687,14 @@ message PlacementGroupTableData {
+   // Topology strategy that applies to this PG. Mirrors
+   // PlacementGroupSpec.topology_strategy. Empty if the PG does not use
+   // topology-aware scheduling.
+-  repeated TopologyStrategyLayer topology_strategy = 18;
++  reserved 18;
++  repeated TopologyStrategyLayer topology_strategy = 19;
++
++  message GroupTopologyAssignment {
++    int32 bundle_group_index = 1;
++    map<string, string> assignments = 2;
++  }
++  repeated GroupTopologyAssignment group_topology_assignments = 20;
+ }
+
+ message JobTableData {

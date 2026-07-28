@@ -1,0 +1,14 @@
+Computing main repo mapping:
+Loading:
+Loading: 0 packages loaded
+WARNING: Build option --test_env has changed, discarding analysis cache (this can be expensive, see https://bazel.build/advanced/performance/iteration-speed).
+Analyzing: 662 targets (0 packages loaded, 0 targets configured)
+Analyzing: 662 targets (0 packages loaded, 0 targets configured)
+
+INFO: Analyzed 662 targets (0 packages loaded, 28037 targets configured).
+[17,440 / 17,440] no actions running
+INFO: Found 662 targets...
+INFO: Elapsed time: 1.443s, Critical Path: 0.11s
+INFO: 1 process: 1 internal.
+INFO: Build completed successfully, 1 total action
+BUILD_EXIT=0

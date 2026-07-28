@@ -220,15 +220,6 @@ def test_placement_group_pack(ray_start_cluster):
     placement_group_assert_no_leak([placement_group])
 
 
-@pytest.mark.parametrize(
-    "ray_start_cluster",
-    [
-        {
-            "include_dashboard": True,
-        }
-    ],
-    indirect=True,
-)
 def test_hierarchical_two_pg_contention(ray_start_cluster):
     @ray.remote
     def f():
@@ -250,17 +241,24 @@ def test_hierarchical_two_pg_contention(ray_start_cluster):
         bundles,
         topology_strategy=[{"rack": "STRICT_PACK"}, {"ray.io/node-id": "STRICT_PACK"}],
     )
-    ray.get(pg1.ready())
-
-    # PG2 also requires 4 CPUs. It should fit on the OTHER node.
-    # If there was a double subtraction leak, this would fail or hang.
     pg2 = ray.util.placement_group(
         bundles,
         topology_strategy=[{"rack": "STRICT_PACK"}, {"ray.io/node-id": "STRICT_PACK"}],
     )
+
+    ray.get(pg1.ready())
     ray.get(pg2.ready(), timeout=10.0)
 
 
+@pytest.mark.parametrize(
+    "ray_start_cluster",
+    [
+        {
+            "include_dashboard": True,
+        }
+    ],
+    indirect=True,
+)
 def test_placement_group_strict_pack(ray_start_cluster):
     @ray.remote(num_cpus=2)
     class Actor(object):
@@ -1013,7 +1011,7 @@ def test_hierarchical_pg_partial_recovery(ray_start_cluster):
 
 
 def test_hierarchical_pg_strict_pack_rejoin(ray_start_cluster):
-    # F1: outer-STRICT_PACK rejoin-siblings invariant test.
+    # Ensure outer-STRICT_PACK rejoin-siblings invariant is maintained.
     # We kill a node hosting one group. When it recovers, it must rejoin the same outer domain (rack).
     cluster = ray_start_cluster
 

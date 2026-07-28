@@ -1,0 +1,28 @@
+Computing main repo mapping:
+Loading:
+Loading: 0 packages loaded
+Analyzing: 4 targets (0 packages loaded, 0 targets configured)
+Analyzing: 4 targets (0 packages loaded, 0 targets configured)
+
+INFO: Analyzed 4 targets (0 packages loaded, 0 targets configured).
+[1 / 16] Compiling src/ray/raylet/scheduling/policy/bundle_scheduling_policy.cc; 1s linux-sandbox ... (3 actions running)
+[1 / 16] Compiling src/ray/raylet/scheduling/policy/bundle_scheduling_policy.cc; 11s linux-sandbox ... (3 actions running)
+[6 / 17] Compiling src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc; 19s linux-sandbox ... (3 actions, 2 running)
+[7 / 17] 1 / 4 tests; Compiling src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc; 20s linux-sandbox ... (2 actions running)
+[7 / 17] 1 / 4 tests; Compiling src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc; 30s linux-sandbox ... (2 actions running)
+[8 / 17] 1 / 4 tests; Compiling src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc; 41s linux-sandbox ... (2 actions, 1 running)
+[11 / 17] 1 / 4 tests; Compiling src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc; 42s linux-sandbox ... (3 actions, 2 running)
+[14 / 17] 3 / 4 tests; Compiling src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc; 43s linux-sandbox
+[15 / 17] 3 / 4 tests; [Prepa] Linking src/ray/gcs/tests/gcs_placement_group_scheduler_test
+[16 / 17] 3 / 4 tests; Testing //src/ray/gcs/tests:gcs_placement_group_scheduler_test; 1s linux-sandbox
+INFO: Found 4 test targets...
+INFO: Elapsed time: 50.448s, Critical Path: 49.97s
+INFO: 13 processes: 2 internal, 11 linux-sandbox.
+INFO: Build completed successfully, 13 total actions
+//src/ray/gcs/tests:gcs_autoscaler_state_manager_test                    PASSED in 0.8s
+//src/ray/gcs/tests:gcs_placement_group_manager_test                     PASSED in 0.8s
+//src/ray/gcs/tests:gcs_placement_group_scheduler_test                   PASSED in 1.2s
+//src/ray/raylet/scheduling/policy/tests:scheduling_policy_test          PASSED in 0.5s
+
+Executed 4 out of 4 tests: 4 tests pass.
+TEST_EXIT=0

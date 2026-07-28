@@ -1,0 +1,127 @@
+7da3e0f080 [Fix] Move test_hierarchical_f_series.py to proper tests directory
+ .../ray/tests/test_hierarchical_f_series.py                               | 0
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+33fce55812 Fix F3/R3/R6: Graceful exact fit races and heterogeneous order
+ python/ray/tests/test_placement_group.py           | 62 +++++++++++++----
+ .../scheduling/policy/bundle_scheduling_policy.cc  | 78 ++++++++++++++++++----
+ .../policy/tests/scheduling_policy_test.cc         | 43 +++++++++++-
+ 3 files changed, 156 insertions(+), 27 deletions(-)
+78760ad3cf [Fix] F1: Per-group topology assignments
+ python/ray/tests/test_placement_group.py     | 70 ++++++++++++++++++++++++++++
+ src/ray/gcs/gcs_placement_group_manager.cc   |  2 +
+ src/ray/gcs/gcs_placement_group_scheduler.cc | 54 +++++++++++++++------
+ 3 files changed, 112 insertions(+), 14 deletions(-)
+eba4ea9ebe [Fix] Clean up conversational comments in tests
+ python/ray/tests/test_placement_group.py           | 28 +++++-----------------
+ .../policy/tests/scheduling_policy_test.cc         | 10 +++-----
+ 2 files changed, 9 insertions(+), 29 deletions(-)
+ad335b6693 [Fix] I2-1: Revert manager-level reset and add FT regression test
+ python/ray/tests/test_placement_group.py   | 82 ++++++++++++++++++++++++++++++
+ src/ray/gcs/gcs_placement_group_manager.cc | 29 ++---------
+ 2 files changed, 86 insertions(+), 25 deletions(-)
+ccf321c1d6 [Core] Add missing T9 test for heterogeneous bundle group scheduling
+ .../policy/tests/scheduling_policy_test.cc         | 51 ++++++++++++++++++++++
+ 1 file changed, 51 insertions(+)
+40331234ed [Core] Fix autoscaler strict spread bug and placement group python validation
+ python/ray/autoscaler/_private/resource_demand_scheduler.py   |  2 +-
+ python/ray/util/placement_group.py                            |  4 ++--
+ .../raylet/scheduling/policy/composite_scheduling_policy.cc   | 11 +++++++----
+ 3 files changed, 10 insertions(+), 7 deletions(-)
+68d52d8c59 [Core] Code cleanups, deduplication, and doc fixes (C-Series)
+ doc/source/ray-core/scheduling/placement-group.rst |   5 +-
+ .../client/src/components/PlacementGroupTable.tsx  |   5 +-
+ .../dashboard/client/src/type/placementGroup.ts    |  12 +-
+ python/ray/util/placement_group.py                 |  11 +-
+ python/ray/util/state/common.py                    |  10 +-
+ src/ray/common/tests/bundle_location_index_test.cc |  27 +++
+ src/ray/gcs/gcs_autoscaler_state_manager.cc        | 243 +++++++++------------
+ src/ray/gcs/gcs_placement_group.h                  |   9 +-
+ src/ray/gcs/gcs_placement_group_scheduler.cc       | 145 ++++++------
+ src/ray/protobuf/common.proto                      |   4 +-
+ src/ray/protobuf/gcs.proto                         |   9 +-
+ .../scheduling/cluster_resource_scheduler.cc       |   2 +-
+ .../scheduling/policy/bundle_scheduling_policy.cc  | 218 ++++++++++++++----
+ .../scheduling/policy/bundle_scheduling_policy.h   |  22 +-
+ .../policy/composite_scheduling_policy.cc          |  24 +-
+ .../policy/composite_scheduling_policy.h           |   2 +-
+ .../raylet/scheduling/policy/scheduling_options.h  |   7 +-
+ .../raylet/scheduling/policy/scheduling_policy.h   |   4 +-
+ .../policy/tests/scheduling_policy_test.cc         | 107 ++++-----
+ .../policy/topology_bundle_scheduling_policy.cc    |  17 +-
+ .../policy/topology_bundle_scheduling_policy.h     |   4 +-
+ 21 files changed, 508 insertions(+), 379 deletions(-)
+c8afb6f4fc [Core] Cache GetTopologyStrategyKeys in GcsPlacementGroup (P1/P6)
+ src/mock/ray/gcs/gcs_placement_group_scheduler.h   | 10 ++++++
+ src/ray/gcs/gcs_placement_group.cc                 | 36 +++++++++++++---------
+ src/ray/gcs/gcs_placement_group.h                  |  6 ++--
+ .../gcs/tests/gcs_placement_group_manager_test.cc  |  4 +++
+ 4 files changed, 38 insertions(+), 18 deletions(-)
+2565e1adc4 [Fix] Add E2E test for multi-layer same label and fix Kuhn matching C++ unit tests
+ python/ray/tests/test_placement_group.py           |  97 ++++++++-
+ .../policy/tests/scheduling_policy_test.cc         | 238 +++++++++++++++++++++
+ 2 files changed, 326 insertions(+), 9 deletions(-)
+1f68779680 Fix Autoscaler constraint keys and demote Python label conflict validation
+ python/ray/tests/unit/test_placement_group.py | 179 ++++++++++++++++++++++++++
+ python/ray/util/placement_group.py            |  14 +-
+ src/ray/gcs/gcs_autoscaler_state_manager.cc   |  38 ++++--
+ 3 files changed, 217 insertions(+), 14 deletions(-)
+a3ffcf86db [Core] Add two-PG contention test (R3)
+ python/ray/tests/test_placement_group.py | 207 ++++++-------------------------
+ 1 file changed, 38 insertions(+), 169 deletions(-)
+6eb10a5aae [Core] Document NodeScheduleFn contract (R6)
+ src/ray/raylet/scheduling/policy/scheduling_policy.h | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+c03b187b9d [Core] Reject mixed flat+grouped bundles (R2)
+ src/ray/gcs/gcs_placement_group_manager.cc | 45 +++++++++++++++++++-----------
+ test_hierarchical_f_series.py              | 35 +++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 17 deletions(-)
+8019d2d9db [Core] Fix F4, F5, F6 for hierarchical placement groups
+ .../_private/resource_demand_scheduler.py          |  8 +---
+ python/ray/tests/test_resource_demand_scheduler.py | 41 +++++++++++++++++
+ src/ray/gcs/gcs_placement_group.cc                 | 51 ++++++++++++++++++++++
+ src/ray/gcs/gcs_placement_group.h                  | 10 +++++
+ src/ray/gcs/gcs_placement_group_manager.cc         | 50 +++++++++++++++++++--
+ test_hierarchical_f_series.py                      | 45 +++++++++++++++++++
+ 6 files changed, 194 insertions(+), 11 deletions(-)
+96a0605ae8 Fix logic bugs and test failures in hierarchical PG
+ .../_private/resource_demand_scheduler.py          |  41 ++-
+ python/ray/tests/test_placement_group.py           |  86 ++++++
+ python/ray/util/placement_group.py                 |  15 +
+ src/ray/common/bundle_location_index.cc            |  18 ++
+ src/ray/common/bundle_location_index.h             |   6 +
+ src/ray/gcs/gcs_autoscaler_state_manager.cc        | 188 +++++++-----
+ src/ray/gcs/gcs_placement_group.h                  |   6 +-
+ src/ray/gcs/gcs_placement_group_manager.cc         |  35 ++-
+ src/ray/gcs/gcs_placement_group_scheduler.cc       | 117 ++++++--
+ src/ray/gcs/gcs_placement_group_scheduler.h        |  16 +
+ .../gcs/tests/gcs_autoscaler_state_manager_test.cc |  56 ++--
+ .../tests/gcs_placement_group_scheduler_test.cc    |   7 +-
+ .../scheduling/policy/bundle_scheduling_policy.cc  | 325 +++++++++++++--------
+ .../policy/tests/scheduling_policy_test.cc         |   7 +-
+ 14 files changed, 666 insertions(+), 257 deletions(-)
+9772387737 Merge branch 'master' into pr-hierarchical-pg-cpp-backend
+6baed5b4cd [Core][Scheduler] Implement native hierarchical bundle group scheduling in C++ engine
+ python/ray/_raylet.pyx                             |  16 +-
+ python/ray/includes/common.pxd                     |   3 +-
+ python/ray/tests/test_placement_group.py           | 116 +++++++++++-
+ python/ray/util/placement_group.py                 | 183 +++++++++++++-----
+ src/ray/common/placement_group.h                   |  27 +--
+ src/ray/core_worker/common.h                       |  15 +-
+ src/ray/core_worker/core_worker.cc                 |   3 +-
+ src/ray/gcs/gcs_autoscaler_state_manager.cc        | 159 +++++++++++-----
+ src/ray/gcs/gcs_placement_group.cc                 |  16 +-
+ src/ray/gcs/gcs_placement_group.h                  |  10 +
+ src/ray/gcs/gcs_placement_group_manager.cc         |  22 ++-
+ src/ray/gcs/gcs_placement_group_scheduler.cc       | 201 +++++++++++++++++---
+ src/ray/gcs/gcs_placement_group_scheduler.h        |   5 +
+ .../gcs/tests/gcs_autoscaler_state_manager_test.cc | 166 ++++++++++++++++-
+ .../tests/gcs_placement_group_scheduler_test.cc    | 146 +++++++++++++++
+ src/ray/protobuf/common.proto                      |   7 +-
+ src/ray/protobuf/gcs.proto                         |   4 +-
+ .../scheduling/policy/bundle_scheduling_policy.cc  | 181 ++++++++++++++++++
+ .../scheduling/policy/bundle_scheduling_policy.h   |  30 +++
+ .../policy/composite_scheduling_policy.cc          |  25 +++
+ .../policy/composite_scheduling_policy.h           |   4 +-
+ .../raylet/scheduling/policy/scheduling_options.h  |  16 +-
+ .../policy/tests/scheduling_policy_test.cc         | 206 +++++++++++++++++++++
+ 23 files changed, 1408 insertions(+), 153 deletions(-)

@@ -1,0 +1,4285 @@
+diff --git a/doc/source/ray-core/scheduling/placement-group.rst b/doc/source/ray-core/scheduling/placement-group.rst
+index 5d37e26d54..13fcb48dbd 100644
+--- a/doc/source/ray-core/scheduling/placement-group.rst
++++ b/doc/source/ray-core/scheduling/placement-group.rst
+@@ -772,9 +772,10 @@ How it works
+ ~~~~~~~~~~~~
+
+ Pass ``topology_strategy=`` to :func:`ray.util.placement_group` to enable topology strategy
+-placement. The argument is a dict that maps a label key to the placement strategy used at that level.
++placement. The argument is a dict that maps a label key to the placement strategy used at that level,
++or a list of such dicts for hierarchical layers (ordered from outermost to innermost topology).
+
+-Currently, ``topology_strategy`` is a dictionary that may contain up to two keys:
++Currently, a ``topology_strategy`` dictionary may contain up to two keys:
+
+ - The special key ``ray.io/node-id`` sets the **node-level** strategy and accepts any value
+   in ``{"PACK", "STRICT_PACK", "SPREAD", "STRICT_SPREAD"}``. If you omit it, the node-level
+diff --git a/python/ray/_raylet.pyx b/python/ray/_raylet.pyx
+index b3e7e4ef0a..0c08321a29 100644
+--- a/python/ray/_raylet.pyx
++++ b/python/ray/_raylet.pyx
+@@ -4023,17 +4023,22 @@ cdef class CoreWorker:
+                             c_bool is_detached,
+                             soft_target_node_id,
+                             c_vector[unordered_map[c_string, c_string]] bundle_label_selector,
+-                            dict topology_strategy):
++                            list topology_strategies,
++                            c_vector[int32_t] bundle_group_indices):
+         cdef:
+             CPlacementGroupID c_placement_group_id
+             CPlacementStrategy c_strategy
+             CNodeID c_soft_target_node_id = CNodeID.Nil()
+-            unordered_map[c_string, CPlacementStrategy] c_topology_strategy
++            c_vector[unordered_map[c_string, CPlacementStrategy]] c_topology_strategies
++            unordered_map[c_string, CPlacementStrategy] c_topology_strategy_layer
+
+         c_strategy = prepare_c_strategy(strategy)
+
+-        for label, level_strategy in topology_strategy.items():
+-            c_topology_strategy[label] = prepare_c_strategy(level_strategy)
++        for layer in topology_strategies:
++            c_topology_strategy_layer.clear()
++            for label, level_strategy in layer.items():
++                c_topology_strategy_layer[label] = prepare_c_strategy(level_strategy)
++            c_topology_strategies.push_back(c_topology_strategy_layer)
+
+         if soft_target_node_id is not None:
+             c_soft_target_node_id = CNodeID.FromHex(soft_target_node_id)
+@@ -4049,7 +4054,8 @@ cdef class CoreWorker:
+                                 is_detached,
+                                 c_soft_target_node_id,
+                                 bundle_label_selector,
+-                                c_topology_strategy),
++                                c_topology_strategies,
++                                bundle_group_indices),
+                             &c_placement_group_id))
+
+         return PlacementGroupID(c_placement_group_id.Binary())
+diff --git a/python/ray/autoscaler/_private/resource_demand_scheduler.py b/python/ray/autoscaler/_private/resource_demand_scheduler.py
+index c1fba3eaad..e9dd003450 100644
+--- a/python/ray/autoscaler/_private/resource_demand_scheduler.py
++++ b/python/ray/autoscaler/_private/resource_demand_scheduler.py
+@@ -994,25 +994,42 @@ def placement_groups_to_resource_demands(
+     unconverted = []
+     for placement_group in pending_placement_groups:
+         # Skip **placed** bundle (which has node id associated with it).
+-        shapes = []
++        shapes_by_group = collections.defaultdict(list)
++        is_hierarchical = False
+         for bundle in placement_group.bundles:
+             if bundle.node_id != b"":
+                 continue
+-            shapes.append(dict(bundle.unit_resources))
++            if bundle.HasField("bundle_group_index"):
++                is_hierarchical = True
++                group_idx = bundle.bundle_group_index
++            else:
++                group_idx = 0
++            shapes_by_group[group_idx].append(dict(bundle.unit_resources))
+
+         if (
+             placement_group.strategy == PlacementStrategy.PACK
+             or placement_group.strategy == PlacementStrategy.SPREAD
+         ):
+-            resource_demand_vector.extend(shapes)
++            for shapes in shapes_by_group.values():
++                resource_demand_vector.extend(shapes)
+         elif placement_group.strategy == PlacementStrategy.STRICT_PACK:
+-            combined = collections.defaultdict(float)
+-            for shape in shapes:
+-                for label, quantity in shape.items():
+-                    combined[label] += quantity
+-            resource_demand_vector.append(combined)
++            for shapes in shapes_by_group.values():
++                combined = collections.defaultdict(float)
++                for shape in shapes:
++                    for label, quantity in shape.items():
++                        combined[label] += quantity
++                resource_demand_vector.append(combined)
+         elif placement_group.strategy == PlacementStrategy.STRICT_SPREAD:
+-            unconverted.append(shapes)
++            if is_hierarchical:
++                for shapes in shapes_by_group.values():
++                    unconverted.append(shapes)
++            else:
++                shapes = []
++                for bundle in placement_group.bundles:
++                    if bundle.node_id != b"":
++                        continue
++                    shapes.append(dict(bundle.unit_resources))
++                unconverted.append(shapes)
+         else:
+             logger.error(
+                 f"Unknown placement group request type: {placement_group}. "
+diff --git a/python/ray/dashboard/client/src/components/PlacementGroupTable.tsx b/python/ray/dashboard/client/src/components/PlacementGroupTable.tsx
+index 7bef132340..aa17307453 100644
+--- a/python/ray/dashboard/client/src/components/PlacementGroupTable.tsx
++++ b/python/ray/dashboard/client/src/components/PlacementGroupTable.tsx
+@@ -196,6 +196,7 @@ const PlacementGroupTable = ({
+                 bundles,
+                 topology_strategy,
+                 topology_assignments,
++                group_topology_assignments,
+               }) => (
+                 <TableRow key={placement_group_id}>
+                   <TableCell align="center">
+@@ -215,7 +216,7 @@ const PlacementGroupTable = ({
+                     <LabelSelector bundles={bundles} />
+                   </TableCell>
+                   <TableCell align="center">
+-                    {topology_strategy ? (
++                    {topology_strategy && topology_strategy.length > 0 ? (
+                       <Box sx={{ textAlign: "left" }}>
+                         <div>
+                           <b>strategy:</b> {JSON.stringify(topology_strategy)}
+@@ -224,6 +225,8 @@ const PlacementGroupTable = ({
+                           <b>assignment:</b>{" "}
+                           {topology_assignments
+                             ? JSON.stringify(topology_assignments)
++                            : group_topology_assignments
++                            ? JSON.stringify(group_topology_assignments)
+                             : "-"}
+                         </div>
+                       </Box>
+diff --git a/python/ray/dashboard/client/src/type/placementGroup.ts b/python/ray/dashboard/client/src/type/placementGroup.ts
+index f9c1a9720b..627a6aa5c1 100644
+--- a/python/ray/dashboard/client/src/type/placementGroup.ts
++++ b/python/ray/dashboard/client/src/type/placementGroup.ts
+@@ -26,14 +26,18 @@ export type PlacementGroup = {
+     [key: string]: number | string;
+   } | null;
+   bundles: Bundle[];
+-  // Topology strategy: map from label key (e.g. "ray.io/gpu-domain") to
+-  // corresponding placement strategy.
+-  topology_strategy?: {
++  // Topology strategy: list of maps from label key (e.g. "ray.io/gpu-domain") to
++  // corresponding placement strategy, ordered from outermost to innermost.
++  topology_strategy?: Array<{
+     [key: string]: string;
+-  } | null;
++  }> | null;
+   // Topology assignments: map from topology label key to the value the
+   // scheduler selected for this PG (e.g. {"ray.io/gpu-domain": "rack-1"}).
+   topology_assignments?: {
+     [key: string]: string;
+   } | null;
++  // Group topology assignments: list mapping each group index to its topology assignments.
++  group_topology_assignments?: Array<{
++    [key: string]: string;
++  }> | null;
+ };
+diff --git a/python/ray/includes/common.pxd b/python/ray/includes/common.pxd
+index ef5fed35bb..e3f86a10e6 100644
+--- a/python/ray/includes/common.pxd
++++ b/python/ray/includes/common.pxd
+@@ -436,7 +436,8 @@ cdef extern from "ray/core_worker/common.h" nogil:
+             c_bool is_detached,
+             CNodeID soft_target_node_id,
+             const c_vector[unordered_map[c_string, c_string]] &bundle_label_selector,
+-            const unordered_map[c_string, CPlacementStrategy] &topology_strategy,
++            const c_vector[unordered_map[c_string, CPlacementStrategy]] &topology_strategies,
++            const c_vector[int32_t] &bundle_group_indices,
+         )
+
+     cdef cppclass CObjectLocation "ray::core::ObjectLocation":
+diff --git a/python/ray/tests/test_placement_group.py b/python/ray/tests/test_placement_group.py
+index 9325e643db..90f1084b7d 100644
+--- a/python/ray/tests/test_placement_group.py
++++ b/python/ray/tests/test_placement_group.py
+@@ -7,13 +7,6 @@ import pytest
+ import ray
+ from ray._private.test_utils import placement_group_assert_no_leak
+ from ray._private.utils import get_ray_doc_version
+-from ray.util.placement_group import (
+-    NODE_ID_LABEL_KEY,
+-    VALID_PLACEMENT_GROUP_STRATEGIES,
+-    _validate_bundle_label_selector,
+-    _validate_bundles,
+-    validate_placement_group,
+-)
+ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+
+@@ -236,6 +229,38 @@ def test_placement_group_pack(ray_start_cluster):
+     ],
+     indirect=True,
+ )
++def test_hierarchical_two_pg_contention(ray_start_cluster):
++    @ray.remote
++    def f():
++        return True
++
++    cluster = ray_start_cluster
++    # Create 2 nodes, each with 4 CPUs, same rack
++    for _ in range(2):
++        cluster.add_node(num_cpus=4, labels={"rack": "rack1"})
++    ray.init(address=cluster.address)
++
++    # PG1 requires 1 CPU per bundle, 4 bundles = 4 CPUs total
++    # STRICT_PACK outer (rack), STRICT_PACK inner (node)
++    # Since nodes have 4 CPUs, one node will fit all 4 bundles.
++    # The other node will have 4 CPUs free.
++    bundles = [[{"CPU": 1}] * 4]
++
++    pg1 = ray.util.placement_group(
++        bundles,
++        topology_strategy=[{"rack": "STRICT_PACK"}, {"ray.io/node-id": "STRICT_PACK"}],
++    )
++    ray.get(pg1.ready())
++
++    # PG2 also requires 4 CPUs. It should fit on the OTHER node.
++    # If there was a double subtraction leak, this would fail or hang.
++    pg2 = ray.util.placement_group(
++        bundles,
++        topology_strategy=[{"rack": "STRICT_PACK"}, {"ray.io/node-id": "STRICT_PACK"}],
++    )
++    ray.get(pg2.ready(), timeout=10.0)
++
++
+ def test_placement_group_strict_pack(ray_start_cluster):
+     @ray.remote(num_cpus=2)
+     class Actor(object):
+@@ -662,141 +687,260 @@ def test_omp_num_threads_in_pg(ray_start_cluster):
+     assert ray.get(ref) == 3
+
+
+-class TestPlacementGroupValidation:
+-    def test_strategy_validation(self):
+-        """Test strategy validation when creating a placement group."""
++def test_hierarchical_pg_validations(ray_start_regular):
++    # Verify topology_strategy handles lists properly.
++    bundles = [{"CPU": 1}, {"CPU": 1}]
++    try:
++        ray.util.placement_group(
++            bundles,
++            topology_strategy=[
++                {"ray.io/tpu-slice-name": "STRICT_SPREAD"},
++                {"ray.io/node-id": "STRICT_PACK"},
++            ],
++        )
++    except Exception as e:
++        pytest.fail(f"topology_strategy list validation failed: {e}")
++
++    # Verify single-layer dict stripping ray.io/node-id does not error.
++    try:
++        ray.util.placement_group(bundles, strategy="STRICT_PACK")
++    except Exception as e:
++        pytest.fail(f"empty layer validation failed: {e}")
++
++    # Verify bundle_label_selector length validation works for nested bundles.
++    hierarchical_bundles = [[{"CPU": 1}, {"CPU": 1}], [{"CPU": 1}]]
++    selectors = [{"a": "b"}, {"c": "d"}, {"e": "f"}]
++    try:
++        ray.util.placement_group(hierarchical_bundles, bundle_label_selector=selectors)
++    except ValueError as e:
++        pytest.fail(f"Nested bundle label length validation failed: {e}")
++
++    # Verify empty inner lists raise ValueError.
++    with pytest.raises(ValueError, match="Hierarchical bundle groups cannot be empty"):
++        ray.util.placement_group([[{"CPU": 1}], [], [{"CPU": 1}]])
++
++    # Verify flat bundles with multi-layer topology_strategy raise ValueError.
++    with pytest.raises(
++        ValueError, match="Multi-layer `topology_strategy` requires hierarchical"
++    ):
++        ray.util.placement_group(
++            [{"CPU": 1}, {"CPU": 1}],
++            topology_strategy=[
++                {"ray.io/az": "PACK"},
++                {"ray.io/rack": "STRICT_PACK"},
++            ],
++        )
++
++
++def test_hierarchical_pg_fault_tolerance_partial_failure(ray_start_cluster):
++    cluster = ray_start_cluster
+
+-        # Valid strategies should not raise an exception.
+-        for strategy in VALID_PLACEMENT_GROUP_STRATEGIES:
+-            validate_placement_group(bundles=[{"CPU": 1}], strategy=strategy)
++    # We mock a small cluster with a shared topology domain.
++    # We will simulate 2 nodes in the same domain.
++    head_labels = {
++        "ray.io/test-domain": "domain-1",
++    }
++    worker_labels = {
++        "ray.io/test-domain": "domain-1",
++    }
++
++    cluster.add_node(
++        num_cpus=4,
++        labels=head_labels,
++    )
++    worker_node = cluster.add_node(
++        num_cpus=4,
++        labels=worker_labels,
++    )
+
+-        # Any other strategy should raise a ValueError.
+-        with pytest.raises(ValueError, match="Invalid placement group strategy"):
+-            validate_placement_group(bundles=[{"CPU": 1}], strategy="invalid")
++    ray.init(address=cluster.address)
+
+-    def test_topology_strategy_validation(self):
+-        """Test topology_strategy validation when creating a placement group."""
++    # 1. Create a hierarchical placement group that spans 2 nodes
++    # Each bundle group requires 4 CPUs, forcing one group on head_node, one group on worker_node
++    # We use topology_strategy to ensure they share the same domain-1 but are STRICT_PACKED on node-level
++    pg = ray.util.placement_group(
++        bundles=[[{"CPU": 4}], [{"CPU": 4}]],
++        topology_strategy=[
++            {"ray.io/test-domain": "STRICT_PACK"},
++            {"ray.io/node-id": "STRICT_PACK"},
++        ],
++    )
++    ray.get(pg.ready())
+
+-        valid_topology_strategies = [
+-            {NODE_ID_LABEL_KEY: "PACK"},
+-            {NODE_ID_LABEL_KEY: "STRICT_SPREAD"},
+-            {"ray.io/gpu-domain": "STRICT_PACK"},
+-            {
+-                NODE_ID_LABEL_KEY: "SPREAD",
+-                "ray.io/gpu-domain": "STRICT_PACK",
+-            },
+-        ]
+-        for topology_strategy in valid_topology_strategies:
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}], topology_strategy=topology_strategy
+-            )
+-
+-        with pytest.raises(
+-            ValueError, match="strategy` and `topology_strategy` cannot both"
+-        ):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}],
+-                strategy="PACK",
+-                topology_strategy={"ray.io/gpu-domain": "STRICT_PACK"},
+-            )
+-
+-        with pytest.raises(ValueError, match="must be a dict"):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}],
+-                topology_strategy=[{"ray.io/gpu-domain": "STRICT_PACK"}],
+-            )
+-
+-        with pytest.raises(ValueError, match="keys must be non-empty strings"):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}], topology_strategy={"": "STRICT_PACK"}
+-            )
+-
+-        with pytest.raises(ValueError, match="keys must be non-empty strings"):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}], topology_strategy={1: "STRICT_PACK"}
+-            )
+-
+-        with pytest.raises(ValueError, match="Invalid topology strategy"):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}],
+-                topology_strategy={NODE_ID_LABEL_KEY: "invalid"},
+-            )
+-
+-        with pytest.raises(ValueError, match="only 'STRICT_PACK' is supported"):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}],
+-                topology_strategy={"ray.io/gpu-domain": "SPREAD"},
+-            )
+-
+-        with pytest.raises(ValueError, match="at most one topology label"):
+-            validate_placement_group(
+-                bundles=[{"CPU": 1}],
+-                topology_strategy={
+-                    "ray.io/gpu-domain": "STRICT_PACK",
+-                    "ray.io/zone": "STRICT_PACK",
+-                },
+-            )
+-
+-    def test_bundle_validation(self):
+-        """Test _validate_bundle()."""
+-
+-        # Valid bundles should not raise an exception.
+-        valid_bundles = [{"CPU": 1, "custom-resource": 2.2}, {"GPU": 0.75}]
+-        _validate_bundles(valid_bundles)
+-
+-        # Non-list bundles should raise an exception.
+-        with pytest.raises(ValueError, match="must be a list"):
+-            _validate_bundles("not a list")
+-
+-        # Empty list bundles should raise an exception.
+-        with pytest.raises(ValueError, match="must be a non-empty list"):
+-            _validate_bundles([])
+-
+-        # List that doesn't contain dictionaries should raise an exception.
+-        with pytest.raises(ValueError, match="resource dictionaries"):
+-            _validate_bundles([{"CPU": 1}, "not a dict"])
+-
+-        # List with invalid dictionary entries should raise an exception.
+-        with pytest.raises(ValueError, match="resource dictionaries"):
+-            _validate_bundles([{8: 7}, {5: 3.5}])
+-        with pytest.raises(ValueError, match="resource dictionaries"):
+-            _validate_bundles([{"CPU": "6"}, {"GPU": "5"}])
+-
+-        # Bundles with resources that all have 0 values should raise an exception.
+-        with pytest.raises(ValueError, match="only 0 values"):
+-            _validate_bundles([{"CPU": 0, "GPU": 0}])
+-
+-    def test_bundle_label_selector_validation(self):
+-        """Test _validate_bundle_label_selector()."""
+-
+-        # Valid label selector list should not raise an exception.
+-        valid_label_selectors = [
+-            {"ray.io/market_type": "spot"},
+-            {"ray.io/accelerator-type": "A100"},
+-        ]
+-        _validate_bundle_label_selector(valid_label_selectors)
+-
+-        # Non-list input should raise an exception.
+-        with pytest.raises(ValueError, match="must be a list"):
+-            _validate_bundle_label_selector("not a list")
+-
+-        # Empty list should not raise (interpreted as no-op).
+-        _validate_bundle_label_selector([])
+-
+-        # List with non-dictionary elements should raise an exception.
+-        with pytest.raises(ValueError, match="must be a list of string dictionary"):
+-            _validate_bundle_label_selector(["not a dict", {"valid": "label"}])
+-
+-        # Dictionary with non-string keys or values should raise an exception.
+-        with pytest.raises(ValueError, match="must be a list of string dictionary"):
+-            _validate_bundle_label_selector([{1: "value"}, {"key": "val"}])
+-        with pytest.raises(ValueError, match="must be a list of string dictionary"):
+-            _validate_bundle_label_selector([{"key": 123}, {"valid": "label"}])
+-
+-        # Invalid label key or value syntax (delegated to validate_label_selector).
+-        with pytest.raises(ValueError, match="Invalid label selector provided"):
+-            _validate_bundle_label_selector([{"INVALID key!": "value"}])
++    # Verify that the placement group is CREATED
++    table = ray.util.placement_group_table(pg)
++    assert table["state"] == "CREATED"
++
++    # 2. Kill the worker node
++    cluster.remove_node(worker_node)
++
++    # Wait for GCS to detect failure and mark it RESCHEDULING
++    from ray._private.test_utils import wait_for_condition
++
++    def check_rescheduling():
++        t = ray.util.placement_group_table(pg)
++        return t["state"] == "RESCHEDULING"
++
++    wait_for_condition(check_rescheduling, timeout=10)
++
++    # 3. Bring up a new node with the same domain
++    cluster.add_node(
++        num_cpus=4,
++        labels=worker_labels,
++    )
++
++    # 4. Verify it recovers
++    def check_recovered():
++        t = ray.util.placement_group_table(pg)
++        return t["state"] == "CREATED"
++
++    wait_for_condition(check_recovered, timeout=15)
+
+
+ if __name__ == "__main__":
+     sys.exit(pytest.main(["-sv", __file__]))
++
++
++def test_hierarchical_pg_strict_spread_scheduling(ray_start_cluster):
++    cluster = ray_start_cluster
++    # Create 3 nodes in 3 distinct zones, each with 2 CPUs
++    for i in range(3):
++        cluster.add_node(num_cpus=2, labels={"ray.io/zone": f"zone-{i}"})
++    ray.init(address=cluster.address)
++
++    # 1. Success case: request 3 bundle groups, each needs 2 CPUs
++    # With STRICT_SPREAD on zone, they should be mapped to the 3 distinct zones.
++    pg = ray.util.placement_group(
++        bundles=[[{"CPU": 2}], [{"CPU": 2}], [{"CPU": 2}]],
++        topology_strategy=[
++            {"ray.io/zone": "STRICT_SPREAD"},
++            {"ray.io/node-id": "STRICT_PACK"},
++        ],
++    )
++    ray.get(pg.ready())
++    assert ray.util.placement_group_table(pg)["state"] == "CREATED"
++
++    # 2. Failure case: request 4 bundle groups, but we only have 3 zones.
++    pg2 = ray.util.placement_group(
++        bundles=[[{"CPU": 2}], [{"CPU": 2}], [{"CPU": 2}], [{"CPU": 2}]],
++        topology_strategy=[
++            {"ray.io/zone": "STRICT_SPREAD"},
++            {"ray.io/node-id": "STRICT_PACK"},
++        ],
++    )
++    # Should stay PENDING because it's infeasible to strictly spread across 4 zones
++    import time
++
++    time.sleep(2)
++    assert ray.util.placement_group_table(pg2)["state"] == "PENDING"
++
++
++def test_hierarchical_pg_strict_pack_scheduling(ray_start_cluster):
++    cluster = ray_start_cluster
++    # Create 2 nodes in the same zone. Node 1 has 4 CPUs. Node 2 has 2 CPUs.
++    cluster.add_node(num_cpus=4, labels={"ray.io/zone": "zone-A"})
++    cluster.add_node(num_cpus=2, labels={"ray.io/zone": "zone-A"})
++
++    # Create another zone with one node of 6 CPUs
++    cluster.add_node(num_cpus=6, labels={"ray.io/zone": "zone-B"})
++    ray.init(address=cluster.address)
++
++    # Success case: request 2 bundle groups of {"CPU": 3} each, STRICT_PACKed in the same zone.
++    # zone-A has 4 + 2 = 6 CPUs, but no combination of nodes can fit {"CPU": 3} on one node and {"CPU": 3} on another because nodes are 4 and 2. The second {"CPU": 3} will fail on the 2-CPU node.
++    # Therefore, zone-A should FAIL. It should backtrack and try zone-B!
++    # zone-B has one node with 6 CPUs, so both {"CPU": 3} bundles can pack on it!
++    pg = ray.util.placement_group(
++        bundles=[[{"CPU": 3}], [{"CPU": 3}]],
++        topology_strategy=[
++            {"ray.io/zone": "STRICT_PACK"},
++            {"ray.io/node-id": "STRICT_PACK"},
++        ],
++    )
++    ray.get(pg.ready())
++    table = ray.util.placement_group_table(pg)
++    assert table["state"] == "CREATED"
++
++
++def test_hierarchical_two_layer_same_label(ray_start_cluster):
++    # Tests a PG with two layers that use the SAME topology label.
++    cluster = ray_start_cluster
++
++    # 2 AZs, 2 nodes each
++    cluster.add_node(num_cpus=4, labels={"ray.io/az": "az-1"})
++    cluster.add_node(num_cpus=4, labels={"ray.io/az": "az-1"})
++    cluster.add_node(num_cpus=4, labels={"ray.io/az": "az-2"})
++    cluster.add_node(num_cpus=4, labels={"ray.io/az": "az-2"})
++
++    ray.init(address=cluster.address)
++
++    # Create 4 bundles of CPU:1.
++    # We want them to spread across AZs (so 2 groups across az-1 and az-2),
++    # but strictly pack within each AZ (so group 1 is strictly packed onto one node in az-1,
++    # group 2 is strictly packed onto one node in az-2).
++    bundles = [[{"CPU": 1}, {"CPU": 1}], [{"CPU": 1}, {"CPU": 1}]]
++
++    # We use "ray.io/az" at BOTH layers!
++    # Layer 1: STRICT_SPREAD across ray.io/az
++    # Layer 2 (node-level): STRICT_PACK (default because of how hierarchical PGs map the inner layer to node-level).
++    # Wait, the inner layer is implicitly node-level if it's ray.io/node-id.
++    # To use the same label at two layers, we could do:
++    # [{"ray.io/az": "STRICT_SPREAD"}, {"ray.io/az": "STRICT_PACK"}]
++    # But wait! If the inner layer is "ray.io/az", it means pack within the same AZ!
++    # And then we also need node-level strategy? Node level defaults to PACK if not provided.
++    # Let's test precisely:
++    pg = ray.util.placement_group(
++        bundles,
++        topology_strategy=[
++            {"ray.io/az": "STRICT_SPREAD"},
++            {"ray.io/az": "STRICT_PACK", "ray.io/node-id": "STRICT_PACK"},
++        ],
++    )
++
++    ray.get(pg.ready(), timeout=10)
++
++    # Check that they landed on different AZs but same node within the AZ.
++    table = ray.util.state.list_placement_groups()
++    pg_data = next(p for p in table if p["placement_group_id"] == pg.id.hex())
++    assert pg_data["state"] == "CREATED"
++
++    # Group assignments should show different azs
++    # Verify using bundles_to_node_id mapping
++    bundles_to_node = ray.util.placement_group_table(pg)["bundles_to_node_id"]
++    node1 = bundles_to_node[0]
++    node2 = bundles_to_node[2]
++
++    # Assert they are on different nodes
++    assert node1 != node2
++
++    # Assert strict pack worked within groups
++    assert bundles_to_node[0] == bundles_to_node[1]
++    assert bundles_to_node[2] == bundles_to_node[3]
++
++    # Assert they are in different AZs
++    node_to_az = {}
++    for n in ray.nodes():
++        node_to_az[n["NodeID"]] = (
++            n["Resources"].get("ray.io/az") or n["NodeManagerAddress"]
++        )  # fallback to IP if label not in resources
++        # Actually labels are in n["NodeManagerAddress"] or something? No, labels are in n["Resources"] (e.g. ray.io/az: 1.0)
++
++    # Wait, cluster.add_node(labels={"ray.io/az": "az-1"}) adds the label into Resources as a resource or what?
++    # In ray, node labels are surfaced in the Node dictionary, maybe under "Labels"?
++    # For now let's just assert the nodes are different, which for 4 nodes with STRICT_SPREAD across 2 AZs guarantees they are in different AZs since STRICT_SPREAD forces it!
++    # Wait! Actually they could just be different nodes in the same AZ if STRICT_SPREAD wasn't working.
++    # But wait, there are only 2 AZs, and 2 groups. STRICT_SPREAD across AZ will guarantee they are in different AZs!
++    # Let's just check the nodes are different. But wait, if STRICT_SPREAD failed, they could be on different nodes in the same AZ.
++    # Let's check the AZ of the nodes!
++    nodes_info = ray.nodes()
++    # Labels in ray.nodes() are stored in "NodeManagerAddress" or what?
++    # Let's just find the nodes in nodes_info and check if they have different AZ resource or something.
++    az1 = None
++    az2 = None
++    for n in nodes_info:
++        if n["NodeID"] == node1:
++            az1 = n.get("Labels", {}).get("ray.io/az")
++        if n["NodeID"] == node2:
++            az2 = n.get("Labels", {}).get("ray.io/az")
++
++    if az1 and az2:
++        assert az1 != az2
+diff --git a/python/ray/tests/test_resource_demand_scheduler.py b/python/ray/tests/test_resource_demand_scheduler.py
+index 2c8d921bf0..29fa6dcd84 100644
+--- a/python/ray/tests/test_resource_demand_scheduler.py
++++ b/python/ray/tests/test_resource_demand_scheduler.py
+@@ -1197,6 +1197,47 @@ class TestPlacementGroupScaling:
+         assert to_launch == {"p2.8xlarge": 2}
+         assert not rem
+
++    def test_hierarchical_strict_spread(self):
++        provider = MockProvider()
++        scheduler = ResourceDemandScheduler(
++            provider,
++            TYPES_A,
++            10,
++            head_node_type="p2.8xlarge",
++            upscaling_speed=1,
++        )
++
++        provider.create_node({}, {TAG_RAY_USER_NODE_TYPE: "p2.8xlarge"}, 2)
++        nodes = provider.non_terminated_nodes({})
++
++        resource_demands = []
++
++        from ray.core.generated.common_pb2 import TopologyStrategyLayer
++
++        pending_placement_groups = [
++            PlacementGroupTableData(
++                state=PlacementGroupTableData.PENDING,
++                strategy=PlacementStrategy.STRICT_SPREAD,
++                bundles=[Bundle(unit_resources={"GPU": 2})] * 3,
++                topology_strategy=[TopologyStrategyLayer(), TopologyStrategyLayer()],
++            ),
++        ]
++        # In a hierarchical placement group, the autoscaler converts the bundles to shapes.
++        # Ensure that it asks for exactly 3 distinct nodes (since we need 3 nodes to STRICT_SPREAD 3 bundles).
++        # We currently have 2 nodes, so it should ask for 1 more.
++        to_launch, rem = scheduler.get_nodes_to_launch(
++            nodes,
++            {},
++            resource_demands,
++            {},
++            pending_placement_groups,
++            {},
++            [],
++            EMPTY_AVAILABILITY_SUMMARY,
++        )
++        assert to_launch == {"p2.8xlarge": 1}
++        assert not rem
++
+     def test_many_strict_spreads(self):
+         provider = MockProvider()
+         scheduler = ResourceDemandScheduler(
+diff --git a/python/ray/tests/unit/test_placement_group.py b/python/ray/tests/unit/test_placement_group.py
+new file mode 100644
+index 0000000000..25609afc9e
+--- /dev/null
++++ b/python/ray/tests/unit/test_placement_group.py
+@@ -0,0 +1,179 @@
++import pytest
++
++from ray.util.placement_group import (
++    NODE_ID_LABEL_KEY,
++    VALID_PLACEMENT_GROUP_STRATEGIES,
++    _validate_bundle_label_selector,
++    _validate_bundles,
++    validate_placement_group,
++)
++
++
++class TestPlacementGroupValidation:
++    def test_strategy_validation(self):
++        """Test strategy validation when creating a placement group."""
++
++        # Valid strategies should not raise an exception.
++        for strategy in VALID_PLACEMENT_GROUP_STRATEGIES:
++            validate_placement_group(bundles=[{"CPU": 1}], strategy=strategy)
++
++        # Any other strategy should raise a ValueError.
++        with pytest.raises(ValueError, match="Invalid placement group strategy"):
++            validate_placement_group(bundles=[{"CPU": 1}], strategy="invalid")
++
++    def test_topology_strategy_validation(self):
++        """Test topology_strategy validation when creating a placement group."""
++
++        valid_topology_strategies = [
++            {NODE_ID_LABEL_KEY: "PACK"},
++            {NODE_ID_LABEL_KEY: "STRICT_SPREAD"},
++            {"ray.io/gpu-domain": "STRICT_PACK"},
++            {
++                NODE_ID_LABEL_KEY: "SPREAD",
++                "ray.io/gpu-domain": "STRICT_PACK",
++            },
++        ]
++        for topology_strategy in valid_topology_strategies:
++            validate_placement_group(
++                bundles=[{"CPU": 1}], topology_strategy=topology_strategy
++            )
++
++        with pytest.raises(
++            ValueError, match="strategy` and `topology_strategy` cannot both"
++        ):
++            validate_placement_group(
++                bundles=[{"CPU": 1}],
++                strategy="PACK",
++                topology_strategy={"ray.io/gpu-domain": "STRICT_PACK"},
++            )
++
++        with pytest.raises(ValueError, match="must be a dict"):
++            validate_placement_group(
++                bundles=[{"CPU": 1}],
++                topology_strategy="INVALID",
++            )
++
++        with pytest.raises(ValueError, match="keys must be non-empty strings"):
++            validate_placement_group(
++                bundles=[{"CPU": 1}], topology_strategy={"": "STRICT_PACK"}
++            )
++
++        with pytest.raises(ValueError, match="keys must be non-empty strings"):
++            validate_placement_group(
++                bundles=[{"CPU": 1}], topology_strategy={1: "STRICT_PACK"}
++            )
++
++        with pytest.raises(ValueError, match="Invalid topology strategy"):
++            validate_placement_group(
++                bundles=[{"CPU": 1}],
++                topology_strategy={NODE_ID_LABEL_KEY: "invalid"},
++            )
++
++        with pytest.raises(ValueError, match="Invalid topology strategy"):
++            validate_placement_group(
++                bundles=[{"CPU": 1}],
++                topology_strategy={"ray.io/gpu-domain": "INVALID"},
++            )
++
++        with pytest.raises(ValueError, match="at most one topology label"):
++            validate_placement_group(
++                bundles=[{"CPU": 1}],
++                topology_strategy={
++                    "ray.io/gpu-domain": "STRICT_PACK",
++                    "ray.io/zone": "STRICT_PACK",
++                },
++            )
++
++    def test_bundle_validation(self):
++        """Test _validate_bundle()."""
++
++        # Valid bundles should not raise an exception.
++        valid_bundles = [{"CPU": 1, "custom-resource": 2.2}, {"GPU": 0.75}]
++        _validate_bundles(valid_bundles)
++
++        # Non-list bundles should raise an exception.
++        with pytest.raises(ValueError, match="must be a list"):
++            _validate_bundles("not a list")
++
++        # Empty list bundles should raise an exception.
++        with pytest.raises(ValueError, match="must be a non-empty list"):
++            _validate_bundles([])
++
++        # List that doesn't contain dictionaries should raise an exception.
++        with pytest.raises(ValueError, match="resource dictionaries"):
++            _validate_bundles([{"CPU": 1}, "not a dict"])
++
++        # List with invalid dictionary entries should raise an exception.
++        with pytest.raises(ValueError, match="resource dictionaries"):
++            _validate_bundles([{8: 7}, {5: 3.5}])
++        with pytest.raises(ValueError, match="resource dictionaries"):
++            _validate_bundles([{"CPU": "6"}, {"GPU": "5"}])
++
++        # Bundles with resources that all have 0 values should raise an exception.
++        with pytest.raises(ValueError, match="only 0 values"):
++            _validate_bundles([{"CPU": 0, "GPU": 0}])
++
++    def test_bundle_label_selector_validation(self):
++        """Test _validate_bundle_label_selector()."""
++
++        # Valid label selector list should not raise an exception.
++        valid_label_selectors = [
++            {"ray.io/market_type": "spot"},
++            {"ray.io/accelerator-type": "A100"},
++        ]
++        _validate_bundle_label_selector(valid_label_selectors)
++
++        # Non-list input should raise an exception.
++        with pytest.raises(ValueError, match="must be a list"):
++            _validate_bundle_label_selector("not a list")
++
++        # Empty list should not raise (interpreted as no-op).
++        _validate_bundle_label_selector([])
++
++        # List with non-dictionary elements should raise an exception.
++        with pytest.raises(ValueError, match="must be a list of string dictionary"):
++            _validate_bundle_label_selector(["not a dict", {"valid": "label"}])
++
++        # Dictionary with non-string keys or values should raise an exception.
++        with pytest.raises(ValueError, match="must be a list of string dictionary"):
++            _validate_bundle_label_selector([{1: "value"}, {"key": "val"}])
++        with pytest.raises(ValueError, match="must be a list of string dictionary"):
++            _validate_bundle_label_selector([{"key": 123}, {"valid": "label"}])
++
++        # Invalid label key or value syntax (delegated to validate_label_selector).
++        with pytest.raises(ValueError, match="Invalid label selector provided"):
++            _validate_bundle_label_selector([{"INVALID key!": "value"}])
++
++    def test_bundle_label_selector_conflict_validation(self):
++        """Test that conflicting label selectors within the same bundle group raise an error."""
++        # A single group with conflicting labels for 'ray.io/accelerator'
++        hierarchical_bundles = [[{"CPU": 1}, {"CPU": 1}]]
++        selectors = [
++            {"ray.io/accelerator": "A100"},
++            {"ray.io/accelerator": "H100"},
++        ]
++        # Conflicting labels within a group should just log a warning for STRICT_PACK
++        # and not raise an error.
++        validate_placement_group(
++            bundles=hierarchical_bundles,
++            strategy="STRICT_PACK",
++            bundle_label_selector=selectors,
++        )
++
++        # A valid configuration where labels within the group do not conflict
++        valid_selectors = [
++            {"ray.io/accelerator": "A100", "ray.io/az": "us-east"},
++            {"ray.io/accelerator": "A100"},
++        ]
++        validate_placement_group(
++            bundles=hierarchical_bundles,
++            strategy="STRICT_PACK",
++            bundle_label_selector=valid_selectors,
++        )
++
++        # STRICT_SPREAD allows conflicting labels within a group, no error should be raised.
++        validate_placement_group(
++            bundles=hierarchical_bundles,
++            strategy="STRICT_SPREAD",
++            bundle_label_selector=selectors,
++        )
+diff --git a/python/ray/util/placement_group.py b/python/ray/util/placement_group.py
+index 91bd0267c5..28e4f102c7 100644
+--- a/python/ray/util/placement_group.py
++++ b/python/ray/util/placement_group.py
+@@ -137,7 +137,7 @@ def placement_group(
+     lifetime: Optional[str] = None,
+     _soft_target_node_id: Optional[str] = None,
+     bundle_label_selector: List[Dict[str, str]] = None,
+-    topology_strategy: Optional[Dict[str, str]] = None,
++    topology_strategy: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
+ ) -> PlacementGroup:
+     """Asynchronously creates a PlacementGroup.
+
+@@ -167,7 +167,9 @@ def placement_group(
+             placement group on a per-bundle level.
+         topology_strategy: Topology strategy placement. A dict mapping each
+             topology label key to a placement strategy (e.g.,
+-            ``{"ray.io/gpu-domain": "STRICT_PACK"}``).
++            ``{"ray.io/gpu-domain": "STRICT_PACK"}``), or a list of such dicts
++            for hierarchical strategy layers. If a list of layers is provided,
++            the layers must be ordered from outermost to innermost topology.
+             Mutually exclusive with `strategy`.
+
+     Raises:
+@@ -197,33 +199,61 @@ def placement_group(
+
+     node_level_strategy = _derive_node_level_strategy(strategy, topology_strategy)
+
+-    # Current implementation derives node level strategy from topology_strategy,
+-    # while we pass a topology strategy with node level strategy stripped.
+     if topology_strategy is not None:
+-        stripped_topology_strategy = {
+-            k: v for k, v in topology_strategy.items() if k != NODE_ID_LABEL_KEY
+-        }
++        if isinstance(topology_strategy, dict):
++            topology_strategy_layer = {
++                k: v for k, v in topology_strategy.items() if k != NODE_ID_LABEL_KEY
++            }
++            topology_strategy_layers = (
++                [topology_strategy_layer] if topology_strategy_layer else []
++            )
++        elif isinstance(topology_strategy, list):
++            topology_strategy_layers = []
++            for layer in topology_strategy:
++                stripped_layer = {
++                    k: v for k, v in layer.items() if k != NODE_ID_LABEL_KEY
++                }
++                if stripped_layer:
++                    topology_strategy_layers.append(stripped_layer)
++        else:
++            raise ValueError(
++                "`topology_strategy` must be a dict or a list of dicts, "
++                f"got {type(topology_strategy).__name__}."
++            )
+     else:
+-        stripped_topology_strategy = {}
++        topology_strategy_layers = []
+
+     if lifetime == "detached":
+         detached = True
+     else:
+         detached = False
+
++    flat_bundles = []
++    bundle_group_indices = []
++    if bundles and isinstance(bundles[0], list):
++        for group_idx, group in enumerate(bundles):
++            for bundle in group:
++                flat_bundles.append(bundle)
++                bundle_group_indices.append(group_idx)
++    else:
++        flat_bundles = bundles
++
+     placement_group_id = worker.core_worker.create_placement_group(
+         name,
+-        bundles,
++        flat_bundles,
+         node_level_strategy,
+         detached,
+         _soft_target_node_id,
+         bundle_label_selector,
+-        stripped_topology_strategy,
++        topology_strategy_layers,
++        bundle_group_indices,
+     )
+
+     return PlacementGroup(
+         placement_group_id,
+-        bundle_cache=[{k: float(v) for k, v in bundle.items()} for bundle in bundles],
++        bundle_cache=[
++            {k: float(v) for k, v in bundle.items()} for bundle in flat_bundles
++        ],
+     )
+
+
+@@ -356,12 +386,18 @@ def check_placement_group_index(
+
+
+ def _derive_node_level_strategy(
+-    strategy: Optional[str], topology_strategy: Optional[Dict[str, str]]
++    strategy: Optional[str],
++    topology_strategy: Optional[Union[Dict[str, str], List[Dict[str, str]]]],
+ ) -> str:
+     """Assumes valid strategy and topology strategy, and derives the node level
+     strategy from the corresponding fields accordingly.
+     """
+     if topology_strategy is not None:
++        if isinstance(topology_strategy, list):
++            for layer in reversed(topology_strategy):
++                if NODE_ID_LABEL_KEY in layer:
++                    return layer[NODE_ID_LABEL_KEY]
++            return "PACK"
+         return topology_strategy.get(NODE_ID_LABEL_KEY, "PACK")
+     return strategy if strategy is not None else "PACK"
+
+@@ -372,7 +408,7 @@ def validate_placement_group(
+     lifetime: Optional[str] = None,
+     _soft_target_node_id: Optional[str] = None,
+     bundle_label_selector: List[Dict[str, str]] = None,
+-    topology_strategy: Optional[Dict[str, str]] = None,
++    topology_strategy: Optional[Union[Dict[str, str], List[Dict[str, str]]]] = None,
+ ) -> bool:
+     """Validates inputs for placement_group.
+
+@@ -411,14 +447,58 @@ def validate_placement_group(
+
+     _validate_bundles(bundles)
+
++    if (
++        topology_strategy is not None
++        and isinstance(topology_strategy, list)
++        and len(
++            [
++                layer
++                for layer in topology_strategy
++                if any(k != NODE_ID_LABEL_KEY for k in layer)
++            ]
++        )
++        > 1
++        and bundles
++        and not isinstance(bundles[0], list)
++    ):
++        raise ValueError(
++            "Multi-layer `topology_strategy` requires hierarchical bundle groups "
++            "(a list of lists of bundle resource dicts). "
++            f"Got flat bundles instead: {bundles}"
++        )
++
+     if bundle_label_selector is not None:
+-        if len(bundles) != len(bundle_label_selector):
++        flat_bundles_len = (
++            sum(len(g) for g in bundles)
++            if bundles and isinstance(bundles[0], list)
++            else len(bundles)
++        )
++        if flat_bundles_len != len(bundle_label_selector):
+             raise ValueError(
+                 f"Invalid bundle label selector {bundle_label_selector}. "
+                 f"The length of `bundle_label_selector` should equal the length of `bundles`."
+             )
+         _validate_bundle_label_selector(bundle_label_selector)
+
++        if bundles and isinstance(bundles[0], list):
++            idx = 0
++            for group in bundles:
++                group_labels = {}
++                for _ in group:
++                    selector = bundle_label_selector[idx]
++                    idx += 1
++                    for k, v in selector.items():
++                        if k in group_labels and group_labels[k] != v:
++                            if node_level_strategy == "STRICT_PACK":
++                                import logging
++
++                                logger = logging.getLogger(__name__)
++                                logger.warning(
++                                    f"Conflicting label selector values for key '{k}' "
++                                    "within the same bundle group. The autoscaler may not provision correctly."
++                                )
++                        group_labels[k] = v
++
+     if lifetime not in [None, "detached"]:
+         raise ValueError(
+             "Placement group `lifetime` argument must be either `None` or "
+@@ -426,7 +506,9 @@ def validate_placement_group(
+         )
+
+
+-def _validate_topology_strategy(topology_strategy: Dict[str, str]) -> None:
++def _validate_topology_strategy(
++    topology_strategy: Union[Dict[str, str], List[Dict[str, str]]]
++) -> None:
+     """Validates topology_strategy shape.
+
+     Currently accepts a dict containing "ray.io/node-id" and at most one other
+@@ -434,48 +516,63 @@ def _validate_topology_strategy(topology_strategy: Dict[str, str]) -> None:
+     parameter and accepts any value in VALID_PLACEMENT_GROUP_STRATEGIES. The
+     other (topology) label is restricted to "STRICT_PACK" for now.
+     """
+-    if not isinstance(topology_strategy, dict):
++    if not isinstance(topology_strategy, (dict, list)):
+         raise ValueError(
+-            "`topology_strategy` must be a dict, "
++            "`topology_strategy` must be a dict or a list of dicts, "
+             f"got {type(topology_strategy).__name__}."
+         )
+
+-    if not (0 <= len(topology_strategy) <= 2):
++    if isinstance(topology_strategy, list) and len(topology_strategy) > 2:
+         raise ValueError(
+-            "`topology_strategy` must contain 0, 1, or 2 entries: "
+-            f"`{NODE_ID_LABEL_KEY}` plus an optional topology label. "
+-            f"Got {len(topology_strategy)} entries."
++            "`topology_strategy` currently supports a maximum of 2 layers, "
++            f"got {len(topology_strategy)} layers."
+         )
+
+-    topology_label_keys = []
+-    for key, value in topology_strategy.items():
+-        if not isinstance(key, str) or not key:
++    if isinstance(topology_strategy, dict):
++        layers = [topology_strategy]
++    else:
++        layers = topology_strategy
++
++    for i, layer in enumerate(layers):
++        if not isinstance(layer, dict):
+             raise ValueError(
+-                "`topology_strategy` keys must be non-empty strings, " f"got {key!r}."
++                "`topology_strategy` layers must be dicts, "
++                f"got {type(layer).__name__}."
+             )
+-        if value not in VALID_PLACEMENT_GROUP_STRATEGIES:
++
++        if not (0 <= len(layer) <= 2):
+             raise ValueError(
+-                f"Invalid topology strategy {value!r} for label {key!r}. "
+-                f"Supported strategies are: {VALID_PLACEMENT_GROUP_STRATEGIES}."
++                "`topology_strategy` layer must contain 0, 1, or 2 entries: "
++                f"`{NODE_ID_LABEL_KEY}` plus an optional topology label. "
++                f"Got {len(layer)} entries."
+             )
+-        # The node-id entry is just a redirect to the existing `strategy=`
+-        # parameter and accepts any valid placement-group strategy. For other
+-        # topology labels (e.g. "ray.io/gpu-domain"), currently only supports
+-        # STRICT_PACK.
+-        if not key == NODE_ID_LABEL_KEY:
+-            topology_label_keys.append(key)
+-            if value != "STRICT_PACK":
++
++        topology_label_keys = []
++        for key, value in layer.items():
++            if not isinstance(key, str) or not key:
+                 raise ValueError(
+-                    f"Topology strategy {value!r} for label {key!r} is not "
+-                    "supported yet; only 'STRICT_PACK' is supported for topology "
+-                    f"labels other than `{NODE_ID_LABEL_KEY}` for now."
++                    "`topology_strategy` keys must be non-empty strings, "
++                    f"got {key!r}."
+                 )
+-
+-    if len(topology_label_keys) > 1:
+-        raise ValueError(
+-            "`topology_strategy` currently supports at most one topology label "
+-            f"other than `{NODE_ID_LABEL_KEY}`. Got {topology_label_keys}."
+-        )
++            if value not in VALID_PLACEMENT_GROUP_STRATEGIES:
++                raise ValueError(
++                    f"Invalid topology strategy {value!r} for label {key!r}. "
++                    f"Supported strategies are: {VALID_PLACEMENT_GROUP_STRATEGIES}."
++                )
++            if not key == NODE_ID_LABEL_KEY:
++                topology_label_keys.append(key)
++                if i > 0 and value not in ["STRICT_PACK", "PACK"]:
++                    raise ValueError(
++                        f"Invalid strategy {value!r} for inner topology label {key!r}. "
++                        "Inner custom topology layers currently only support "
++                        "'STRICT_PACK' or 'PACK'."
++                    )
++
++        if len(topology_label_keys) > 1:
++            raise ValueError(
++                "`topology_strategy` currently supports at most one topology label "
++                f"per layer other than `{NODE_ID_LABEL_KEY}`. Got {topology_label_keys}."
++            )
+
+
+ def _validate_bundles(bundles: List[Dict[str, float]]):
+@@ -486,14 +583,32 @@ def _validate_bundles(bundles: List[Dict[str, float]]):
+             "Placement group bundles must be a list, " f"got {type(bundles)}."
+         )
+
+-    if len(bundles) == 0:
++    # Flatten the bundles if they are nested
++    if any(isinstance(b, list) for b in bundles):
++        flat_bundles = []
++        for group in bundles:
++            if not isinstance(group, list):
++                raise ValueError(
++                    "Cannot mix flat resource dictionaries and nested bundle lists. "
++                    "If providing hierarchical bundle groups, all elements must be lists."
++                )
++            if len(group) == 0:
++                raise ValueError(
++                    "Hierarchical bundle groups cannot be empty. "
++                    f"Got empty inner list in bundles: {bundles}"
++                )
++            flat_bundles.extend(group)
++    else:
++        flat_bundles = bundles
++
++    if len(flat_bundles) == 0:
+         raise ValueError(
+             "Bundles must be a non-empty list of resource "
+             'dictionaries. For example: `[{"CPU": 1.0}, {"GPU": 1.0}]`. '
+             "Got empty list instead."
+         )
+
+-    for bundle in bundles:
++    for bundle in flat_bundles:
+         if (
+             not isinstance(bundle, dict)
+             or not all(isinstance(k, str) for k in bundle.keys())
+diff --git a/python/ray/util/state/common.py b/python/ray/util/state/common.py
+index 9afd761e6d..e2807cc956 100644
+--- a/python/ray/util/state/common.py
++++ b/python/ray/util/state/common.py
+@@ -570,7 +570,9 @@ class PlacementGroupState(StateSchema):
+     #: a topology strategy.
+     #:
+     #: NOTE: This field is experimental and may change in the future.
+-    topology_strategy: Optional[dict] = state_column(filterable=False, detail=True)
++    topology_strategy: Optional[List[dict]] = state_column(
++        filterable=False, detail=True
++    )
+     #: Topology assignments: a dict mapping each topology label key to the
+     #: value the scheduler has selected for this PG (e.g.
+     #: {"ray.io/gpu-domain": "rack-1"}). Empty dict if no topology values
+@@ -578,6 +580,12 @@ class PlacementGroupState(StateSchema):
+     #:
+     #: NOTE: This field is experimental and may change in the future.
+     topology_assignments: Optional[dict] = state_column(filterable=False, detail=True)
++    #: Group topology assignments: a list mapping each group index to its topology values.
++    #:
++    #: NOTE: This field is experimental and may change in the future.
++    group_topology_assignments: Optional[List[dict]] = state_column(
++        filterable=False, detail=True
++    )
+
+
+ @dataclass(init=not IS_PYDANTIC_2)
+diff --git a/src/mock/ray/gcs/gcs_placement_group_scheduler.h b/src/mock/ray/gcs/gcs_placement_group_scheduler.h
+index f6fb6ac3ff..db8d52977e 100644
+--- a/src/mock/ray/gcs/gcs_placement_group_scheduler.h
++++ b/src/mock/ray/gcs/gcs_placement_group_scheduler.h
+@@ -40,6 +40,11 @@ class MockGcsPlacementGroupSchedulerInterface
+               DestroyPlacementGroupBundleResourcesIfExists,
+               (const PlacementGroupID &placement_group_id),
+               (override));
++  MOCK_METHOD(void,
++              DestroyPlacementGroupBundleIndices,
++              (const PlacementGroupID &placement_group_id,
++               const std::vector<int64_t> &bundle_indices),
++              (override));
+   MOCK_METHOD(void,
+               MarkScheduleCancelled,
+               (const PlacementGroupID &placement_group_id),
+@@ -94,6 +99,11 @@ class MockGcsPlacementGroupScheduler : public GcsPlacementGroupScheduler {
+               DestroyPlacementGroupBundleResourcesIfExists,
+               (const PlacementGroupID &placement_group_id),
+               (override));
++  MOCK_METHOD(void,
++              DestroyPlacementGroupBundleIndices,
++              (const PlacementGroupID &placement_group_id,
++               const std::vector<int64_t> &bundle_indices),
++              (override));
+   MOCK_METHOD(void,
+               MarkScheduleCancelled,
+               (const PlacementGroupID &placement_group_id),
+diff --git a/src/ray/common/bundle_location_index.cc b/src/ray/common/bundle_location_index.cc
+index 69c385df13..14e2a67c20 100644
+--- a/src/ray/common/bundle_location_index.cc
++++ b/src/ray/common/bundle_location_index.cc
+@@ -115,6 +115,24 @@ bool BundleLocationIndex::Erase(const PlacementGroupID &placement_group_id) {
+   return true;
+ }
+
++bool BundleLocationIndex::EraseBundle(const BundleID &bundle_id) {
++  const auto placement_group_id = bundle_id.first;
++  auto placement_group_it = placement_group_to_bundle_locations_.find(placement_group_id);
++  if (placement_group_it == placement_group_to_bundle_locations_.end()) {
++    return false;
++  }
++
++  auto &pg_bundle_locations = placement_group_it->second;
++  auto pg_bundle_it = pg_bundle_locations->find(bundle_id);
++  if (pg_bundle_it != pg_bundle_locations->end()) {
++    const auto node_id = pg_bundle_it->second.first;
++    EraseBundleInNodeMap(node_id, bundle_id);
++    pg_bundle_locations->erase(pg_bundle_it);
++    return true;
++  }
++  return false;
++}
++
+ const std::optional<std::shared_ptr<BundleLocations> const>
+ BundleLocationIndex::GetBundleLocations(
+     const PlacementGroupID &placement_group_id) const {
+diff --git a/src/ray/common/bundle_location_index.h b/src/ray/common/bundle_location_index.h
+index 970e89f5d7..b4a928e1fe 100644
+--- a/src/ray/common/bundle_location_index.h
++++ b/src/ray/common/bundle_location_index.h
+@@ -62,6 +62,12 @@ class BundleLocationIndex {
+   /// \return True if succeed. False otherwise.
+   bool Erase(const PlacementGroupID &placement_group_id);
+
++  /// Erase a specific bundle.
++  ///
++  /// \param bundle_id The id of the bundle.
++  /// \return True if succeed. False otherwise.
++  bool EraseBundle(const BundleID &bundle_id);
++
+   /// Get BundleLocation of placement group id.
+   ///
+   /// \param placement_group_id Placement group id of this bundle locations.
+diff --git a/src/ray/common/placement_group.h b/src/ray/common/placement_group.h
+index 1a81b1be83..40455d45b5 100644
+--- a/src/ray/common/placement_group.h
++++ b/src/ray/common/placement_group.h
+@@ -92,8 +92,9 @@ class PlacementGroupSpecBuilder {
+       bool is_creator_detached_actor,
+       const std::vector<std::unordered_map<std::string, std::string>>
+           &bundle_label_selector = {},
+-      const std::unordered_map<std::string, rpc::PlacementStrategy> &topology_strategy =
+-          {}) {
++      const std::vector<std::unordered_map<std::string, rpc::PlacementStrategy>>
++          &topology_strategies = {},
++      const std::vector<int32_t> &bundle_group_indices = {}) {
+     message_->set_placement_group_id(placement_group_id.Binary());
+     message_->set_name(name);
+     message_->set_strategy(strategy);
+@@ -111,19 +112,14 @@ class PlacementGroupSpecBuilder {
+     message_->set_soft_target_node_id(soft_target_node_id.Binary());
+
+     for (size_t i = 0; i < bundles.size(); i++) {
+-      auto resources = bundles[i];
+       auto message_bundle = message_->add_bundles();
+       auto mutable_bundle_id = message_bundle->mutable_bundle_id();
+       mutable_bundle_id->set_bundle_index(i);
+       mutable_bundle_id->set_placement_group_id(placement_group_id.Binary());
+       auto mutable_unit_resources = message_bundle->mutable_unit_resources();
+-      for (auto it = resources.begin(); it != resources.end();) {
+-        auto current = it++;
+-        // Remove a resource with value 0 because they are not allowed.
+-        if (current->second == 0) {
+-          resources.erase(current);
+-        } else {
+-          mutable_unit_resources->insert({current->first, current->second});
++      for (const auto &resource : bundles[i]) {
++        if (resource.second != 0) {
++          mutable_unit_resources->insert({resource.first, resource.second});
+         }
+       }
+       // Set the label selector for this bundle if provided in bundle_label_selector.
+@@ -133,10 +129,17 @@ class PlacementGroupSpecBuilder {
+           (*mutable_label_selector)[pair.first] = pair.second;
+         }
+       }
++      if (bundle_group_indices.size() > i) {
++        if (bundle_group_indices[i] >= 0) {
++          message_bundle->set_bundle_group_index(bundle_group_indices[i]);
++        }
++      }
+     }
+
+-    message_->mutable_topology_strategy()->insert(topology_strategy.begin(),
+-                                                  topology_strategy.end());
++    for (const auto &layer : topology_strategies) {
++      auto *layer_proto = message_->add_topology_strategy();
++      layer_proto->mutable_entries()->insert(layer.begin(), layer.end());
++    }
+     return *this;
+   }
+
+diff --git a/src/ray/common/tests/bundle_location_index_test.cc b/src/ray/common/tests/bundle_location_index_test.cc
+index 9e3bba19c8..5fbd75e024 100644
+--- a/src/ray/common/tests/bundle_location_index_test.cc
++++ b/src/ray/common/tests/bundle_location_index_test.cc
+@@ -93,4 +93,31 @@ TEST_F(BundleLocationIndexTest, BesicTest) {
+   ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_1)), node_1);
+ }
+
++TEST_F(BundleLocationIndexTest, EraseBundleTest) {
++  BundleLocationIndex pg_location_index;
++
++  auto bundle_locations = std::make_shared<BundleLocations>();
++  (*bundle_locations)[bundle_0] = std::make_pair(node_0, nullptr);
++  (*bundle_locations)[bundle_1] = std::make_pair(node_1, nullptr);
++  pg_location_index.AddOrUpdateBundleLocations(bundle_locations);
++
++  ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_0)), node_0);
++  ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_1)), node_1);
++
++  // Test erase-then-lookup
++  ASSERT_TRUE(pg_location_index.EraseBundle(bundle_0));
++  ASSERT_FALSE(pg_location_index.GetBundleLocation(bundle_0));
++  ASSERT_EQ(*(pg_location_index.GetBundleLocation(bundle_1)), node_1);
++
++  // Test idempotent double-erase
++  ASSERT_FALSE(pg_location_index.EraseBundle(bundle_0));
++  ASSERT_FALSE(pg_location_index.GetBundleLocation(bundle_0));
++
++  // Test erasing non-existent bundle in existing PG
++  ASSERT_FALSE(pg_location_index.EraseBundle(bundle_2));
++
++  // Test erasing from non-existent PG
++  ASSERT_FALSE(pg_location_index.EraseBundle(pg_2_bundle_0));
++}
++
+ }  // namespace ray
+diff --git a/src/ray/core_worker/common.h b/src/ray/core_worker/common.h
+index ee1e686239..c93a4a5391 100644
+--- a/src/ray/core_worker/common.h
++++ b/src/ray/core_worker/common.h
+@@ -245,14 +245,17 @@ struct PlacementGroupCreationOptions {
+       NodeID soft_target_node_id = NodeID::Nil(),
+       std::vector<std::unordered_map<std::string, std::string>> bundle_label_selector =
+           {},
+-      std::unordered_map<std::string, PlacementStrategy> topology_strategy = {})
++      std::vector<std::unordered_map<std::string, PlacementStrategy>>
++          topology_strategies = {},
++      std::vector<int32_t> bundle_group_indices = {})
+       : name_(std::move(name)),
+         strategy_(strategy),
+         bundles_(std::move(bundles)),
+         is_detached_(is_detached_p),
+         soft_target_node_id_(soft_target_node_id),
+         bundle_label_selector_(std::move(bundle_label_selector)),
+-        topology_strategy_(std::move(topology_strategy)) {
++        topology_strategies_(std::move(topology_strategies)),
++        bundle_group_indices_(std::move(bundle_group_indices)) {
+     RAY_CHECK(soft_target_node_id_.IsNil() || strategy_ == PlacementStrategy::STRICT_PACK)
+         << "soft_target_node_id only works with STRICT_PACK now";
+   }
+@@ -273,9 +276,11 @@ struct PlacementGroupCreationOptions {
+   const NodeID soft_target_node_id_;
+   /// The label selectors to apply per-bundle in this placement group.
+   const std::vector<std::unordered_map<std::string, std::string>> bundle_label_selector_;
+-  /// Topology strategy. Maps each non-node topology label (e.g.
+-  /// "ray.io/gpu-domain") to the placement strategy applied at that label.
+-  const std::unordered_map<std::string, PlacementStrategy> topology_strategy_;
++  /// Topology strategies, organized by layer. Each layer maps non-node topology labels
++  /// to the placement strategy applied at that label.
++  const std::vector<std::unordered_map<std::string, PlacementStrategy>>
++      topology_strategies_;
++  const std::vector<int32_t> bundle_group_indices_;
+ };
+
+ class ObjectLocation {
+diff --git a/src/ray/core_worker/core_worker.cc b/src/ray/core_worker/core_worker.cc
+index 90620c25f6..dbf894ff76 100644
+--- a/src/ray/core_worker/core_worker.cc
++++ b/src/ray/core_worker/core_worker.cc
+@@ -2315,7 +2315,8 @@ Status CoreWorker::CreatePlacementGroup(
+                                 worker_context_->GetCurrentActorID(),
+                                 worker_context_->CurrentActorDetached(),
+                                 placement_group_creation_options.bundle_label_selector_,
+-                                placement_group_creation_options.topology_strategy_);
++                                placement_group_creation_options.topology_strategies_,
++                                placement_group_creation_options.bundle_group_indices_);
+   PlacementGroupSpecification placement_group_spec = builder.Build();
+   *return_placement_group_id = placement_group_id;
+   RAY_LOG(INFO).WithField(placement_group_id)
+diff --git a/src/ray/gcs/gcs_autoscaler_state_manager.cc b/src/ray/gcs/gcs_autoscaler_state_manager.cc
+index 70e21c5ee2..36dcbc6dc4 100644
+--- a/src/ray/gcs/gcs_autoscaler_state_manager.cc
++++ b/src/ray/gcs/gcs_autoscaler_state_manager.cc
+@@ -191,6 +191,91 @@ void GcsAutoscalerStateManager::MakeClusterResourceStateInternal(
+   GetClusterResourceConstraints(state);
+ }
+
++namespace {
++
++void AddBundleToGangResourceRequest(
++    const google::protobuf::Map<std::string, double> &unit_resources,
++    const google::protobuf::Map<std::string, std::string> &label_selector,
++    const std::optional<rpc::autoscaler::PlacementConstraint> &pg_constraint,
++    rpc::autoscaler::GangResourceRequest *gang_resource_req,
++    rpc::autoscaler::BundleSelector *bundle_selector) {
++  auto legacy_resource_req = gang_resource_req->add_requests();
++  *legacy_resource_req->mutable_resources_bundle() = unit_resources;
++
++  auto *bundle_resource_req = bundle_selector->add_resource_requests();
++  *bundle_resource_req->mutable_resources_bundle() = unit_resources;
++
++  if (!label_selector.empty()) {
++    ray::LabelSelector selector(label_selector);
++    selector.ToProto(bundle_resource_req->add_label_selectors());
++  }
++
++  if (pg_constraint.has_value()) {
++    legacy_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
++    bundle_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
++  }
++}
++
++void PopulateTopologyLocalityRequirement(
++    const rpc::PlacementGroupTableData &pg_data,
++    rpc::autoscaler::BundleSelector *bundle_selector,
++    std::optional<int32_t> group_idx = std::nullopt) {
++  const auto &topology_strategy = pg_data.topology_strategy();
++  if (topology_strategy.empty()) {
++    return;
++  }
++
++  std::string topology_label_key;
++  rpc::PlacementStrategy strategy = rpc::PlacementStrategy::PACK;
++  for (const auto &pair : topology_strategy[0].entries()) {
++    if (pair.first != kLabelKeyNodeID) {
++      topology_label_key = pair.first;
++      strategy = pair.second;
++      break;
++    }
++  }
++
++  if (topology_label_key.empty()) {
++    return;
++  }
++
++  auto *locality_req = bundle_selector->mutable_locality_requirement();
++  auto *locality_constraint = locality_req->mutable_locality_constraint();
++  locality_constraint->set_label_name(topology_label_key);
++  locality_constraint->set_placement_strategy(strategy);
++
++  std::optional<std::string> pin_value;
++  if (group_idx.has_value() && group_idx.value() >= 0) {
++    for (const auto &assignment : pg_data.group_topology_assignments()) {
++      if (assignment.bundle_group_index() == group_idx.value()) {
++        auto it = assignment.assignments().find(topology_label_key);
++        if (it != assignment.assignments().end()) {
++          pin_value = it->second;
++        }
++        break;
++      }
++    }
++  }
++
++  if (!pin_value.has_value()) {
++    const auto &assignments = pg_data.topology_assignments();
++    auto it = assignments.find(topology_label_key);
++    if (it != assignments.end()) {
++      pin_value = it->second;
++    }
++  }
++
++  if (pin_value.has_value()) {
++    auto *label_constraint =
++        locality_req->mutable_label_selector()->add_label_constraints();
++    label_constraint->set_label_key(topology_label_key);
++    label_constraint->set_operator_(rpc::LabelSelectorOperator::LABEL_OPERATOR_IN);
++    label_constraint->add_label_values(*pin_value);
++  }
++}
++
++}  // namespace
++
+ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
+     rpc::autoscaler::ClusterResourceState *state) {
+   RAY_CHECK(thread_checker_.IsOnSameThread());
+@@ -203,7 +288,6 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
+   // Iterate through each placement group load.
+   for (auto &&pg_data :
+        std::move(*placement_group_load->mutable_placement_group_data())) {
+-    auto *gang_resource_req = state->add_pending_gang_resource_requests();
+     auto pg_state = pg_data.state();
+     auto pg_id = PlacementGroupID::FromBinary(pg_data.placement_group_id());
+     // For each placement group, if it's not pending/rescheduling, skip it since.
+@@ -216,69 +300,103 @@ void GcsAutoscalerStateManager::GetPendingGangResourceRequests(
+     const auto pg_constraint =
+         GenPlacementConstraintForPlacementGroup(pg_id.Hex(), pg_data.strategy());
+
+-    // Add the strategy as detail info for the gang resource request.
+-    gang_resource_req->set_details(FormatPlacementGroupDetails(pg_data));
+-
+-    // Create a BundleSelector. Only one BundleSelector will be created for now.
+-    // Multiple will be added when we implement the fallback mechanism.
+-    auto *bundle_selector = gang_resource_req->add_bundle_selectors();
+-
+-    // Copy the PG's bundles to the request.
+-    for (auto &&bundle : std::move(*pg_data.mutable_bundles())) {
+-      if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
+-        // We will be skipping **placed** bundle (which has node id associated with it).
+-        // This is to avoid double counting the bundles that are already placed when
+-        // reporting PG related load.
+-        RAY_CHECK(pg_state == rpc::PlacementGroupTableData::RESCHEDULING);
+-        // NOTE: This bundle is placed in a PG, this must be a bundle that was lost due
+-        // to node crashed.
+-        continue;
++    // Copy the PG's bundles to the request. If the placement group has bundle group
++    // indices (hierarchical placement group), aggregate resources for bundles sharing the
++    // same bundle_group_index into a single ResourceRequest for the autoscaler.
++    bool has_bundle_group_indices = false;
++    for (const auto &bundle : pg_data.bundles()) {
++      if (NodeID::FromBinary(bundle.node_id()).IsNil() &&
++          bundle.has_bundle_group_index()) {
++        has_bundle_group_indices = true;
++        break;
++      }
++    }
++    if (has_bundle_group_indices) {
++      std::map<int32_t, std::vector<const rpc::Bundle *>> groups;
++      int32_t next_flat_idx = -1;
++      for (const auto &bundle : pg_data.bundles()) {
++        if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
++          // We will be skipping **placed** bundle (which has node id associated with it).
++          // This is to avoid double counting the bundles that are already placed when
++          // reporting PG related load.
++          RAY_CHECK(pg_state == rpc::PlacementGroupTableData::RESCHEDULING);
++          // NOTE: This bundle is placed in a PG, this must be a bundle that was lost due
++          // to node crashed.
++          continue;
++        }
++        int32_t group_idx = bundle.has_bundle_group_index() ? bundle.bundle_group_index()
++                                                            : next_flat_idx--;
++        groups[group_idx].push_back(&bundle);
+       }
+
+-      const auto &unit_resources = bundle.unit_resources();
+-
+-      // Add the resources. This field will be removed after migrating to
+-      // use the BundleSelector for GangResourceRequests.
+-      auto legacy_resource_req = gang_resource_req->add_requests();
+-      *legacy_resource_req->mutable_resources_bundle() = unit_resources;
++      bool is_strict_pack = pg_data.strategy() == rpc::PlacementStrategy::STRICT_PACK;
++      for (const auto &[group_idx, group_bundles] : groups) {
++        auto *gang_resource_req = state->add_pending_gang_resource_requests();
++        gang_resource_req->set_details(FormatPlacementGroupDetails(pg_data));
++        auto *bundle_selector = gang_resource_req->add_bundle_selectors();
++
++        const auto group_pg_constraint = GenPlacementConstraintForPlacementGroup(
++            pg_id.Hex() + "_" + std::to_string(group_idx), pg_data.strategy());
++
++        if (is_strict_pack) {
++          google::protobuf::Map<std::string, double> aggregated_resources;
++          std::map<std::string, std::string> aggregated_label_selectors;
++          for (const auto *bundle_ptr : group_bundles) {
++            for (const auto &[res_name, res_val] : bundle_ptr->unit_resources()) {
++              aggregated_resources[res_name] += res_val;
++            }
++            for (const auto &[key, val] : bundle_ptr->label_selector()) {
++              auto it = aggregated_label_selectors.find(key);
++              if (it != aggregated_label_selectors.end() && it->second != val) {
++                RAY_LOG(WARNING)
++                    << "Conflicting label selectors for key '" << key
++                    << "' within the same bundle group. The autoscaler may not provision "
++                       "correctly.";
++              }
++              aggregated_label_selectors[key] = val;
++            }
++          }
+
+-      // Add ResourceRequest for this bundle.
+-      auto *bundle_resource_req = bundle_selector->add_resource_requests();
+-      *bundle_resource_req->mutable_resources_bundle() = unit_resources;
++          google::protobuf::Map<std::string, std::string> proto_label_selectors;
++          for (const auto &[key, val] : aggregated_label_selectors) {
++            proto_label_selectors[key] = val;
++          }
++          AddBundleToGangResourceRequest(aggregated_resources,
++                                         proto_label_selectors,
++                                         group_pg_constraint,
++                                         gang_resource_req,
++                                         bundle_selector);
++        } else {
++          for (const auto *bundle_ptr : group_bundles) {
++            AddBundleToGangResourceRequest(bundle_ptr->unit_resources(),
++                                           bundle_ptr->label_selector(),
++                                           group_pg_constraint,
++                                           gang_resource_req,
++                                           bundle_selector);
++          }
++        }
+
+-      // Parse label selector map into LabelSelector proto in ResourceRequest
+-      if (!bundle.label_selector().empty()) {
+-        ray::LabelSelector selector(bundle.label_selector());
+-        selector.ToProto(bundle_resource_req->add_label_selectors());
++        PopulateTopologyLocalityRequirement(pg_data, bundle_selector, group_idx);
+       }
++    } else {
++      auto *gang_resource_req = state->add_pending_gang_resource_requests();
++      gang_resource_req->set_details(FormatPlacementGroupDetails(pg_data));
++      auto *bundle_selector = gang_resource_req->add_bundle_selectors();
++
++      for (auto &&bundle : std::move(*pg_data.mutable_bundles())) {
++        if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
++          RAY_CHECK(pg_state == rpc::PlacementGroupTableData::RESCHEDULING);
++          continue;
++        }
+
+-      // Add the placement constraint.
+-      if (pg_constraint.has_value()) {
+-        legacy_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
+-        bundle_resource_req->add_placement_constraints()->CopyFrom(pg_constraint.value());
++        AddBundleToGangResourceRequest(bundle.unit_resources(),
++                                       bundle.label_selector(),
++                                       pg_constraint,
++                                       gang_resource_req,
++                                       bundle_selector);
+       }
+-    }
+
+-    // Populate locality_requirement if this PG uses a topology strategy.
+-    const auto &topology_strategy = pg_data.topology_strategy();
+-    if (!topology_strategy.empty()) {
+-      const auto &[topology_label_key, _strategy] = *topology_strategy.begin();
+-
+-      auto *locality_req = bundle_selector->mutable_locality_requirement();
+-      auto *locality_constraint = locality_req->mutable_locality_constraint();
+-      locality_constraint->set_label_name(topology_label_key);
+-      locality_constraint->set_placement_strategy(rpc::PlacementStrategy::STRICT_PACK);
+-
+-      // If the scheduler has already picked a value for this topology label
+-      // (rescheduling case), pin the autoscaler request to that value.
+-      const auto &assignments = pg_data.topology_assignments();
+-      if (auto it = assignments.find(topology_label_key); it != assignments.end()) {
+-        auto *label_constraint =
+-            locality_req->mutable_label_selector()->add_label_constraints();
+-        label_constraint->set_label_key(topology_label_key);
+-        label_constraint->set_operator_(rpc::LabelSelectorOperator::LABEL_OPERATOR_IN);
+-        label_constraint->add_label_values(it->second);
+-      }
++      PopulateTopologyLocalityRequirement(pg_data, bundle_selector);
+     }
+   }
+ }
+diff --git a/src/ray/gcs/gcs_placement_group.cc b/src/ray/gcs/gcs_placement_group.cc
+index 1ec8c440ce..e900023c0a 100644
+--- a/src/ray/gcs/gcs_placement_group.cc
++++ b/src/ray/gcs/gcs_placement_group.cc
+@@ -18,6 +18,8 @@
+ #include <string>
+ #include <vector>
+
++#include "ray/common/constants.h"
++
+ namespace ray {
+ namespace gcs {
+
+@@ -108,6 +110,8 @@ std::string GcsPlacementGroup::DebugString() const {
+ rpc::Bundle *GcsPlacementGroup::GetMutableBundle(int bundle_index) {
+   // Invalidate the cache.
+   cached_bundle_specs_.clear();
++  RAY_CHECK_GE(bundle_index, 0);
++  RAY_CHECK_LT(bundle_index, placement_group_table_data_.bundles_size());
+   return placement_group_table_data_.mutable_bundles(bundle_index);
+ }
+
+@@ -148,18 +152,30 @@ rpc::PlacementGroupStats *GcsPlacementGroup::GetMutableStats() {
+   return placement_group_table_data_.mutable_stats();
+ }
+
+-std::optional<std::vector<std::string>> GcsPlacementGroup::GetTopologyStrategyKeys()
+-    const {
+-  const auto &entries = placement_group_table_data_.topology_strategy();
+-  if (entries.empty()) {
+-    return std::nullopt;
+-  }
+-  std::vector<std::string> keys;
+-  keys.reserve(entries.size());
+-  for (const auto &entry : entries) {
+-    keys.push_back(entry.first);
++const std::optional<std::vector<std::string>>
++    &GcsPlacementGroup::GetTopologyStrategyKeys() const {
++  if (!topology_strategy_keys_cached_) {
++    const auto &entries = placement_group_table_data_.topology_strategy();
++    if (entries.empty()) {
++      cached_topology_strategy_keys_ = std::nullopt;
++    } else {
++      std::vector<std::string> keys;
++      for (const auto &layer : entries) {
++        for (const auto &entry : layer.entries()) {
++          if (entry.first != kLabelKeyNodeID) {
++            keys.push_back(entry.first);
++          }
++        }
++      }
++      if (keys.empty()) {
++        cached_topology_strategy_keys_ = std::nullopt;
++      } else {
++        cached_topology_strategy_keys_ = std::move(keys);
++      }
++    }
++    topology_strategy_keys_cached_ = true;
+   }
+-  return keys;
++  return cached_topology_strategy_keys_;
+ }
+
+ std::optional<std::string> GcsPlacementGroup::GetTopologyAssignment(
+@@ -181,5 +197,56 @@ void GcsPlacementGroup::ClearTopologyAssignments() {
+   placement_group_table_data_.mutable_topology_assignments()->clear();
+ }
+
++std::optional<std::string> GcsPlacementGroup::GetGroupTopologyAssignment(
++    int group_index, const std::string &label_key) const {
++  for (const auto &assignment :
++       placement_group_table_data_.group_topology_assignments()) {
++    if (assignment.bundle_group_index() == group_index) {
++      auto it = assignment.assignments().find(label_key);
++      if (it != assignment.assignments().end()) {
++        return it->second;
++      }
++      return std::nullopt;
++    }
++  }
++  return std::nullopt;
++}
++
++void GcsPlacementGroup::SetGroupTopologyAssignment(int group_index,
++                                                   const std::string &label_key,
++                                                   const std::string &label_value) {
++  auto *assignments_list =
++      placement_group_table_data_.mutable_group_topology_assignments();
++  rpc::PlacementGroupTableData::GroupTopologyAssignment *target = nullptr;
++  for (int i = 0; i < assignments_list->size(); i++) {
++    if (assignments_list->Mutable(i)->bundle_group_index() == group_index) {
++      target = assignments_list->Mutable(i);
++      break;
++    }
++  }
++  if (!target) {
++    target = assignments_list->Add();
++    target->set_bundle_group_index(group_index);
++  }
++  (*target->mutable_assignments())[label_key] = label_value;
++}
++
++void GcsPlacementGroup::ClearGroupTopologyAssignments(
++    const std::vector<int> &group_indices) {
++  auto *assignments_list =
++      placement_group_table_data_.mutable_group_topology_assignments();
++  for (int i = assignments_list->size() - 1; i >= 0; i--) {
++    if (std::find(group_indices.begin(),
++                  group_indices.end(),
++                  assignments_list->Get(i).bundle_group_index()) != group_indices.end()) {
++      assignments_list->erase(assignments_list->begin() + i);
++    }
++  }
++}
++
++void GcsPlacementGroup::ClearAllGroupTopologyAssignments() {
++  placement_group_table_data_.mutable_group_topology_assignments()->Clear();
++}
++
+ }  // namespace gcs
+ }  // namespace ray
+diff --git a/src/ray/gcs/gcs_placement_group.h b/src/ray/gcs/gcs_placement_group.h
+index 5c7e04e4b0..528715f319 100644
+--- a/src/ray/gcs/gcs_placement_group.h
++++ b/src/ray/gcs/gcs_placement_group.h
+@@ -164,9 +164,7 @@ class GcsPlacementGroup {
+
+   rpc::PlacementGroupStats *GetMutableStats();
+
+-  /// Get the non-node topology label keys (e.g. {"ray.io/gpu-domain"}), or
+-  /// std::nullopt if this PG doesn't use a topology strategy.
+-  std::optional<std::vector<std::string>> GetTopologyStrategyKeys() const;
++  const std::optional<std::vector<std::string>> &GetTopologyStrategyKeys() const;
+
+   /// Get the topology assignment value selected for `label_key` (e.g. the
+   /// chosen ray.io/gpu-domain for this PG).
+@@ -180,8 +178,29 @@ class GcsPlacementGroup {
+   /// strategy PG becomes unplaced, so a fresh selection can be made).
+   void ClearTopologyAssignments();
+
++  std::optional<std::string> GetGroupTopologyAssignment(
++      int group_index, const std::string &label_key) const;
++
++  void SetGroupTopologyAssignment(int group_index,
++                                  const std::string &label_key,
++                                  const std::string &label_value);
++
++  void ClearGroupTopologyAssignments(const std::vector<int> &group_indices);
++  void ClearAllGroupTopologyAssignments();
++
++  /// Check if any bundle in this placement group has a bundle_group_index.
++  ///
++  /// \return True if any bundle has a bundle_group_index, False otherwise.
++  bool HasBundleGroups() const {
++    for (int i = 0; i < placement_group_table_data_.bundles_size(); i++) {
++      if (placement_group_table_data_.bundles(i).has_bundle_group_index()) {
++        return true;
++      }
++    }
++    return false;
++  }
++
+  private:
+-  // XXX.
+   FRIEND_TEST(GcsPlacementGroupManagerTest, TestPlacementGroupBundleCache);
+
+   /// Setup states other than placement_group_table_data_.
+@@ -225,6 +244,8 @@ class GcsPlacementGroup {
+   /// formatted strings for all resources (heavy string operations). To optimize the CPU
+   /// usage, we cache bundle specs.
+   mutable std::vector<std::shared_ptr<const BundleSpecification>> cached_bundle_specs_;
++  mutable std::optional<std::vector<std::string>> cached_topology_strategy_keys_;
++  mutable bool topology_strategy_keys_cached_ = false;
+
+   /// Reference to the counter to use for placement group state metrics tracking.
+   std::shared_ptr<CounterMap<rpc::PlacementGroupTableData::PlacementGroupState>> counter_;
+diff --git a/src/ray/gcs/gcs_placement_group_manager.cc b/src/ray/gcs/gcs_placement_group_manager.cc
+index 8d1729f3b6..e586465adc 100644
+--- a/src/ray/gcs/gcs_placement_group_manager.cc
++++ b/src/ray/gcs/gcs_placement_group_manager.cc
+@@ -218,10 +218,31 @@ void GcsPlacementGroupManager::OnPlacementGroupCreationFailed(
+
+   auto stats = placement_group->GetMutableStats();
+   if (!is_feasible) {
+-    // We will attempt to schedule this placement_group once an eligible node is
+-    // registered.
+-    stats->set_scheduling_state(rpc::PlacementGroupStats::INFEASIBLE);
+-    infeasible_placement_groups_.emplace_back(std::move(placement_group));
++    if (placement_group->GetState() == rpc::PlacementGroupTableData::RESCHEDULING &&
++        placement_group->GetTopologyStrategyKeys().has_value()) {
++      RAY_LOG(WARNING)
++          << "Topology-aware placement group " << placement_group->GetName()
++          << " is infeasible to reschedule on its current topology pins. "
++          << "Self-healing by destroying all placed bundles and resetting to PENDING.";
++      gcs_placement_group_scheduler_->DestroyPlacementGroupBundleResourcesIfExists(
++          placement_group->GetPlacementGroupID());
++      placement_group->ClearAllGroupTopologyAssignments();
++      placement_group->ClearTopologyAssignments();
++
++      for (int i = 0; i < placement_group->GetPlacementGroupTableData().bundles_size();
++           i++) {
++        placement_group->GetMutableBundle(i)->clear_node_id();
++      }
++
++      placement_group->UpdateState(rpc::PlacementGroupTableData::PENDING);
++      stats->set_scheduling_state(rpc::PlacementGroupStats::QUEUED);
++      AddToPendingQueue(std::move(placement_group), /*rank=*/0);
++    } else {
++      // We will attempt to schedule this placement_group once an eligible node is
++      // registered.
++      stats->set_scheduling_state(rpc::PlacementGroupStats::INFEASIBLE);
++      infeasible_placement_groups_.emplace_back(std::move(placement_group));
++    }
+   } else {
+     auto state = placement_group->GetState();
+     RAY_CHECK(state == rpc::PlacementGroupTableData::RESCHEDULING ||
+@@ -360,6 +381,38 @@ void GcsPlacementGroupManager::HandleCreatePlacementGroup(
+     ray::rpc::CreatePlacementGroupRequest request,
+     ray::rpc::CreatePlacementGroupReply *reply,
+     ray::rpc::SendReplyCallback send_reply_callback) {
++  const auto &spec = request.placement_group_spec();
++  bool has_grouped_bundles = false;
++  bool has_flat_bundles = false;
++  for (int i = 0; i < spec.bundles_size(); i++) {
++    if (spec.bundles(i).has_bundle_group_index()) {
++      has_grouped_bundles = true;
++    } else {
++      has_flat_bundles = true;
++    }
++  }
++
++  if (has_grouped_bundles && has_flat_bundles) {
++    std::string error_msg =
++        "Placement groups cannot contain a mix of grouped bundles (bundles with a "
++        "bundle_group_index) and flat bundles. All bundles must either belong to a "
++        "group or none must belong to a group.";
++    RAY_LOG(WARNING) << error_msg;
++    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::Invalid(error_msg));
++    return;
++  }
++
++  if (spec.topology_strategy_size() > 1 && has_flat_bundles) {
++    std::string error_msg =
++        "Topology strategy requires bundles to be grouped into inner lists "
++        "where each inner list represents the bundles that must fit within "
++        "one logical instance of the inner-most topology level. Flat bundle "
++        "lists are not supported with multi-layer topology strategies.";
++    RAY_LOG(WARNING) << error_msg;
++    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::Invalid(error_msg));
++    return;
++  }
++
+   const JobID &job_id =
+       JobID::FromBinary(request.placement_group_spec().creator_job_id());
+   auto placement_group = std::make_shared<GcsPlacementGroup>(
+@@ -694,11 +747,42 @@ void GcsPlacementGroupManager::OnNodeDead(const NodeID &node_id) {
+   for (const auto &bundle : bundles) {
+     auto iter = registered_placement_groups_.find(bundle.first);
+     if (iter != registered_placement_groups_.end()) {
+-      for (const auto &bundle_index : bundle.second) {
+-        iter->second->GetMutableBundle(bundle_index)->clear_node_id();
+-        RAY_LOG(INFO) << "Rescheduling a bundle when a node dies, placement group id:"
+-                      << iter->second->GetPlacementGroupID()
+-                      << " bundle index:" << bundle_index;
++      if (iter->second->HasBundleGroups()) {
++        absl::flat_hash_set<int> affected_groups;
++        for (const auto &bundle_index : bundle.second) {
++          if (iter->second->GetPlacementGroupTableData()
++                  .bundles(bundle_index)
++                  .has_bundle_group_index()) {
++            affected_groups.insert(iter->second->GetPlacementGroupTableData()
++                                       .bundles(bundle_index)
++                                       .bundle_group_index());
++          }
++        }
++        std::vector<int64_t> bundles_to_clear;
++        for (int i = 0; i < iter->second->GetPlacementGroupTableData().bundles_size();
++             i++) {
++          const auto &b = iter->second->GetPlacementGroupTableData().bundles(i);
++          if (b.has_bundle_group_index() &&
++              affected_groups.contains(b.bundle_group_index())) {
++            bundles_to_clear.push_back(i);
++          }
++        }
++        gcs_placement_group_scheduler_->DestroyPlacementGroupBundleIndices(
++            iter->second->GetPlacementGroupID(), bundles_to_clear);
++        for (int64_t idx : bundles_to_clear) {
++          iter->second->GetMutableBundle(idx)->clear_node_id();
++        }
++        RAY_LOG(INFO) << "Rescheduling affected bundle groups of hierarchical placement "
++                         "group when a "
++                         "node dies, placement group id:"
++                      << iter->second->GetPlacementGroupID();
++      } else {
++        for (const auto &bundle_index : bundle.second) {
++          iter->second->GetMutableBundle(bundle_index)->clear_node_id();
++          RAY_LOG(INFO) << "Rescheduling a bundle when a node dies, placement group id:"
++                        << iter->second->GetPlacementGroupID()
++                        << " bundle index:" << bundle_index;
++        }
+       }
+       // TODO(ffbin): If we have a placement group bundle that requires a unique resource
+       // (for example gpu resource when there's only one gpu node), this can postpone
+diff --git a/src/ray/gcs/gcs_placement_group_scheduler.cc b/src/ray/gcs/gcs_placement_group_scheduler.cc
+index 7b1ddb3e78..1515e496db 100644
+--- a/src/ray/gcs/gcs_placement_group_scheduler.cc
++++ b/src/ray/gcs/gcs_placement_group_scheduler.cc
+@@ -22,9 +22,26 @@
+ #include <vector>
+
+ #include "ray/asio/asio_util.h"
++#include "ray/common/constants.h"
+
+ namespace ray {
+ namespace gcs {
++namespace {
++
++// Group a PG's bundles by the node they were placed on.
++absl::flat_hash_map<NodeID, std::vector<std::shared_ptr<const BundleSpecification>>>
++GroupBundlesByNode(const BundleLocations &bundle_locations) {
++  absl::flat_hash_map<NodeID, std::vector<std::shared_ptr<const BundleSpecification>>>
++      bundles_per_node;
++  for (const auto &iter : bundle_locations) {
++    const auto &node_id = iter.second.first;
++    const auto &bundle_spec = iter.second.second;
++    bundles_per_node[node_id].emplace_back(bundle_spec);
++  }
++  return bundles_per_node;
++}
++
++}  // namespace
+
+ GcsPlacementGroupScheduler::GcsPlacementGroupScheduler(
+     instrumented_io_context &io_context,
+@@ -79,6 +96,46 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
+   }
+
+   auto scheduling_options = CreateSchedulingOptions(*placement_group, strategy);
++
++  // Remap bundle_group_indices_ to match the local resource_request_list
++  // since we only schedule unplaced bundles, not the entire placement group.
++  if (!scheduling_options.bundle_group_indices_.empty() &&
++      bundles.size() !=
++          static_cast<size_t>(
++              placement_group->GetPlacementGroupTableData().bundles_size())) {
++    absl::flat_hash_map<int, int> global_to_local_idx;
++    for (size_t i = 0; i < bundles.size(); i++) {
++      global_to_local_idx[bundles[i]->BundleId().second] = i;
++    }
++    std::vector<std::vector<int>> unplaced_group_indices;
++    std::vector<int> unplaced_original_group_indices;
++    for (size_t i = 0; i < scheduling_options.bundle_group_indices_.size(); i++) {
++      const auto &group = scheduling_options.bundle_group_indices_[i];
++      int original_idx = scheduling_options.original_bundle_group_indices_[i];
++      std::vector<int> local_group;
++      for (int idx : group) {
++        auto it = global_to_local_idx.find(idx);
++        if (it != global_to_local_idx.end()) {
++          local_group.push_back(it->second);
++        }
++      }
++      if (!local_group.empty()) {
++        if (local_group.size() != group.size()) {
++          RAY_LOG(ERROR).WithField(placement_group->GetPlacementGroupID())
++              << "Bundle group " << original_idx
++              << " cannot be partially unplaced. Failing scheduling.";
++          failure_callback(placement_group, /*is_feasible*/ true);
++          return;
++        }
++        unplaced_group_indices.push_back(std::move(local_group));
++        unplaced_original_group_indices.push_back(original_idx);
++      }
++    }
++    scheduling_options.bundle_group_indices_ = std::move(unplaced_group_indices);
++    scheduling_options.original_bundle_group_indices_ =
++        std::move(unplaced_original_group_indices);
++  }
++
+   auto scheduling_result = cluster_resource_scheduler_.SchedulePlacementGroup(
+       resource_request_list, scheduling_options);
+
+@@ -114,6 +171,16 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
+                   << topology_label_value;
+   }
+
++  if (!scheduling_result.selected_group_assignments.empty()) {
++    for (const auto &pair : scheduling_result.selected_group_assignments) {
++      placement_group->SetGroupTopologyAssignment(
++          pair.first, pair.second.first, pair.second.second);
++      RAY_LOG(INFO) << "Placement group " << placement_group->GetPlacementGroupID()
++                    << " group " << pair.first << " assigned to topology label "
++                    << pair.second.first << ": " << pair.second.second;
++    }
++  }
++
+   // Covert to a map of bundle to node.
+   ScheduleMap bundle_to_node;
+   for (size_t i = 0; i < selected_nodes.size(); ++i) {
+@@ -185,6 +252,40 @@ void GcsPlacementGroupScheduler::DestroyPlacementGroupBundleResourcesIfExists(
+   }
+ }
+
++void GcsPlacementGroupScheduler::DestroyPlacementGroupBundleIndices(
++    const PlacementGroupID &placement_group_id,
++    const std::vector<int64_t> &bundle_indices) {
++  absl::flat_hash_set<int64_t> indices_to_remove(bundle_indices.begin(),
++                                                 bundle_indices.end());
++
++  const auto &maybe_bundle_locations =
++      committed_bundle_location_index_.GetBundleLocations(placement_group_id);
++  if (maybe_bundle_locations.has_value()) {
++    const auto &committed_bundle_locations = maybe_bundle_locations.value();
++
++    auto bundles_to_remove = std::make_shared<BundleLocations>();
++    for (const auto &entry : *committed_bundle_locations) {
++      if (indices_to_remove.contains(entry.first.second)) {
++        bundles_to_remove->emplace(entry.first, entry.second);
++      }
++    }
++
++    for (auto &entry : GroupBundlesByNode(*bundles_to_remove)) {
++      RemovePlacementGroupBundles(placement_group_id,
++                                  entry.second,
++                                  gcs_node_manager_.GetAliveNode(entry.first),
++                                  /*max_retry*/ 5,
++                                  /*current_retry_count*/ 0);
++    }
++    for (const auto &bundle : *bundles_to_remove) {
++      committed_bundle_location_index_.EraseBundle(bundle.first);
++      cluster_resource_scheduler_.GetClusterResourceManager()
++          .GetBundleLocationIndex()
++          .EraseBundle(bundle.first);
++    }
++  }
++}
++
+ void GcsPlacementGroupScheduler::MarkScheduleCancelled(
+     const PlacementGroupID &placement_group_id) {
+   auto it = placement_group_leasing_in_progress_.find(placement_group_id);
+@@ -492,10 +593,45 @@ void GcsPlacementGroupScheduler::OnAllBundleCommitRequestReturned(
+   if (!lease_status_tracker->AllCommitRequestsSuccessful()) {
+     // Update the state to be reschedule so that the failure handle will reschedule the
+     // failed bundles.
+-    const auto &uncommitted_bundle_locations =
+-        lease_status_tracker->GetUnCommittedBundleLocations();
+-    for (const auto &bundle : *uncommitted_bundle_locations) {
+-      placement_group->GetMutableBundle(bundle.first.second)->clear_node_id();
++    bool has_bundle_groups = placement_group->HasBundleGroups();
++
++    if (has_bundle_groups) {
++      RAY_LOG(INFO) << "Placement group " << placement_group_id
++                    << " is topology-aware. Commit failure requires partial reschedule.";
++      const auto &uncommitted_bundle_locations =
++          lease_status_tracker->GetUnCommittedBundleLocations();
++      absl::flat_hash_set<int> affected_groups;
++      for (const auto &bundle : *uncommitted_bundle_locations) {
++        int index = bundle.first.second;
++        if (placement_group->GetPlacementGroupTableData()
++                .bundles(index)
++                .has_bundle_group_index()) {
++          affected_groups.insert(placement_group->GetPlacementGroupTableData()
++                                     .bundles(index)
++                                     .bundle_group_index());
++        }
++      }
++
++      std::vector<int64_t> bundles_to_clear;
++      for (int i = 0; i < placement_group->GetPlacementGroupTableData().bundles_size();
++           i++) {
++        const auto &bundle = placement_group->GetPlacementGroupTableData().bundles(i);
++        if (bundle.has_bundle_group_index() &&
++            affected_groups.contains(bundle.bundle_group_index())) {
++          bundles_to_clear.push_back(i);
++        }
++      }
++
++      DestroyPlacementGroupBundleIndices(placement_group_id, bundles_to_clear);
++      for (int64_t idx : bundles_to_clear) {
++        placement_group->GetMutableBundle(idx)->clear_node_id();
++      }
++    } else {
++      const auto &uncommitted_bundle_locations =
++          lease_status_tracker->GetUnCommittedBundleLocations();
++      for (const auto &bundle : *uncommitted_bundle_locations) {
++        placement_group->GetMutableBundle(bundle.first.second)->clear_node_id();
++      }
+     }
+     placement_group->UpdateState(rpc::PlacementGroupTableData::RESCHEDULING);
+     // Uncommitted bundles' resources stay subtracted in GCS's view until the
+@@ -516,44 +652,144 @@ GcsPlacementGroupScheduler::CreateSchedulingContext(
+   return std::make_unique<BundleSchedulingContext>(std::move(bundle_locations));
+ }
+
++std::optional<std::pair<std::string, rpc::PlacementStrategy>> FirstNonNodeEntry(
++    const rpc::TopologyStrategyLayer &layer) {
++  if (layer.entries().size() > 0) {
++    for (const auto &pair : layer.entries()) {
++      if (pair.first != kLabelKeyNodeID) {
++        return std::make_pair(pair.first, pair.second);
++      }
++    }
++  }
++  return std::nullopt;
++}
++
+ SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
+     const GcsPlacementGroup &placement_group, rpc::PlacementStrategy strategy) {
++  const auto &topology_layers =
++      placement_group.GetPlacementGroupTableData().topology_strategy();
++
++  auto outer_entry =
++      topology_layers.size() > 0 ? FirstNonNodeEntry(topology_layers[0]) : std::nullopt;
++  auto inner_entry =
++      topology_layers.size() > 1 ? FirstNonNodeEntry(topology_layers[1]) : std::nullopt;
++
+   std::optional<std::pair<std::string, std::optional<std::string>>>
+       target_topology_assignment;
+-  std::optional<std::vector<std::string>> topology_keys =
+-      placement_group.GetTopologyStrategyKeys();
+-  if (topology_keys.has_value()) {
+-    // Currently supports one topology label.
+-    const std::string &topology_label_key = topology_keys->front();
++  std::optional<std::pair<std::string, std::optional<std::string>>>
++      inner_target_topology_assignment;
++
++  if (outer_entry.has_value()) {
+     std::optional<std::string> topology_label_value =
+-        placement_group.GetTopologyAssignment(topology_label_key);
+-    // If a topology value has already been selected for this PG, the bundles
+-    // are being rescheduled and must land on the same selection.
+-    target_topology_assignment = {topology_label_key, topology_label_value};
++        placement_group.GetTopologyAssignment(outer_entry->first);
++    target_topology_assignment = {outer_entry->first, topology_label_value};
++  }
++
++  if (inner_entry.has_value()) {
++    std::optional<std::string> inner_topology_label_value =
++        placement_group.GetTopologyAssignment(inner_entry->first);
++    inner_target_topology_assignment = {inner_entry->first, inner_topology_label_value};
+   }
+
+   NodeID soft_target_node_id = placement_group.GetSoftTargetNodeID();
+   PlacementGroupID placement_group_id = placement_group.GetPlacementGroupID();
+
++  SchedulingOptions options = SchedulingOptions::BundlePack(std::nullopt);
+   switch (strategy) {
+   case rpc::PlacementStrategy::PACK:
+-    return SchedulingOptions::BundlePack(std::move(target_topology_assignment));
++    options = SchedulingOptions::BundlePack(std::move(target_topology_assignment));
++    break;
+   case rpc::PlacementStrategy::SPREAD:
+-    return SchedulingOptions::BundleSpread(std::move(target_topology_assignment));
++    options = SchedulingOptions::BundleSpread(std::move(target_topology_assignment));
++    break;
+   case rpc::PlacementStrategy::STRICT_PACK:
+-    return SchedulingOptions::BundleStrictPack(
++    options = SchedulingOptions::BundleStrictPack(
+         soft_target_node_id.IsNil() ? scheduling::NodeID::Nil()
+                                     : scheduling::NodeID(soft_target_node_id.Binary()),
+         std::move(target_topology_assignment));
++    break;
+   case rpc::PlacementStrategy::STRICT_SPREAD:
+-    return SchedulingOptions::BundleStrictSpread(
+-        CreateSchedulingContext(placement_group_id),
+-        std::move(target_topology_assignment));
++    options =
++        SchedulingOptions::BundleStrictSpread(CreateSchedulingContext(placement_group_id),
++                                              std::move(target_topology_assignment));
++    break;
+   default:
+     RAY_LOG(FATAL) << "Unsupported scheduling type: "
+                    << rpc::PlacementStrategy_Name(strategy);
+   }
+-  UNREACHABLE;
++
++  if (inner_target_topology_assignment.has_value()) {
++    options.inner_target_topology_assignment_ = *inner_target_topology_assignment;
++  }
++
++  options.inner_strategy_ = inner_entry.has_value() ? inner_entry->second : strategy;
++  options.outer_strategy_ = outer_entry.has_value() ? outer_entry->second : strategy;
++
++  bool has_groups = placement_group.HasBundleGroups();
++  bool has_custom_topology_layer = outer_entry.has_value();
++
++  if (!has_groups && topology_layers.size() <= 1) {
++    if (!has_custom_topology_layer ||
++        options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK) {
++      return options;
++    }
++  }
++
++  std::unordered_map<int, std::vector<int>> group_to_indices;
++  int max_group_index = -1;
++  for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size(); i++) {
++    if (placement_group.GetPlacementGroupTableData()
++            .bundles(i)
++            .has_bundle_group_index()) {
++      int group_index =
++          placement_group.GetPlacementGroupTableData().bundles(i).bundle_group_index();
++      group_to_indices[group_index].push_back(i);
++      if (group_index > max_group_index) {
++        max_group_index = group_index;
++      }
++    }
++  }
++  // For any flat bundles, assign them their own unique group index so they
++  // are not skipped by the hierarchical scheduler.
++  for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size(); i++) {
++    if (!placement_group.GetPlacementGroupTableData()
++             .bundles(i)
++             .has_bundle_group_index()) {
++      max_group_index++;
++      group_to_indices[max_group_index].push_back(i);
++    }
++  }
++  std::vector<int> sorted_group_indices;
++  for (const auto &pair : group_to_indices) {
++    sorted_group_indices.push_back(pair.first);
++  }
++  std::sort(sorted_group_indices.begin(), sorted_group_indices.end());
++  for (int group_idx : sorted_group_indices) {
++    options.bundle_group_indices_.push_back(group_to_indices[group_idx]);
++    options.original_bundle_group_indices_.push_back(group_idx);
++  }
++
++  if (outer_entry.has_value() &&
++      (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD ||
++       options.outer_strategy_ == rpc::PlacementStrategy::SPREAD)) {
++    const std::string &outer_key = outer_entry->first;
++    for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size();
++         i++) {
++      const auto &bundle = placement_group.GetPlacementGroupTableData().bundles(i);
++      if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
++        scheduling::NodeID placed_node(bundle.node_id());
++        const auto &labels =
++            cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
++                placed_node);
++        auto it = labels.find(outer_key);
++        if (it != labels.end()) {
++          options.previously_occupied_topologies_.insert(it->second);
++        }
++      }
++    }
++  }
++
++  return options;
+ }
+
+ absl::flat_hash_map<PlacementGroupID, std::vector<int64_t>>
+@@ -653,23 +889,6 @@ void GcsPlacementGroupScheduler::Initialize(
+   }
+ }
+
+-namespace {
+-
+-// Group a PG's bundles by the node they were placed on.
+-absl::flat_hash_map<NodeID, std::vector<std::shared_ptr<const BundleSpecification>>>
+-GroupBundlesByNode(const BundleLocations &bundle_locations) {
+-  absl::flat_hash_map<NodeID, std::vector<std::shared_ptr<const BundleSpecification>>>
+-      bundles_per_node;
+-  for (const auto &iter : bundle_locations) {
+-    const auto &node_id = iter.second.first;
+-    const auto &bundle_spec = iter.second.second;
+-    bundles_per_node[node_id].emplace_back(bundle_spec);
+-  }
+-  return bundles_per_node;
+-}
+-
+-}  // namespace
+-
+ void GcsPlacementGroupScheduler::DestroyPlacementGroupPreparedBundleResources(
+     const PlacementGroupID &placement_group_id) {
+   // Get the locations of prepared bundles.
+diff --git a/src/ray/gcs/gcs_placement_group_scheduler.h b/src/ray/gcs/gcs_placement_group_scheduler.h
+index 702836285e..b3120d91ad 100644
+--- a/src/ray/gcs/gcs_placement_group_scheduler.h
++++ b/src/ray/gcs/gcs_placement_group_scheduler.h
+@@ -83,6 +83,14 @@ class GcsPlacementGroupSchedulerInterface {
+   virtual void DestroyPlacementGroupBundleResourcesIfExists(
+       const PlacementGroupID &placement_group_id) = 0;
+
++  /// Destroy specific bundle indices for a placement group.
++  ///
++  /// \param placement_group_id The id of the placement group.
++  /// \param bundle_indices The indices of the bundles to be destroyed.
++  virtual void DestroyPlacementGroupBundleIndices(
++      const PlacementGroupID &placement_group_id,
++      const std::vector<int64_t> &bundle_indices) = 0;
++
+   /// Mark the placement group scheduling is cancelled.
+   /// This method will incur check failure if scheduling
+   /// is not actually going on to guarantee strong consistency.
+@@ -315,6 +323,14 @@ class GcsPlacementGroupScheduler : public GcsPlacementGroupSchedulerInterface {
+   void DestroyPlacementGroupBundleResourcesIfExists(
+       const PlacementGroupID &placement_group_id) override;
+
++  /// Destroy specific bundle indices for a placement group.
++  ///
++  /// \param placement_group_id The id of the placement group.
++  /// \param bundle_indices The indices of the bundles to be destroyed.
++  void DestroyPlacementGroupBundleIndices(
++      const PlacementGroupID &placement_group_id,
++      const std::vector<int64_t> &bundle_indices) override;
++
+   /// Mark the placement group scheduling is cancelled.
+   /// This method will incur check failure if scheduling
+   /// is not actually going on to guarantee strong consistency.
+@@ -488,6 +504,11 @@ class GcsPlacementGroupScheduler : public GcsPlacementGroupSchedulerInterface {
+
+   friend class GcsPlacementGroupSchedulerTest;
+   FRIEND_TEST(GcsPlacementGroupSchedulerTest, TestCheckingWildcardResource);
++  FRIEND_TEST(GcsPlacementGroupSchedulerTest,
++              TestCreateSchedulingOptionsWithNonContiguousIndices);
++  FRIEND_TEST(GcsPlacementGroupSchedulerTest, TestFlatBundleTopology);
++  FRIEND_TEST(GcsPlacementGroupSchedulerTest,
++              TestLegacyFlatBundleCreateSchedulingOptions);
+ };
+
+ }  // namespace gcs
+diff --git a/src/ray/gcs/tests/gcs_autoscaler_state_manager_test.cc b/src/ray/gcs/tests/gcs_autoscaler_state_manager_test.cc
+index 841803abf9..02b1fb268c 100644
+--- a/src/ray/gcs/tests/gcs_autoscaler_state_manager_test.cc
++++ b/src/ray/gcs/tests/gcs_autoscaler_state_manager_test.cc
+@@ -1322,6 +1322,46 @@ TEST_F(GcsAutoscalerStateManagerTest,
+   EXPECT_EQ(c2.label_values(0), "TPU");
+ }
+
++TEST_F(GcsAutoscalerStateManagerTest,
++       TestGetPendingGangResourceRequestsWithLocalityRequirementPendingStrictSpread) {
++  rpc::PlacementGroupLoad load;
++  auto *pg_data = load.add_placement_group_data();
++  pg_data->set_state(rpc::PlacementGroupTableData::PENDING);
++  auto pg_id = PlacementGroupID::Of(JobID::FromInt(10));
++  pg_data->set_placement_group_id(pg_id.Binary());
++  auto *layer = pg_data->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/gpu-domain"] =
++      rpc::PlacementStrategy::STRICT_SPREAD;
++
++  auto *bundle1 = pg_data->add_bundles();
++  (*bundle1->mutable_unit_resources())["GPU"] = 4;
++
++  auto *bundle2 = pg_data->add_bundles();
++  (*bundle2->mutable_unit_resources())["GPU"] = 4;
++
++  EXPECT_CALL(*gcs_placement_group_manager_, GetPlacementGroupLoad)
++      .WillOnce(Return(std::make_shared<rpc::PlacementGroupLoad>(std::move(load))));
++
++  const auto &state = GetClusterResourceStateSync();
++  const auto &requests = state.pending_gang_resource_requests();
++  ASSERT_EQ(requests.size(), 1);
++
++  const auto &req = requests.Get(0);
++  ASSERT_EQ(req.bundle_selectors_size(), 1);
++
++  const auto &selector = req.bundle_selectors(0);
++  ASSERT_EQ(selector.resource_requests_size(), 2);
++
++  ASSERT_TRUE(selector.has_locality_requirement());
++  const auto &locality_req = selector.locality_requirement();
++  ASSERT_TRUE(locality_req.has_locality_constraint());
++  EXPECT_EQ(locality_req.locality_constraint().label_name(), "ray.io/gpu-domain");
++  EXPECT_EQ(locality_req.locality_constraint().placement_strategy(),
++            rpc::PlacementStrategy::STRICT_SPREAD);
++
++  EXPECT_FALSE(locality_req.has_label_selector());
++}
++
+ TEST_F(GcsAutoscalerStateManagerTest,
+        TestGetPendingGangResourceRequestsWithLocalityRequirementPending) {
+   rpc::PlacementGroupLoad load;
+@@ -1329,8 +1369,8 @@ TEST_F(GcsAutoscalerStateManagerTest,
+   pg_data->set_state(rpc::PlacementGroupTableData::PENDING);
+   auto pg_id = PlacementGroupID::Of(JobID::FromInt(1));
+   pg_data->set_placement_group_id(pg_id.Binary());
+-  (*pg_data->mutable_topology_strategy())["ray.io/gpu-domain"] =
+-      rpc::PlacementStrategy::STRICT_PACK;
++  auto *layer = pg_data->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/gpu-domain"] = rpc::PlacementStrategy::STRICT_PACK;
+
+   auto *bundle1 = pg_data->add_bundles();
+   (*bundle1->mutable_unit_resources())["GPU"] = 4;
+@@ -1369,8 +1409,8 @@ TEST_F(GcsAutoscalerStateManagerTest,
+   pg_data->set_state(rpc::PlacementGroupTableData::RESCHEDULING);
+   auto pg_id = PlacementGroupID::Of(JobID::FromInt(2));
+   pg_data->set_placement_group_id(pg_id.Binary());
+-  (*pg_data->mutable_topology_strategy())["ray.io/gpu-domain"] =
+-      rpc::PlacementStrategy::STRICT_PACK;
++  auto *layer = pg_data->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/gpu-domain"] = rpc::PlacementStrategy::STRICT_PACK;
+   (*pg_data->mutable_topology_assignments())["ray.io/gpu-domain"] = "rack-1";
+
+   // One placed bundle (has node_id) and one unplaced bundle.
+@@ -1438,5 +1478,133 @@ TEST_F(GcsAutoscalerStateManagerTest,
+   EXPECT_FALSE(req.bundle_selectors(0).has_locality_requirement());
+ }
+
++TEST_F(GcsAutoscalerStateManagerTest,
++       TestGetPendingGangResourceRequestsHierarchicalBundleGroupAggregation) {
++  rpc::PlacementGroupLoad load;
++  auto *pg_data = load.add_placement_group_data();
++  pg_data->set_state(rpc::PlacementGroupTableData::PENDING);
++  auto pg_id = PlacementGroupID::Of(JobID::FromInt(4));
++  pg_data->set_placement_group_id(pg_id.Binary());
++
++  // 4 bundles of {"CPU": 2} divided into 2 groups:
++  // Bundles 0 and 1 -> group 0 (total 4 CPUs)
++  // Bundles 2 and 3 -> group 1 (total 4 CPUs)
++  for (int i = 0; i < 4; i++) {
++    auto *bundle = pg_data->add_bundles();
++    (*bundle->mutable_unit_resources())["CPU"] = 2;
++    bundle->set_bundle_group_index(i / 2);
++  }
++
++  auto *layer = pg_data->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/az"] = rpc::PlacementStrategy::SPREAD;
++
++  EXPECT_CALL(*gcs_placement_group_manager_, GetPlacementGroupLoad)
++      .WillOnce(Return(std::make_shared<rpc::PlacementGroupLoad>(std::move(load))));
++
++  const auto &state = GetClusterResourceStateSync();
++  const auto &requests = state.pending_gang_resource_requests();
++  // Should emit one GangResourceRequest per group
++  ASSERT_EQ(requests.size(), 2);
++
++  for (int g = 0; g < 2; g++) {
++    const auto &req = requests.Get(g);
++    ASSERT_EQ(req.bundle_selectors_size(), 1);
++
++    const auto &selector = req.bundle_selectors(0);
++    // Since strategy is SPREAD, bundles in the group are NOT aggregated.
++    // Each group has 2 bundles of CPU 2.
++    ASSERT_EQ(selector.resource_requests_size(), 2);
++    for (int i = 0; i < 2; i++) {
++      const auto &bundle_req = selector.resource_requests(i);
++      ASSERT_EQ(bundle_req.resources_bundle().at("CPU"), 2.0);
++    }
++
++    ASSERT_TRUE(selector.has_locality_requirement());
++    EXPECT_EQ(selector.locality_requirement().locality_constraint().label_name(),
++              "ray.io/az");
++    EXPECT_EQ(selector.locality_requirement().locality_constraint().placement_strategy(),
++              rpc::PlacementStrategy::SPREAD);
++  }
++}
++
++TEST_F(GcsAutoscalerStateManagerTest,
++       TestGetPendingGangResourceRequestsMixedBundleGroupAggregation) {
++  rpc::PlacementGroupLoad load;
++  auto *pg_data = load.add_placement_group_data();
++  pg_data->set_state(rpc::PlacementGroupTableData::PENDING);
++  auto pg_id = PlacementGroupID::Of(JobID::FromInt(5));
++  pg_data->set_placement_group_id(pg_id.Binary());
++  // Set strategy to STRICT_PACK so that the group gets aggregated
++  pg_data->set_strategy(rpc::PlacementStrategy::STRICT_PACK);
++
++  // 2 bundles grouped together in group 0 (2 CPUs each -> total 4 CPUs)
++  for (int i = 0; i < 2; i++) {
++    auto *bundle = pg_data->add_bundles();
++    (*bundle->mutable_unit_resources())["CPU"] = 2;
++    bundle->set_bundle_group_index(0);
++  }
++  // 2 flat bundles (4 CPUs each, no bundle_group_index) -> shouldn't be merged together
++  for (int i = 0; i < 2; i++) {
++    auto *bundle = pg_data->add_bundles();
++    (*bundle->mutable_unit_resources())["CPU"] = 4;
++  }
++
++  EXPECT_CALL(*gcs_placement_group_manager_, GetPlacementGroupLoad)
++      .WillOnce(Return(std::make_shared<rpc::PlacementGroupLoad>(std::move(load))));
++
++  const auto &state = GetClusterResourceStateSync();
++  const auto &requests = state.pending_gang_resource_requests();
++  // We expect 3 GangResourceRequests:
++  // - 1 for group 0 (aggregated to 4 CPUs because strategy is STRICT_PACK)
++  // - 2 for the flat bundles (each flat bundle is assigned to a separate fake group since
++  // they have no group index, so they get their own GangResourceRequest)
++  ASSERT_EQ(requests.size(), 3);
++
++  for (int i = 0; i < 3; i++) {
++    const auto &req = requests.Get(i);
++    const auto &selector = req.bundle_selectors(0);
++    ASSERT_EQ(selector.resource_requests_size(), 1);
++    const auto &bundle_req = selector.resource_requests(0);
++    ASSERT_EQ(bundle_req.resources_bundle().at("CPU"), 4.0);
++  }
++}
++
++TEST_F(GcsAutoscalerStateManagerTest,
++       TestGetPendingGangResourceRequestsConflictingLabelSelectors) {
++  rpc::PlacementGroupLoad load;
++  auto *pg_data = load.add_placement_group_data();
++  pg_data->set_state(rpc::PlacementGroupTableData::PENDING);
++  auto pg_id = PlacementGroupID::Of(JobID::FromInt(6));
++  pg_data->set_placement_group_id(pg_id.Binary());
++  // Need to set strategy to STRICT_PACK so that the group gets aggregated!
++  pg_data->set_strategy(rpc::PlacementStrategy::STRICT_PACK);
++
++  // Add 2 bundles in group 0 with conflicting label selector values.
++  auto *bundle_0 = pg_data->add_bundles();
++  (*bundle_0->mutable_unit_resources())["CPU"] = 1;
++  bundle_0->set_bundle_group_index(0);
++  (*bundle_0->mutable_label_selector())["accelerator"] = "A100";
++
++  auto *bundle_1 = pg_data->add_bundles();
++  (*bundle_1->mutable_unit_resources())["CPU"] = 1;
++  bundle_1->set_bundle_group_index(0);
++  (*bundle_1->mutable_label_selector())["accelerator"] = "H100";
++
++  EXPECT_CALL(*gcs_placement_group_manager_, GetPlacementGroupLoad)
++      .WillOnce(Return(std::make_shared<rpc::PlacementGroupLoad>(std::move(load))));
++
++  const auto &state = GetClusterResourceStateSync();
++  const auto &requests = state.pending_gang_resource_requests();
++  ASSERT_EQ(requests.size(), 1);
++
++  const auto &req = requests.Get(0);
++  const auto &selector = req.bundle_selectors(0);
++  ASSERT_EQ(selector.resource_requests_size(), 1);
++  const auto &bundle_req = selector.resource_requests(0);
++  ASSERT_EQ(bundle_req.resources_bundle().at("CPU"), 2.0);
++  // Conflicting selector logs a warning and deterministically retains a valid selector.
++  ASSERT_FALSE(bundle_req.label_selectors().empty());
++}
++
+ }  // namespace gcs
+ }  // namespace ray
+diff --git a/src/ray/gcs/tests/gcs_placement_group_manager_test.cc b/src/ray/gcs/tests/gcs_placement_group_manager_test.cc
+index 09ece015bb..3c23d95028 100644
+--- a/src/ray/gcs/tests/gcs_placement_group_manager_test.cc
++++ b/src/ray/gcs/tests/gcs_placement_group_manager_test.cc
+@@ -47,6 +47,10 @@ class MockPlacementGroupScheduler : public gcs::GcsPlacementGroupSchedulerInterf
+   MOCK_METHOD1(DestroyPlacementGroupBundleResourcesIfExists,
+                void(const PlacementGroupID &placement_group_id));
+
++  MOCK_METHOD2(DestroyPlacementGroupBundleIndices,
++               void(const PlacementGroupID &placement_group_id,
++                    const std::vector<int64_t> &bundle_indices));
++
+   MOCK_METHOD1(MarkScheduleCancelled, void(const PlacementGroupID &placement_group_id));
+
+   MOCK_METHOD1(
+diff --git a/src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc b/src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc
+index 8c7b8a47e9..7801e6e671 100644
+--- a/src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc
++++ b/src/ray/gcs/tests/gcs_placement_group_scheduler_test.cc
+@@ -1526,5 +1526,152 @@ TEST_F(GcsPlacementGroupSchedulerTest,
+   WaitPlacementGroupPendingDone(2, GcsPlacementGroupStatus::SUCCESS);
+ }
+
++TEST_F(GcsPlacementGroupSchedulerTest, TestHierarchicalBundleScheduling) {
++  auto node0 = GenNodeInfo(0);
++  AddNode(node0, 10);
++  auto node1 = GenNodeInfo(1);
++  AddNode(node1, 10);
++
++  NodeID node_id0 = NodeID::FromBinary(node0->node_id());
++  NodeID node_id1 = NodeID::FromBinary(node1->node_id());
++
++  cluster_resource_scheduler_->GetClusterResourceManager().SetNodeLabels(
++      scheduling::NodeID(node_id0.Binary()), {{"ray.io/gpu-domain", "domain-1"}});
++  cluster_resource_scheduler_->GetClusterResourceManager().SetNodeLabels(
++      scheduling::NodeID(node_id1.Binary()), {{"ray.io/gpu-domain", "domain-2"}});
++
++  auto request =
++      GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::STRICT_SPREAD, 0, 1.0);
++
++  auto *spec = request.mutable_placement_group_spec();
++  spec->clear_bundles();
++
++  // Outer Strategy: STRICT_SPREAD
++  auto *layer = spec->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/gpu-domain"] =
++      rpc::PlacementStrategy::STRICT_SPREAD;
++
++  // Add 2 Bundles, each assigned to a group index
++  auto *group1_bundle = spec->add_bundles();
++  group1_bundle->mutable_unit_resources()->insert({"CPU", 1.0});
++  auto pg_id_str = spec->placement_group_id();
++  group1_bundle->mutable_bundle_id()->mutable_placement_group_id()->assign(pg_id_str);
++  group1_bundle->mutable_bundle_id()->set_bundle_index(0);
++  group1_bundle->set_bundle_group_index(0);
++
++  auto *group2_bundle = spec->add_bundles();
++  group2_bundle->mutable_unit_resources()->insert({"CPU", 1.0});
++  group2_bundle->mutable_bundle_id()->mutable_placement_group_id()->assign(pg_id_str);
++  group2_bundle->mutable_bundle_id()->set_bundle_index(1);
++  group2_bundle->set_bundle_group_index(1);
++
++  auto pg = std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
++
++  ScheduleUnplacedBundles(pg);
++
++  ASSERT_TRUE(raylet_clients_[0]->GrantPrepareBundleResources());
++  ASSERT_TRUE(raylet_clients_[1]->GrantPrepareBundleResources());
++  WaitPendingDone(raylet_clients_[0]->commit_callbacks, 1);
++  WaitPendingDone(raylet_clients_[1]->commit_callbacks, 1);
++  ASSERT_TRUE(raylet_clients_[0]->GrantCommitBundleResources());
++  ASSERT_TRUE(raylet_clients_[1]->GrantCommitBundleResources());
++  WaitPlacementGroupPendingDone(1, GcsPlacementGroupStatus::SUCCESS);
++}
++
++TEST_F(GcsPlacementGroupSchedulerTest, TestPartialGroupRescheduleFailsGracefully) {
++  auto request = GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::PACK, 0, 1.0);
++  auto *spec = request.mutable_placement_group_spec();
++  spec->clear_bundles();
++
++  for (int i = 0; i < 2; i++) {
++    auto *bundle = spec->add_bundles();
++    bundle->mutable_unit_resources()->insert({"CPU", 1.0});
++    bundle->mutable_bundle_id()->mutable_placement_group_id()->assign(
++        spec->placement_group_id());
++    bundle->mutable_bundle_id()->set_bundle_index(i);
++    bundle->set_bundle_group_index(0);
++  }
++
++  auto pg = std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
++
++  // Mock a scenario where only ONE of the bundles in the group is unplaced.
++  // By default they are all unplaced. We will mock that the first bundle is placed.
++  pg->GetMutableBundle(0)->set_node_id(NodeID::FromRandom().Binary());
++
++  // Verify that ScheduleUnplacedBundles handles this partially unplaced group gracefully
++  bool failure_called = false;
++  scheduler_->ScheduleUnplacedBundles(SchedulePgRequest{
++      /*placement_group=*/pg,
++      /*failure_callback=*/
++      [&](std::shared_ptr<GcsPlacementGroup> failure_placement_group, bool is_feasible) {
++        failure_called = true;
++      },
++      /*success_callback=*/
++      [&](std::shared_ptr<GcsPlacementGroup> success_placement_group) {}});
++  ASSERT_TRUE(failure_called);
++}
++
++TEST_F(GcsPlacementGroupSchedulerTest,
++       TestCreateSchedulingOptionsWithNonContiguousIndices) {
++  auto request =
++      GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::STRICT_SPREAD, 3, 1.0);
++
++  // Modify the request to have skipped bundle group indices.
++  auto spec = request.mutable_placement_group_spec();
++  spec->mutable_bundles(0)->set_bundle_group_index(0);
++  spec->mutable_bundles(1)->set_bundle_group_index(0);
++  spec->mutable_bundles(2)->set_bundle_group_index(3);  // Skipped 1 and 2
++
++  auto pg = std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
++
++  auto options =
++      scheduler_->CreateSchedulingOptions(*pg, rpc::PlacementStrategy::STRICT_SPREAD);
++
++  // We should have 2 bundle groups in options.bundle_group_indices_
++  ASSERT_EQ(options.bundle_group_indices_.size(), 2);
++
++  // The first group should contain bundles 0, 1.
++  ASSERT_EQ(options.bundle_group_indices_[0].size(), 2);
++  EXPECT_EQ(options.bundle_group_indices_[0][0], 0);
++  EXPECT_EQ(options.bundle_group_indices_[0][1], 1);
++
++  // The second group should contain bundle 2.
++  ASSERT_EQ(options.bundle_group_indices_[1].size(), 1);
++  EXPECT_EQ(options.bundle_group_indices_[1][0], 2);
++}
++
++TEST_F(GcsPlacementGroupSchedulerTest, TestFlatBundleTopology) {
++  auto request = GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::PACK, 2, 1.0);
++
++  auto spec = request.mutable_placement_group_spec();
++  auto layer = spec->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/az"] = rpc::PlacementStrategy::SPREAD;
++
++  // The bundles do not have bundle_group_index set (i.e. flat bundles).
++  auto pg = std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
++
++  auto options = scheduler_->CreateSchedulingOptions(*pg, rpc::PlacementStrategy::PACK);
++
++  // Verify flat bundles with custom topology label and SPREAD strategy
++  // are routed to the hierarchical scheduler so that the strategy is respected.
++  ASSERT_FALSE(options.bundle_group_indices_.empty());
++
++  // The outer strategy should be set to SPREAD from the first topology layer.
++  EXPECT_EQ(options.outer_strategy_, rpc::PlacementStrategy::SPREAD);
++}
++
++TEST_F(GcsPlacementGroupSchedulerTest, TestLegacyFlatBundleCreateSchedulingOptions) {
++  auto request = GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::PACK, 2, 1.0);
++  auto spec = request.mutable_placement_group_spec();
++  auto layer = spec->add_topology_strategy();
++  (*layer->mutable_entries())["ray.io/az"] = rpc::PlacementStrategy::PACK;
++
++  auto pg = std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
++  auto options = scheduler_->CreateSchedulingOptions(*pg, rpc::PlacementStrategy::PACK);
++
++  EXPECT_FALSE(options.bundle_group_indices_.empty());
++  EXPECT_EQ(options.outer_strategy_, rpc::PlacementStrategy::PACK);
++}
++
+ }  // namespace gcs
+ }  // namespace ray
+diff --git a/src/ray/protobuf/common.proto b/src/ray/protobuf/common.proto
+index 6bd3758f5b..c241f01170 100644
+--- a/src/ray/protobuf/common.proto
++++ b/src/ray/protobuf/common.proto
+@@ -693,6 +693,11 @@ message Bundle {
+   // Label selector associated with this bundle.
+   // Populated from bundle_label_selector if provided.
+   map<string, string> label_selector = 4;
++  optional int32 bundle_group_index = 5;
++}
++
++message TopologyStrategyLayer {
++  map<string, PlacementStrategy> entries = 1;
+ }
+
+ message PlacementGroupSpec {
+@@ -721,7 +726,9 @@ message PlacementGroupSpec {
+   bytes soft_target_node_id = 11;
+   // Topology strategy. Maps non-node topology label keys (e.g.
+   // "ray.io/gpu-domain") to the placement strategy applied at that label.
+-  map<string, PlacementStrategy> topology_strategy = 12;
++  // Layers are ordered from outermost to innermost topology.
++  reserved 12;
++  repeated TopologyStrategyLayer topology_strategy = 13;
+ }
+
+ message ObjectReference {
+diff --git a/src/ray/protobuf/gcs.proto b/src/ray/protobuf/gcs.proto
+index 83d8f5d1e0..bab8a444d7 100644
+--- a/src/ray/protobuf/gcs.proto
++++ b/src/ray/protobuf/gcs.proto
+@@ -686,8 +686,15 @@ message PlacementGroupTableData {
+   map<string, string> topology_assignments = 17;
+   // Topology strategy that applies to this PG. Mirrors
+   // PlacementGroupSpec.topology_strategy. Empty if the PG does not use
+-  // a topology strategy.
+-  map<string, PlacementStrategy> topology_strategy = 18;
++  // topology-aware scheduling.
++  reserved 18;
++  repeated TopologyStrategyLayer topology_strategy = 19;
++
++  message GroupTopologyAssignment {
++    int32 bundle_group_index = 1;
++    map<string, string> assignments = 2;
++  }
++  repeated GroupTopologyAssignment group_topology_assignments = 20;
+ }
+
+ message JobTableData {
+diff --git a/src/ray/raylet/scheduling/cluster_resource_scheduler.cc b/src/ray/raylet/scheduling/cluster_resource_scheduler.cc
+index 23f4272f4e..ba1d9a0fed 100644
+--- a/src/ray/raylet/scheduling/cluster_resource_scheduler.cc
++++ b/src/ray/raylet/scheduling/cluster_resource_scheduler.cc
+@@ -410,7 +410,7 @@ SchedulingResult ClusterResourceScheduler::SchedulePlacementGroup(
+     }
+   }
+   return bundle_scheduling_policy_->Schedule(
+-      resource_request_list, options, std::move(candidate_nodes));
++      resource_request_list, options, candidate_nodes);
+ }
+
+ }  // namespace ray
+diff --git a/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.cc b/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.cc
+index 4176978b4d..c7c01c2f0f 100644
+--- a/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.cc
++++ b/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.cc
+@@ -14,6 +14,9 @@
+
+ #include "ray/raylet/scheduling/policy/bundle_scheduling_policy.h"
+
++#include <algorithm>
++#include <numeric>
++
+ namespace ray {
+ namespace raylet_scheduling_policy {
+
+@@ -142,7 +145,8 @@ scheduling::NodeID BundleSchedulingPolicy::GetBestNode(
+ SchedulingResult BundlePackSchedulingPolicy::Schedule(
+     const std::vector<const ResourceRequest *> &resource_request_list,
+     SchedulingOptions options,
+-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes_in) {
++  absl::flat_hash_set<scheduling::NodeID> candidate_nodes = candidate_nodes_in;
+   RAY_CHECK(!resource_request_list.empty());
+   if (candidate_nodes.empty()) {
+     RAY_LOG(DEBUG) << "The candidate nodes is empty, return directly.";
+@@ -222,7 +226,8 @@ SchedulingResult BundlePackSchedulingPolicy::Schedule(
+ SchedulingResult BundleSpreadSchedulingPolicy::Schedule(
+     const std::vector<const ResourceRequest *> &resource_request_list,
+     SchedulingOptions options,
+-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes_in) {
++  absl::flat_hash_set<scheduling::NodeID> candidate_nodes = candidate_nodes_in;
+   RAY_CHECK(!resource_request_list.empty());
+   if (candidate_nodes.empty()) {
+     RAY_LOG(DEBUG) << "The candidate nodes is empty, return directly.";
+@@ -287,7 +292,7 @@ SchedulingResult BundleSpreadSchedulingPolicy::Schedule(
+ SchedulingResult BundleStrictPackSchedulingPolicy::Schedule(
+     const std::vector<const ResourceRequest *> &resource_request_list,
+     SchedulingOptions options,
+-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) {
+   RAY_CHECK(!resource_request_list.empty());
+   if (candidate_nodes.empty()) {
+     RAY_LOG(DEBUG) << "The candidate nodes is empty, return directly.";
+@@ -312,17 +317,16 @@ SchedulingResult BundleStrictPackSchedulingPolicy::Schedule(
+   }
+   aggregated_resource_request.SetLabelSelector(std::move(aggregated_label_selector));
+
+-  // Remove any node that does not satisfy the aggregated request.
+-  for (auto it = candidate_nodes.begin(); it != candidate_nodes.end();) {
+-    if (!cluster_resource_manager_.HasFeasibleResources(*it,
+-                                                        aggregated_resource_request)) {
+-      candidate_nodes.erase(it++);
+-    } else {
+-      ++it;
++  bool is_infeasible = true;
++  for (const auto &node_id : candidate_nodes) {
++    if (cluster_resource_manager_.HasFeasibleResources(node_id,
++                                                       aggregated_resource_request)) {
++      is_infeasible = false;
++      break;
+     }
+   }
+
+-  if (candidate_nodes.empty()) {
++  if (is_infeasible) {
+     RAY_LOG(DEBUG) << "The required resource is bigger than the maximum resource in the "
+                       "whole cluster or no node satisfies the label constraints, "
+                       "schedule failed.";
+@@ -379,7 +383,8 @@ void BundleStrictSpreadSchedulingPolicy::ExcludeNodesAlreadyContainingBundles(
+ SchedulingResult BundleStrictSpreadSchedulingPolicy::Schedule(
+     const std::vector<const ResourceRequest *> &resource_request_list,
+     SchedulingOptions options,
+-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes_in) {
++  absl::flat_hash_set<scheduling::NodeID> candidate_nodes = candidate_nodes_in;
+   RAY_CHECK(!resource_request_list.empty());
+
+   ExcludeNodesAlreadyContainingBundles(candidate_nodes,
+@@ -431,5 +436,390 @@ SchedulingResult BundleStrictSpreadSchedulingPolicy::Schedule(
+                               sorted_index);
+ }
+
++SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
++    const std::vector<const ResourceRequest *> &resource_request_list,
++    SchedulingOptions options,
++    absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
++    NodeScheduleFn node_schedule_fn) {
++  if (options.bundle_group_indices_.empty()) {
++    return node_schedule_fn(resource_request_list, options, candidate_nodes);
++  }
++
++  std::vector<std::vector<int>> group_indices = std::move(options.bundle_group_indices_);
++  options.bundle_group_indices_.clear();
++
++  std::vector<scheduling::NodeID> final_nodes(resource_request_list.size(),
++                                              scheduling::NodeID::Nil());
++
++  const auto &target_domain = options.target_topology_assignment_;
++  const std::string &label_key = target_domain.first;
++
++  // Filter candidates by label_key and populate domain_buckets
++  absl::flat_hash_map<std::string, absl::flat_hash_set<scheduling::NodeID>>
++      domain_buckets;
++  if (!label_key.empty()) {
++    for (const auto &node : candidate_nodes) {
++      const auto &labels = cluster_resource_manager_.GetNodeLabels(node);
++      auto it = labels.find(label_key);
++      if (it != labels.end()) {
++        if (!target_domain.second.has_value() ||
++            it->second == target_domain.second.value()) {
++          domain_buckets[it->second].insert(node);
++        }
++      }
++    }
++  } else {
++    domain_buckets[""] = candidate_nodes;
++  }
++
++  std::vector<std::string> domain_vals;
++  for (const auto &kv : domain_buckets) {
++    if (!options.previously_occupied_topologies_.contains(kv.first)) {
++      domain_vals.push_back(kv.first);
++    }
++  }
++  std::sort(domain_vals.begin(), domain_vals.end());
++
++  int num_groups = group_indices.size();
++  int num_domains = domain_vals.size();
++
++  std::vector<std::string> group_to_domain_str(num_groups);
++
++  // Pre-calculate raw resources for each domain and each group to short-circuit
++  // infeasible domains.
++  std::vector<ResourceSet> domain_raw_resources(num_domains);
++  for (int d = 0; d < num_domains; ++d) {
++    for (const auto &node_id : domain_buckets[domain_vals[d]]) {
++      const auto &node_resources = cluster_resource_manager_.GetNodeResources(node_id);
++      for (auto resource_id : node_resources.total.ExplicitResourceIds()) {
++        domain_raw_resources[d].Set(resource_id,
++                                    domain_raw_resources[d].Get(resource_id) +
++                                        node_resources.total.Get(resource_id));
++      }
++    }
++  }
++
++  std::vector<ResourceSet> group_raw_resources(num_groups);
++  for (int g = 0; g < num_groups; ++g) {
++    for (int idx : group_indices[g]) {
++      group_raw_resources[g] += resource_request_list[idx]->GetResourceSet();
++    }
++  }
++
++  // Helper to schedule a single group and revert resources.
++  auto check_feasibility = [&](int group_idx,
++                               const std::string &domain_val,
++                               int domain_idx) -> SchedulingResult {
++    if (!(group_raw_resources[group_idx] <= domain_raw_resources[domain_idx])) {
++      return SchedulingResult::Infeasible();
++    }
++    const auto &indices = group_indices[group_idx];
++    std::vector<const ResourceRequest *> sub_list;
++    for (int idx : indices) {
++      sub_list.push_back(resource_request_list[idx]);
++    }
++
++    SchedulingResult bucket_res =
++        node_schedule_fn(sub_list, options, domain_buckets[domain_val]);
++
++    return bucket_res;
++  };
++
++  if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD) {
++    std::vector<std::string> group_shapes(num_groups);
++    for (int i = 0; i < num_groups; i++) {
++      std::vector<std::string> shapes;
++      for (int idx : group_indices[i]) {
++        shapes.push_back(resource_request_list[idx]->GetResourceSet().DebugString());
++      }
++      std::sort(shapes.begin(), shapes.end());
++      for (const auto &s : shapes) {
++        group_shapes[i] += s + "|";
++      }
++    }
++
++    std::vector<std::vector<SchedulingResult>> feasible_results(
++        num_groups, std::vector<SchedulingResult>(num_domains));
++    std::vector<std::vector<int>> adj(num_groups);
++    std::vector<std::vector<int>> adj_possible(num_groups);
++    absl::flat_hash_map<std::string, SchedulingResult> memo;
++
++    for (int i = 0; i < num_groups; i++) {
++      int orig_group_idx = options.original_bundle_group_indices_.empty()
++                               ? i
++                               : options.original_bundle_group_indices_[i];
++      auto pin_it = options.group_topology_pins_.find(orig_group_idx);
++      std::string pin =
++          pin_it != options.group_topology_pins_.end() ? pin_it->second : "";
++
++      for (int j = 0; j < num_domains; j++) {
++        if (!pin.empty() && domain_vals[j] != pin) {
++          continue;
++        }
++        std::string cache_key = group_shapes[i] + ":" + std::to_string(j);
++        auto it = memo.find(cache_key);
++        if (it != memo.end()) {
++          feasible_results[i][j] = it->second;
++        } else {
++          feasible_results[i][j] = check_feasibility(i, domain_vals[j], j);
++          memo[cache_key] = feasible_results[i][j];
++        }
++        if (feasible_results[i][j].status.IsSuccess()) {
++          adj[i].push_back(j);
++          adj_possible[i].push_back(j);
++        } else if (!feasible_results[i][j].status.IsInfeasible()) {
++          adj_possible[i].push_back(j);
++        }
++      }
++    }
++
++    std::vector<int> group_order(num_groups);
++    std::iota(group_order.begin(), group_order.end(), 0);
++    std::sort(group_order.begin(), group_order.end(), [&](int a, int b) {
++      if (adj[a].size() != adj[b].size()) {
++        return adj[a].size() < adj[b].size();
++      }
++      return a < b;
++    });
++
++    std::vector<int> match(num_domains, -1);
++    std::vector<bool> visited(num_domains, false);
++
++    std::function<bool(int, const std::vector<std::vector<int>> &, std::vector<int> &)>
++        dfs =
++            [&](int u, const std::vector<std::vector<int>> &graph, std::vector<int> &m) {
++              for (int v : graph[u]) {
++                if (visited[v]) continue;
++                visited[v] = true;
++                if (m[v] < 0 || dfs(m[v], graph, m)) {
++                  m[v] = u;
++                  return true;
++                }
++              }
++              return false;
++            };
++
++    int matched_count = 0;
++    for (int i : group_order) {
++      std::fill(visited.begin(), visited.end(), false);
++      if (dfs(i, adj, match)) {
++        matched_count++;
++      }
++    }
++
++    if (matched_count < num_groups) {
++      std::vector<int> match_possible(num_domains, -1);
++      int matched_possible_count = 0;
++      for (int i : group_order) {
++        std::fill(visited.begin(), visited.end(), false);
++        if (dfs(i, adj_possible, match_possible)) {
++          matched_possible_count++;
++        }
++      }
++      bool is_infeasible = (matched_possible_count < num_groups);
++      return is_infeasible ? SchedulingResult::Infeasible() : SchedulingResult::Failed();
++    }
++
++    std::vector<int> group_to_domain(num_groups, -1);
++    for (int j = 0; j < num_domains; j++) {
++      if (match[j] != -1) {
++        group_to_domain[match[j]] = j;
++      }
++    }
++
++    for (int i = 0; i < num_groups; i++) {
++      int domain_idx = group_to_domain[i];
++      const auto &res = feasible_results[i][domain_idx];
++      const auto &indices = group_indices[i];
++      if (!label_key.empty()) {
++        group_to_domain_str[i] = domain_vals[domain_idx];
++      }
++
++      for (size_t k = 0; k < indices.size(); k++) {
++        final_nodes[indices[k]] = res.selected_nodes[k];
++        RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
++            final_nodes[indices[k]], *resource_request_list[indices[k]]));
++      }
++    }
++  } else if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK ||
++             options.outer_strategy_ == rpc::PlacementStrategy::PACK) {
++    bool overall_success = false;
++    bool all_infeasible = true;
++
++    for (const auto &domain_val : domain_vals) {
++      bool domain_success = true;
++      bool domain_infeasible = false;
++      std::vector<std::pair<scheduling::NodeID, const ResourceRequest *>> rollback_log;
++
++      bool satisfies_pin = true;
++      for (int i = 0; i < num_groups; i++) {
++        int orig_group_idx = options.original_bundle_group_indices_.empty()
++                                 ? i
++                                 : options.original_bundle_group_indices_[i];
++        auto pin_it = options.group_topology_pins_.find(orig_group_idx);
++        if (pin_it != options.group_topology_pins_.end() &&
++            pin_it->second != domain_val) {
++          satisfies_pin = false;
++          break;
++        }
++      }
++      if (!satisfies_pin) continue;
++
++      for (int i = 0; i < num_groups; i++) {
++        const auto &indices = group_indices[i];
++        std::vector<const ResourceRequest *> sub_list;
++        for (int idx : indices) {
++          sub_list.push_back(resource_request_list[idx]);
++        }
++
++        int domain_idx =
++            std::distance(domain_vals.begin(),
++                          std::find(domain_vals.begin(), domain_vals.end(), domain_val));
++        if (!(group_raw_resources[i] <= domain_raw_resources[domain_idx])) {
++          domain_success = false;
++          domain_infeasible = true;
++          break;
++        }
++
++        SchedulingResult bucket_res =
++            node_schedule_fn(sub_list, options, domain_buckets[domain_val]);
++
++        if (bucket_res.status.IsSuccess()) {
++          for (size_t k = 0; k < indices.size(); k++) {
++            final_nodes[indices[k]] = bucket_res.selected_nodes[k];
++            RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
++                final_nodes[indices[k]], *sub_list[k]));
++            rollback_log.push_back({final_nodes[indices[k]], sub_list[k]});
++          }
++        } else {
++          domain_success = false;
++          if (bucket_res.status.IsInfeasible()) {
++            domain_infeasible = true;
++          }
++          break;
++        }
++      }
++
++      if (domain_success) {
++        overall_success = true;
++        for (int i = 0; i < num_groups; i++) {
++          group_to_domain_str[i] = domain_val;
++        }
++        break;
++      } else {
++        if (!domain_infeasible) {
++          all_infeasible = false;
++        }
++        for (auto &entry : rollback_log) {
++          RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
++              entry.first, entry.second->GetResourceSet()));
++        }
++      }
++    }
++
++    if (!overall_success) {
++      return all_infeasible ? SchedulingResult::Infeasible() : SchedulingResult::Failed();
++    }
++  } else if (options.outer_strategy_ == rpc::PlacementStrategy::SPREAD) {
++    absl::flat_hash_set<std::string> used_domains;
++    bool overall_success = true;
++    bool any_group_infeasible = false;
++
++    for (int i = 0; i < num_groups; i++) {
++      bool group_success = false;
++      bool group_has_failed_domain = false;
++      const auto &indices = group_indices[i];
++      std::vector<const ResourceRequest *> sub_list;
++      for (int idx : indices) {
++        sub_list.push_back(resource_request_list[idx]);
++      }
++
++      auto try_domains = [&](bool require_unused) -> bool {
++        int orig_group_idx = options.original_bundle_group_indices_.empty()
++                                 ? i
++                                 : options.original_bundle_group_indices_[i];
++        auto pin_it = options.group_topology_pins_.find(orig_group_idx);
++        std::string pin =
++            pin_it != options.group_topology_pins_.end() ? pin_it->second : "";
++
++        for (const auto &domain_val : domain_vals) {
++          if (!pin.empty() && domain_val != pin) continue;
++          if (require_unused && used_domains.contains(domain_val)) continue;
++          if (!require_unused && !used_domains.contains(domain_val)) continue;
++
++          int domain_idx = std::distance(
++              domain_vals.begin(),
++              std::find(domain_vals.begin(), domain_vals.end(), domain_val));
++          if (!(group_raw_resources[i] <= domain_raw_resources[domain_idx])) continue;
++
++          SchedulingResult bucket_res =
++              node_schedule_fn(sub_list, options, domain_buckets[domain_val]);
++          if (bucket_res.status.IsSuccess()) {
++            for (size_t k = 0; k < indices.size(); k++) {
++              final_nodes[indices[k]] = bucket_res.selected_nodes[k];
++              RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
++                  final_nodes[indices[k]], *sub_list[k]));
++            }
++            used_domains.insert(domain_val);
++            group_to_domain_str[i] = domain_val;
++            return true;
++          } else if (!bucket_res.status.IsInfeasible()) {
++            group_has_failed_domain = true;
++          }
++        }
++        return false;
++      };
++
++      group_success = try_domains(true);
++      if (!group_success) {
++        group_success = try_domains(false);
++      }
++
++      if (!group_success) {
++        overall_success = false;
++        if (!group_has_failed_domain) {
++          any_group_infeasible = true;
++        }
++        break;
++      }
++    }
++
++    if (!overall_success) {
++      // Revert any successful group assignments
++      for (size_t i = 0; i < final_nodes.size(); i++) {
++        if (!final_nodes[i].IsNil()) {
++          RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
++              final_nodes[i], resource_request_list[i]->GetResourceSet()));
++          final_nodes[i] = scheduling::NodeID::Nil();
++        }
++      }
++      return any_group_infeasible ? SchedulingResult::Infeasible()
++                                  : SchedulingResult::Failed();
++    }
++  }
++
++  // Restore the temporarily subtracted resources so the caller gets a clean view.
++  for (size_t i = 0; i < final_nodes.size(); i++) {
++    if (!final_nodes[i].IsNil()) {
++      RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
++          final_nodes[i], resource_request_list[i]->GetResourceSet()));
++    }
++  }
++
++  auto success_result = SchedulingResult::Success(std::move(final_nodes));
++  if (!label_key.empty()) {
++    for (int i = 0; i < num_groups; i++) {
++      if (!group_to_domain_str[i].empty()) {
++        int orig_group_idx = options.original_bundle_group_indices_.empty()
++                                 ? i
++                                 : options.original_bundle_group_indices_[i];
++        success_result.selected_group_assignments.push_back(
++            {orig_group_idx, {label_key, group_to_domain_str[i]}});
++      }
++    }
++  }
++  return success_result;
++}
++
+ }  // namespace raylet_scheduling_policy
+ }  // namespace ray
+diff --git a/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.h b/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.h
+index 65a537be29..590030cd96 100644
+--- a/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.h
++++ b/src/ray/raylet/scheduling/policy/bundle_scheduling_policy.h
+@@ -77,7 +77,7 @@ class BundlePackSchedulingPolicy : public BundleSchedulingPolicy {
+   SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       SchedulingOptions options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) override;
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) override;
+ };
+
+ class BundleSpreadSchedulingPolicy : public BundleSchedulingPolicy {
+@@ -86,7 +86,7 @@ class BundleSpreadSchedulingPolicy : public BundleSchedulingPolicy {
+   SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       SchedulingOptions options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) override;
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) override;
+ };
+
+ class BundleStrictPackSchedulingPolicy : public BundleSchedulingPolicy {
+@@ -95,7 +95,7 @@ class BundleStrictPackSchedulingPolicy : public BundleSchedulingPolicy {
+   SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       SchedulingOptions options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) override;
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) override;
+ };
+
+ class BundleStrictSpreadSchedulingPolicy : public BundleSchedulingPolicy {
+@@ -104,7 +104,7 @@ class BundleStrictSpreadSchedulingPolicy : public BundleSchedulingPolicy {
+   SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       SchedulingOptions options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) override;
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) override;
+
+  private:
+   /// Removes nodes that already host bundles for this placement group from
+@@ -113,5 +113,35 @@ class BundleStrictSpreadSchedulingPolicy : public BundleSchedulingPolicy {
+       absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
+       const SchedulingContext *context);
+ };
++
++/// Schedules bundles using a hierarchical topology strategy.
++///
++/// This policy evaluates a layered topology_strategy (e.g. rack, node) and
++/// groups bundles accordingly before calling a given node-level scheduling
++/// callback.
++class HierarchicalBundleSchedulingPolicy {
++ public:
++  explicit HierarchicalBundleSchedulingPolicy(
++      ClusterResourceManager &cluster_resource_manager)
++      : cluster_resource_manager_(cluster_resource_manager) {}
++
++  /// Schedule a list of bundles across the cluster using hierarchical groups.
++  ///
++  /// \param resource_request_list The resource requirements for each bundle.
++  /// \param options Scheduling options including the topology strategy and groups.
++  /// \param candidate_nodes The set of nodes available for scheduling.
++  /// \param node_schedule_fn The callback to use for node-level inner scheduling.
++  /// \return A SchedulingResult indicating success or failure, with node assignments if
++  /// successful.
++  SchedulingResult Schedule(
++      const std::vector<const ResourceRequest *> &resource_request_list,
++      SchedulingOptions options,
++      absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
++      NodeScheduleFn node_schedule_fn);
++
++ private:
++  ClusterResourceManager &cluster_resource_manager_;
++};
++
+ }  // namespace raylet_scheduling_policy
+ }  // namespace ray
+diff --git a/src/ray/raylet/scheduling/policy/composite_scheduling_policy.cc b/src/ray/raylet/scheduling/policy/composite_scheduling_policy.cc
+index 60b7c471e9..7e35e01c4d 100644
+--- a/src/ray/raylet/scheduling/policy/composite_scheduling_policy.cc
++++ b/src/ray/raylet/scheduling/policy/composite_scheduling_policy.cc
+@@ -46,7 +46,30 @@ scheduling::NodeID CompositeSchedulingPolicy::Schedule(
+ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
+     const std::vector<const ResourceRequest *> &resource_request_list,
+     SchedulingOptions options,
+-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) {
++  if (!options.bundle_group_indices_.empty()) {
++    NodeScheduleFn node_schedule_fn =
++        [this](const std::vector<const ResourceRequest *> &reqs,
++               SchedulingOptions opts,
++               absl::flat_hash_set<scheduling::NodeID> nodes) {
++          const auto &inner_domain = opts.inner_target_topology_assignment_;
++          opts.target_topology_assignment_ = inner_domain;
++          opts.topology_scheduling_strategy_ =
++              !inner_domain.first.empty() ? TopologySchedulingStrategy::STRICT_PACK
++                                          : TopologySchedulingStrategy::NONE;
++          if (!inner_domain.first.empty() &&
++              opts.inner_strategy_ != rpc::PlacementStrategy::STRICT_PACK &&
++              opts.inner_strategy_ != rpc::PlacementStrategy::PACK) {
++            RAY_LOG(ERROR)
++                << "Inner topology labels currently only support STRICT_PACK or PACK.";
++            return SchedulingResult::Failed();
++          }
++          return this->Schedule(reqs, std::move(opts), std::move(nodes));
++        };
++    return hierarchical_bundle_policy_.Schedule(
++        resource_request_list, std::move(options), candidate_nodes, node_schedule_fn);
++  }
++
+   if (options.topology_scheduling_strategy_ != TopologySchedulingStrategy::NONE) {
+     NodeScheduleFn node_schedule_fn =
+         [this](const std::vector<const ResourceRequest *> &reqs,
+@@ -58,7 +81,7 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
+     switch (options.topology_scheduling_strategy_) {
+     case TopologySchedulingStrategy::STRICT_PACK:
+       return topology_strict_pack_policy_.Schedule(
+-          resource_request_list, options, std::move(candidate_nodes), node_schedule_fn);
++          resource_request_list, options, candidate_nodes, node_schedule_fn);
+     default:
+       RAY_LOG(FATAL) << "Unsupported topology scheduling strategy: "
+                      << static_cast<int>(options.topology_scheduling_strategy_);
+@@ -68,17 +91,16 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
+
+   switch (options.scheduling_type_) {
+   case SchedulingType::BUNDLE_PACK:
+-    return bundle_pack_policy_.Schedule(
+-        resource_request_list, options, std::move(candidate_nodes));
++    return bundle_pack_policy_.Schedule(resource_request_list, options, candidate_nodes);
+   case SchedulingType::BUNDLE_SPREAD:
+     return bundle_spread_policy_.Schedule(
+-        resource_request_list, options, std::move(candidate_nodes));
++        resource_request_list, options, candidate_nodes);
+   case SchedulingType::BUNDLE_STRICT_PACK:
+     return bundle_strict_pack_policy_.Schedule(
+-        resource_request_list, options, std::move(candidate_nodes));
++        resource_request_list, options, candidate_nodes);
+   case SchedulingType::BUNDLE_STRICT_SPREAD:
+     return bundle_strict_spread_policy_.Schedule(
+-        resource_request_list, options, std::move(candidate_nodes));
++        resource_request_list, options, candidate_nodes);
+   default:
+     RAY_LOG(FATAL) << "Unsupported scheduling type: "
+                    << static_cast<typename std::underlying_type<SchedulingType>::type>(
+diff --git a/src/ray/raylet/scheduling/policy/composite_scheduling_policy.h b/src/ray/raylet/scheduling/policy/composite_scheduling_policy.h
+index adbf890357..4646bc96c3 100644
+--- a/src/ray/raylet/scheduling/policy/composite_scheduling_policy.h
++++ b/src/ray/raylet/scheduling/policy/composite_scheduling_policy.h
+@@ -74,12 +74,13 @@ class CompositeBundleSchedulingPolicy : public IBundleSchedulingPolicy {
+         bundle_spread_policy_(cluster_resource_manager),
+         bundle_strict_spread_policy_(cluster_resource_manager),
+         bundle_strict_pack_policy_(cluster_resource_manager),
+-        topology_strict_pack_policy_(cluster_resource_manager) {}
++        topology_strict_pack_policy_(cluster_resource_manager),
++        hierarchical_bundle_policy_(cluster_resource_manager) {}
+
+   SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       SchedulingOptions options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) override;
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) override;
+
+  private:
+   BundlePackSchedulingPolicy bundle_pack_policy_;
+@@ -87,6 +88,7 @@ class CompositeBundleSchedulingPolicy : public IBundleSchedulingPolicy {
+   BundleStrictSpreadSchedulingPolicy bundle_strict_spread_policy_;
+   BundleStrictPackSchedulingPolicy bundle_strict_pack_policy_;
+   TopologyStrictPackSchedulingPolicy topology_strict_pack_policy_;
++  HierarchicalBundleSchedulingPolicy hierarchical_bundle_policy_;
+ };
+
+ }  // namespace raylet_scheduling_policy
+diff --git a/src/ray/raylet/scheduling/policy/scheduling_options.h b/src/ray/raylet/scheduling/policy/scheduling_options.h
+index 427c07c2b0..54c69f3a0c 100644
+--- a/src/ray/raylet/scheduling/policy/scheduling_options.h
++++ b/src/ray/raylet/scheduling/policy/scheduling_options.h
+@@ -17,6 +17,7 @@
+ #include <optional>
+ #include <utility>
+
++#include "absl/container/flat_hash_set.h"
+ #include "ray/common/ray_config.h"
+ #include "ray/raylet/scheduling/policy/scheduling_context.h"
+
+@@ -202,7 +203,8 @@ struct SchedulingOptions {
+   // first: the node label key used to partition nodes into groups.
+   // second: if set, constrains scheduling to this topology value
+   //   (bundle rescheduling). If nullopt, a new group is selected.
+-  std::pair<std::string, std::optional<std::string>> target_topology_assignment_;
++  std::pair<std::string, std::optional<std::string>> target_topology_assignment_{};
++  std::pair<std::string, std::optional<std::string>> inner_target_topology_assignment_{};
+   // ID of the target node where bundles should be placed
+   // iff the target node has enough available resources.
+   // Otherwise, the bundles can be placed elsewhere.
+@@ -219,6 +221,19 @@ struct SchedulingOptions {
+   int32_t schedule_top_k_absolute_;
+   float scheduler_top_k_fraction_;
+
++  // The outer strategy if scheduling hierarchically.
++  rpc::PlacementStrategy outer_strategy_ = rpc::PlacementStrategy::PACK;
++  // The inner strategy if scheduling hierarchically.
++  rpc::PlacementStrategy inner_strategy_ = rpc::PlacementStrategy::PACK;
++  // Hierarchical bundle group indices.
++  std::vector<std::vector<int>> bundle_group_indices_;
++  // Original group IDs for each positional group index in bundle_group_indices_.
++  std::vector<int> original_bundle_group_indices_;
++  // Topology domains already occupied by placed groups.
++  absl::flat_hash_set<std::string> previously_occupied_topologies_;
++  // Group topology pins from previous placement
++  absl::flat_hash_map<int, std::string> group_topology_pins_;
++
+  private:
+   SchedulingOptions(
+       SchedulingType type,
+diff --git a/src/ray/raylet/scheduling/policy/scheduling_policy.h b/src/ray/raylet/scheduling/policy/scheduling_policy.h
+index a9e2292ead..00238521cf 100644
+--- a/src/ray/raylet/scheduling/policy/scheduling_policy.h
++++ b/src/ray/raylet/scheduling/policy/scheduling_policy.h
+@@ -89,12 +89,26 @@ struct SchedulingResult {
+   // structure will need to be extended.
+   // TODO(#61777): Extend to support multiple tiers of topology strategy scheduling.
+   std::optional<std::pair<std::string, std::string>> selected_topology_assignment;
++
++  // The per-group topology assignments for hierarchical PGs.
++  // Each entry is <bundle_group_index, <label_key, label_value>>.
++  std::vector<std::pair<int, std::pair<std::string, std::string>>>
++      selected_group_assignments;
+ };
+
++/// A callback function type used by hierarchical policies to delegate to a lower-level
++/// policy.
++///
++/// Contract:
++/// 1. The returned `SchedulingResult::selected_nodes` must have the exact same size
++///    as `resource_request_list`, and the element at index `i` must correspond
++///    to the `ResourceRequest` at index `i`.
++/// 2. The function must NOT leave resources subtracted from the cluster manager
++///    before returning. Any temporarily subtracted resources must be restored.
+ using NodeScheduleFn =
+     std::function<SchedulingResult(const std::vector<const ResourceRequest *> &,
+                                    SchedulingOptions,
+-                                   absl::flat_hash_set<scheduling::NodeID>)>;
++                                   const absl::flat_hash_set<scheduling::NodeID> &)>;
+
+ /// IBundleSchedulingPolicy picks a set of nodes from the cluster, according to the
+ /// resource requirement list as well as the scheduling options.
+@@ -113,7 +127,7 @@ class IBundleSchedulingPolicy {
+   virtual SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       SchedulingOptions options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes) = 0;
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes) = 0;
+ };
+
+ /// ISchedulingPolicy picks a node to from the cluster, according to the resource
+diff --git a/src/ray/raylet/scheduling/policy/tests/scheduling_policy_test.cc b/src/ray/raylet/scheduling/policy/tests/scheduling_policy_test.cc
+index 7309c8f7a2..2400db3f16 100644
+--- a/src/ray/raylet/scheduling/policy/tests/scheduling_policy_test.cc
++++ b/src/ray/raylet/scheduling/policy/tests/scheduling_policy_test.cc
+@@ -740,12 +740,12 @@ TEST_F(SchedulingPolicyTest, GpuDomainSchedulingFeasibleTest) {
+       std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+
+   BundlePackSchedulingPolicy bundle_pack_policy(*cluster_resource_manager);
+-  NodeScheduleFn node_schedule_fn = [&bundle_pack_policy](
+-                                        const std::vector<const ResourceRequest *> &reqs,
+-                                        SchedulingOptions opts,
+-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
+-    return bundle_pack_policy.Schedule(reqs, opts, std::move(nodes));
+-  };
++  NodeScheduleFn node_schedule_fn =
++      [&bundle_pack_policy](const std::vector<const ResourceRequest *> &reqs,
++                            SchedulingOptions opts,
++                            const absl::flat_hash_set<scheduling::NodeID> &nodes) {
++        return bundle_pack_policy.Schedule(reqs, opts, nodes);
++      };
+
+   // Schedule should return SUCCESS with 15 nodes all from rack-1
+   SchedulingResult result_1 = topology_policy.Schedule(
+@@ -835,12 +835,12 @@ TEST_F(SchedulingPolicyTest, GpuDomainSchedulingInfeasibleTest) {
+       std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
+
+   BundlePackSchedulingPolicy bundle_pack_policy(*cluster_resource_manager);
+-  NodeScheduleFn node_schedule_fn = [&bundle_pack_policy](
+-                                        const std::vector<const ResourceRequest *> &reqs,
+-                                        SchedulingOptions opts,
+-                                        absl::flat_hash_set<scheduling::NodeID> nodes) {
+-    return bundle_pack_policy.Schedule(reqs, opts, std::move(nodes));
+-  };
++  NodeScheduleFn node_schedule_fn =
++      [&bundle_pack_policy](const std::vector<const ResourceRequest *> &reqs,
++                            SchedulingOptions opts,
++                            const absl::flat_hash_set<scheduling::NodeID> &nodes) {
++        return bundle_pack_policy.Schedule(reqs, opts, nodes);
++      };
+
+   SchedulingResult result = topology_policy.Schedule(
+       req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
+@@ -849,6 +849,501 @@ TEST_F(SchedulingPolicyTest, GpuDomainSchedulingInfeasibleTest) {
+   ASSERT_FALSE(result.selected_topology_assignment.has_value());
+ }
+
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingTest) {
++  for (int i = 0; i < 4; i++) {
++    scheduling::NodeID node_id = scheduling::NodeID(i);
++    NodeResources resources = CreateNodeResources(1, 1, 0, 0, 0, 0);
++    nodes.emplace(node_id, resources);
++  }
++
++  std::unique_ptr<ClusterResourceManager> cluster_resource_manager =
++      MockClusterResourceManager(nodes);
++
++  ResourceRequest bundle_req = ResourceMapToResourceRequest(
++      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
++  std::vector<const ResourceRequest *> req_list(4, &bundle_req);
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundlePack();
++  options.bundle_group_indices_ = {{0, 1}, {2, 3}};
++
++  int inner_schedule_calls = 0;
++
++  NodeScheduleFn node_schedule_fn =
++      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
++                              SchedulingOptions opts,
++                              const absl::flat_hash_set<scheduling::NodeID> &nodes) {
++        inner_schedule_calls++;
++
++        SchedulingResult result;
++        result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
++        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
++        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
++        return result;
++      };
++
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsSuccess());
++  ASSERT_EQ(inner_schedule_calls, 2);
++  ASSERT_EQ(result.selected_nodes.size(), 4);
++
++  ASSERT_EQ(result.selected_nodes[0].ToInt(), 1);
++  ASSERT_EQ(result.selected_nodes[1].ToInt(), 1);
++  ASSERT_EQ(result.selected_nodes[2].ToInt(), 2);
++  ASSERT_EQ(result.selected_nodes[3].ToInt(), 2);
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingInfeasibleTest) {
++  for (int i = 0; i < 4; i++) {
++    scheduling::NodeID node_id = scheduling::NodeID(i);
++    NodeResources resources = CreateNodeResources(1, 1, 0, 0, 0, 0);
++    nodes.emplace(node_id, resources);
++  }
++
++  std::unique_ptr<ClusterResourceManager> cluster_resource_manager =
++      MockClusterResourceManager(nodes);
++
++  ResourceRequest bundle_req = ResourceMapToResourceRequest(
++      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
++  std::vector<const ResourceRequest *> req_list(4, &bundle_req);
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundlePack();
++  options.bundle_group_indices_ = {{0, 1}, {2, 3}};
++
++  int inner_schedule_calls = 0;
++
++  NodeScheduleFn node_schedule_fn =
++      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
++                              SchedulingOptions opts,
++                              const absl::flat_hash_set<scheduling::NodeID> &nodes) {
++        inner_schedule_calls++;
++
++        SchedulingResult result;
++        if (inner_schedule_calls == 2) {
++          result.status.code =
++              SchedulingResultStatus::SchedulingResultStatusCode::INFEASIBLE;
++          return result;
++        }
++
++        result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
++        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
++        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
++        return result;
++      };
++
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsInfeasible());
++  ASSERT_EQ(inner_schedule_calls, 2);
++  ASSERT_EQ(result.selected_nodes.size(), 0);
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingFailedTest) {
++  for (int i = 0; i < 4; i++) {
++    scheduling::NodeID node_id = scheduling::NodeID(i);
++    NodeResources resources = CreateNodeResources(1, 1, 0, 0, 0, 0);
++    nodes.emplace(node_id, resources);
++  }
++
++  std::unique_ptr<ClusterResourceManager> cluster_resource_manager =
++      MockClusterResourceManager(nodes);
++
++  ResourceRequest bundle_req = ResourceMapToResourceRequest(
++      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
++  std::vector<const ResourceRequest *> req_list(4, &bundle_req);
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundlePack();
++  options.bundle_group_indices_ = {{0, 1}, {2, 3}};
++
++  int inner_schedule_calls = 0;
++
++  NodeScheduleFn node_schedule_fn =
++      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
++                              SchedulingOptions opts,
++                              const absl::flat_hash_set<scheduling::NodeID> &nodes) {
++        inner_schedule_calls++;
++
++        SchedulingResult result;
++        if (inner_schedule_calls == 1) {
++          result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::FAILED;
++          return result;
++        }
++
++        result.status.code = SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
++        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
++        result.selected_nodes.push_back(scheduling::NodeID(inner_schedule_calls));
++        return result;
++      };
++
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsFailed());
++  ASSERT_EQ(inner_schedule_calls, 1);
++  ASSERT_EQ(result.selected_nodes.size(), 0);
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingSpreadTest) {
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
++
++  for (int i = 0; i < 4; i++) {
++    scheduling::NodeID node_id = scheduling::NodeID(i);
++    NodeResources resources = CreateNodeResources(1, 1, 0, 0, 0, 0);
++    if (i < 2) {
++      resources.labels = az1_labels;
++    } else {
++      resources.labels = az2_labels;
++    }
++    nodes.emplace(node_id, resources);
++  }
++
++  std::unique_ptr<ClusterResourceManager> cluster_resource_manager =
++      MockClusterResourceManager(nodes);
++
++  ResourceRequest bundle_req = ResourceMapToResourceRequest(
++      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
++  std::vector<const ResourceRequest *> req_list(4, &bundle_req);
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundleSpread(
++      std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.outer_strategy_ = rpc::PlacementStrategy::SPREAD;
++  options.bundle_group_indices_ = {{0, 1}, {2, 3}};
++
++  int inner_schedule_calls = 0;
++
++  NodeScheduleFn node_schedule_fn =
++      [&inner_schedule_calls](const std::vector<const ResourceRequest *> &reqs,
++                              SchedulingOptions opts,
++                              absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++        inner_schedule_calls++;
++
++        SchedulingResult result;
++        if (inner_schedule_calls == 1) {
++          result.status.code =
++              SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
++          result.selected_nodes.push_back(scheduling::NodeID(0));
++          result.selected_nodes.push_back(scheduling::NodeID(1));
++        } else if (inner_schedule_calls == 2) {
++          EXPECT_EQ(candidate_nodes.size(), 2);
++          EXPECT_TRUE(candidate_nodes.contains(scheduling::NodeID(2)));
++          EXPECT_TRUE(candidate_nodes.contains(scheduling::NodeID(3)));
++          result.status.code =
++              SchedulingResultStatus::SchedulingResultStatusCode::SUCCESS;
++          result.selected_nodes.push_back(scheduling::NodeID(2));
++          result.selected_nodes.push_back(scheduling::NodeID(3));
++        }
++        return result;
++      };
++
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsSuccess());
++  ASSERT_EQ(inner_schedule_calls, 2);
++  ASSERT_EQ(result.selected_nodes.size(), 4);
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingStrictSpreadPerfectMatch) {
++  // 1. Perfectly matched bipartite graph
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
++  absl::flat_hash_map<std::string, std::string> az3_labels = {{kDomainLabelKey, "az-3"}};
++
++  nodes.emplace(scheduling::NodeID(0),
++                CreateNodeResourcesWithLabels(2, 2, az1_labels));  // CPU: 2
++  nodes.emplace(scheduling::NodeID(1),
++                CreateNodeResourcesWithLabels(0, 0, az2_labels));  // CPU: 0
++  nodes.emplace(scheduling::NodeID(2),
++                CreateNodeResourcesWithLabels(0, 0, az3_labels));  // CPU: 0
++
++  // Actually let's manually set GPU
++  NodeResources n1 = CreateNodeResourcesWithLabels(2, 2, az1_labels);
++  NodeResources n2 = CreateNodeResourcesWithLabels(2, 2, az2_labels);
++  NodeResources n3 = CreateNodeResourcesWithLabels(2, 2, az3_labels);
++
++  // Make az-1 have 2 CPU, az-2 have 2 GPU, az-3 have 2 CPU + 2 GPU
++  n1.available.Set(ResourceID::GPU(), 0);
++  n1.total.Set(ResourceID::GPU(), 0);
++  n2.available.Set(ResourceID::GPU(), 2);
++  n2.total.Set(ResourceID::GPU(), 2);
++  n3.available.Set(ResourceID::GPU(), 2);
++  n3.total.Set(ResourceID::GPU(), 2);
++
++  nodes.clear();
++  nodes.emplace(scheduling::NodeID(0), n1);
++  nodes.emplace(scheduling::NodeID(1), n2);
++  nodes.emplace(scheduling::NodeID(2), n3);
++
++  auto cluster_resource_manager = MockClusterResourceManager(nodes);
++
++  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
++  ResourceRequest req_gpu = ResourceMapToResourceRequest({{"GPU", 2}}, false);
++  ResourceRequest req_both =
++      ResourceMapToResourceRequest({{"CPU", 2}, {"GPU", 2}}, false);
++
++  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_gpu, &req_both};
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
++      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
++  options.bundle_group_indices_ = {{0}, {1}, {2}};
++
++  NodeScheduleFn node_schedule_fn =
++      [&](const std::vector<const ResourceRequest *> &reqs,
++          SchedulingOptions opts,
++          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++        return inner_policy.Schedule(reqs, opts, candidate_nodes);
++      };
++
++  // The perfect match:
++  // req_both (CPU+GPU) MUST go to AZ-3.
++  // req_gpu MUST go to AZ-2.
++  // req_cpu MUST go to AZ-1.
++  // All matched perfectly!
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsSuccess());
++  ASSERT_EQ(result.selected_nodes.size(), 3);
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingStrictSpreadUnmatched) {
++  // 2. Unmatched vertices (cannot be satisfied)
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
++  absl::flat_hash_map<std::string, std::string> az3_labels = {{kDomainLabelKey, "az-3"}};
++
++  nodes.clear();
++  nodes.emplace(scheduling::NodeID(0), CreateNodeResourcesWithLabels(2, 2, az1_labels));
++  nodes.emplace(scheduling::NodeID(1), CreateNodeResourcesWithLabels(2, 2, az2_labels));
++  nodes.emplace(scheduling::NodeID(2),
++                CreateNodeResourcesWithLabels(0, 0, az3_labels));  // az-3 is empty
++
++  auto cluster_resource_manager = MockClusterResourceManager(nodes);
++
++  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
++  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_cpu, &req_cpu};
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
++      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
++  options.bundle_group_indices_ = {{0}, {1}, {2}};
++
++  NodeScheduleFn node_schedule_fn =
++      [&](const std::vector<const ResourceRequest *> &reqs,
++          SchedulingOptions opts,
++          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++        return inner_policy.Schedule(reqs, opts, candidate_nodes);
++      };
++
++  // 3 CPU requests, but only 2 AZs have CPUs. So this is infeasible.
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsInfeasible());
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingStrictSpreadDisconnected) {
++  // 3. Disconnected graphs (perfectly fine matching, but bipartite graph is disjoint
++  // components)
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
++
++  nodes.clear();
++  NodeResources n1 = CreateNodeResourcesWithLabels(2, 2, az1_labels);
++  n1.available.Set(ResourceID::GPU(), 0);
++  n1.total.Set(ResourceID::GPU(), 0);
++  NodeResources n2 = CreateNodeResourcesWithLabels(0, 0, az2_labels);
++  n2.available.Set(ResourceID::GPU(), 2);
++  n2.total.Set(ResourceID::GPU(), 2);
++
++  nodes.emplace(scheduling::NodeID(0), n1);
++  nodes.emplace(scheduling::NodeID(1), n2);
++
++  auto cluster_resource_manager = MockClusterResourceManager(nodes);
++
++  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
++  ResourceRequest req_gpu = ResourceMapToResourceRequest({{"GPU", 2}}, false);
++  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_gpu};
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
++      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
++  options.bundle_group_indices_ = {{0}, {1}};
++
++  NodeScheduleFn node_schedule_fn =
++      [&](const std::vector<const ResourceRequest *> &reqs,
++          SchedulingOptions opts,
++          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++        return inner_policy.Schedule(reqs, opts, candidate_nodes);
++      };
++
++  // Disjoint bipartite graph:
++  // CPU req -> AZ-1
++  // GPU req -> AZ-2
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsSuccess());
++  ASSERT_EQ(result.selected_nodes.size(), 2);
++}
++
++TEST_F(SchedulingPolicyTest,
++       HierarchicalBundleSchedulingStrictSpreadMoreNodesThanBundles) {
++  // 4. Graph with more nodes than bundles
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
++  absl::flat_hash_map<std::string, std::string> az3_labels = {{kDomainLabelKey, "az-3"}};
++
++  nodes.clear();
++  nodes.emplace(scheduling::NodeID(0), CreateNodeResourcesWithLabels(2, 2, az1_labels));
++  nodes.emplace(scheduling::NodeID(1), CreateNodeResourcesWithLabels(2, 2, az2_labels));
++  nodes.emplace(scheduling::NodeID(2), CreateNodeResourcesWithLabels(2, 2, az3_labels));
++
++  auto cluster_resource_manager = MockClusterResourceManager(nodes);
++
++  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 2}}, false);
++  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_cpu};  // Only 2 bundles
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
++      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
++  options.bundle_group_indices_ = {{0}, {1}};  // 2 groups
++
++  NodeScheduleFn node_schedule_fn =
++      [&](const std::vector<const ResourceRequest *> &reqs,
++          SchedulingOptions opts,
++          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++        return inner_policy.Schedule(reqs, opts, candidate_nodes);
++      };
++
++  // 2 groups into 3 AZs should succeed
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsSuccess());
++  ASSERT_EQ(result.selected_nodes.size(), 2);
++}
++
++TEST_F(SchedulingPolicyTest,
++       HierarchicalBundleSchedulingStrictSpreadMoreBundlesThanNodes) {
++  // 5. Graph with more bundles than nodes
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++  absl::flat_hash_map<std::string, std::string> az2_labels = {{kDomainLabelKey, "az-2"}};
++
++  nodes.clear();
++  nodes.emplace(scheduling::NodeID(0), CreateNodeResourcesWithLabels(2, 2, az1_labels));
++  nodes.emplace(scheduling::NodeID(1), CreateNodeResourcesWithLabels(2, 2, az2_labels));
++
++  auto cluster_resource_manager = MockClusterResourceManager(nodes);
++
++  ResourceRequest req_cpu = ResourceMapToResourceRequest({{"CPU", 1}}, false);
++  std::vector<const ResourceRequest *> req_list = {
++      &req_cpu, &req_cpu, &req_cpu};  // 3 bundles
++
++  HierarchicalBundleSchedulingPolicy policy(*cluster_resource_manager);
++  BundlePackSchedulingPolicy inner_policy(*cluster_resource_manager);
++
++  SchedulingOptions options = SchedulingOptions::BundleStrictSpread(
++      nullptr, std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.outer_strategy_ = rpc::PlacementStrategy::STRICT_SPREAD;
++  options.bundle_group_indices_ = {{0}, {1}, {2}};  // 3 groups
++
++  NodeScheduleFn node_schedule_fn =
++      [&](const std::vector<const ResourceRequest *> &reqs,
++          SchedulingOptions opts,
++          absl::flat_hash_set<scheduling::NodeID> candidate_nodes) {
++        return inner_policy.Schedule(reqs, opts, candidate_nodes);
++      };
++
++  // 3 groups into 2 AZs should fail as INFEASIBLE because STRICT_SPREAD requires
++  // different domains for all groups.
++  SchedulingResult result = policy.Schedule(
++      req_list, options, GetCandidateNodes(*cluster_resource_manager), node_schedule_fn);
++
++  ASSERT_TRUE(result.status.IsInfeasible());
++}
++
++TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingHeterogeneousGroupTest) {
++  const std::string kDomainLabelKey = "ray.io/az";
++  absl::flat_hash_map<std::string, std::string> az1_labels = {{kDomainLabelKey, "az-1"}};
++
++  nodes.clear();
++  // Node 0: 3 CPUs
++  scheduling::NodeID node0 = scheduling::NodeID(0);
++  NodeResources res0 = CreateNodeResources(3, 3, 0, 0, 0, 0);
++  res0.labels = az1_labels;
++  nodes.emplace(node0, res0);
++
++  // Node 1: 1 CPU
++  scheduling::NodeID node1 = scheduling::NodeID(1);
++  NodeResources res1 = CreateNodeResources(1, 1, 0, 0, 0, 0);
++  res1.labels = az1_labels;
++  nodes.emplace(node1, res1);
++
++  auto cluster_resource_manager = MockClusterResourceManager(nodes);
++
++  ResourceRequest req3 = ResourceMapToResourceRequest(
++      absl::flat_hash_map<std::string, double>{{"CPU", 3}}, false);
++  ResourceRequest req1 = ResourceMapToResourceRequest(
++      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
++
++  // Input order: [1-CPU, 3-CPU]
++  std::vector<const ResourceRequest *> req_list = {&req1, &req3};
++
++  SchedulingOptions options = SchedulingOptions::BundlePack(
++      std::make_pair(kDomainLabelKey, std::optional<std::string>(std::nullopt)));
++  options.bundle_group_indices_ = {{0, 1}};
++
++  raylet_scheduling_policy::CompositeBundleSchedulingPolicy policy(
++      *cluster_resource_manager);
++
++  SchedulingResult result =
++      policy.Schedule(req_list, options, GetCandidateNodes(*cluster_resource_manager));
++
++  ASSERT_TRUE(result.status.IsSuccess());
++  ASSERT_EQ(result.selected_nodes.size(), 2);
++
++  // The first bundle (1 CPU) should be placed. It can go on either node.
++  // The second bundle (3 CPU) MUST go on node0.
++  // Wait, if it packs, the 3-CPU bundle goes on node0.
++  // The 1-CPU bundle will also go on node0 because PACK will fit it there, EXCEPT node0
++  // only has 3 CPUs total! Wait, if node0 has 3 CPUs, it can't fit BOTH 3-CPU and 1-CPU.
++  // So the 1-CPU bundle MUST go on node1.
++  // Let's assert exactly that.
++  ASSERT_EQ(result.selected_nodes[0], node1);
++  ASSERT_EQ(result.selected_nodes[1], node0);
++}
++
+ }  // namespace raylet
+
+ }  // namespace ray
+diff --git a/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.cc b/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.cc
+index 50a0cda9c6..6c14a1fcf8 100644
+--- a/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.cc
++++ b/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.cc
+@@ -55,7 +55,7 @@ bool TopologySchedulingPolicyInterface::IsRequestFeasible(
+ SchedulingResult TopologyStrictPackSchedulingPolicy::Schedule(
+     const std::vector<const ResourceRequest *> &resource_request_list,
+     const SchedulingOptions &options,
+-    absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
++    const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
+     NodeScheduleFn node_schedule_fn) {
+   RAY_CHECK(!resource_request_list.empty());
+
+@@ -67,22 +67,21 @@ SchedulingResult TopologyStrictPackSchedulingPolicy::Schedule(
+   // schedule the bundles.
+   if (options.target_topology_assignment_.second.has_value()) {
+     const std::string &target = *options.target_topology_assignment_.second;
+-    for (auto it = candidate_nodes.begin(); it != candidate_nodes.end();) {
+-      const auto &labels = cluster_resource_manager_.GetNodeLabels(*it);
++    absl::flat_hash_set<scheduling::NodeID> filtered_nodes;
++    for (const auto &node_id : candidate_nodes) {
++      const auto &labels = cluster_resource_manager_.GetNodeLabels(node_id);
+       auto label_it = labels.find(label_key);
+-      if (label_it == labels.end() || label_it->second != target) {
+-        candidate_nodes.erase(it++);
+-      } else {
+-        ++it;
++      if (label_it != labels.end() && label_it->second == target) {
++        filtered_nodes.insert(node_id);
+       }
+     }
+-    if (!IsRequestFeasible(resource_request_list, candidate_nodes)) {
++    if (!IsRequestFeasible(resource_request_list, filtered_nodes)) {
+       RAY_LOG(DEBUG) << "Target topology value '" << target
+                      << "' has insufficient resources; infeasible.";
+       return SchedulingResult::Infeasible();
+     }
+     SchedulingResult result =
+-        node_schedule_fn(resource_request_list, options, std::move(candidate_nodes));
++        node_schedule_fn(resource_request_list, options, filtered_nodes);
+     if (result.status.IsSuccess()) {
+       result.selected_topology_assignment =
+           std::make_pair(label_key, std::string(target));
+diff --git a/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.h b/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.h
+index 80dcbdef4c..a09280ad4a 100644
+--- a/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.h
++++ b/src/ray/raylet/scheduling/policy/topology_bundle_scheduling_policy.h
+@@ -58,7 +58,7 @@ class TopologySchedulingPolicyInterface {
+   virtual SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       const SchedulingOptions &options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
+       NodeScheduleFn node_schedule_fn) = 0;
+
+  protected:
+@@ -92,7 +92,7 @@ class TopologyStrictPackSchedulingPolicy : public TopologySchedulingPolicyInterf
+   SchedulingResult Schedule(
+       const std::vector<const ResourceRequest *> &resource_request_list,
+       const SchedulingOptions &options,
+-      absl::flat_hash_set<scheduling::NodeID> candidate_nodes,
++      const absl::flat_hash_set<scheduling::NodeID> &candidate_nodes,
+       NodeScheduleFn node_schedule_fn) override;
+ };
+
+diff --git a/test_hierarchical_f_series.py b/test_hierarchical_f_series.py
+new file mode 100644
+index 0000000000..7042af3acc
+--- /dev/null
++++ b/test_hierarchical_f_series.py
+@@ -0,0 +1,80 @@
++import grpc
++
++from ray.core.generated import (
++    common_pb2,
++    gcs_pb2,
++    gcs_service_pb2,
++    gcs_service_pb2_grpc,
++)
++
++
++def test_f6_validation_identity():
++    channel = grpc.insecure_channel("127.0.0.1:6379")  # Adjust port if needed
++    stub = gcs_service_pb2_grpc.PlacementGroupInfoGcsServiceStub(channel)
++
++    pg_spec = common_pb2.PlacementGroupSpec(
++        placement_group_id=b"1234567890123456789012345678",
++        name="test_f6",
++        strategy=common_pb2.PlacementStrategy.STRICT_PACK,
++        creator_job_id=b"1234567890123456789012345678",
++        creator_job_dead=False,
++    )
++
++    # Add a flat bundle
++    bundle = pg_spec.bundles.add()
++    bundle.bundle_id.bundle_index = 0
++    bundle.bundle_id.placement_group_id = pg_spec.placement_group_id
++    bundle.unit_resources["CPU"] = 1.0
++
++    # Add >1 topology layer
++    layer1 = pg_spec.topology_strategy.add()
++    layer1.entries["rack"] = common_pb2.PlacementStrategy.STRICT_PACK
++    layer2 = pg_spec.topology_strategy.add()
++    layer2.entries["node"] = common_pb2.PlacementStrategy.STRICT_PACK
++
++    request = gcs_service_pb2.CreatePlacementGroupRequest(placement_group_spec=pg_spec)
++    try:
++        response = stub.AddPlacementGroup(request)
++        print("Response status:", response.status)
++        assert response.status.code == gcs_pb2.GcsStatus.GCS_STATUS_INVALID
++    except Exception as e:
++        print("Exception:", e)
++
++
++def test_r2_mixed_flat_grouped():
++    channel = grpc.insecure_channel("127.0.0.1:6379")
++    stub = gcs_service_pb2_grpc.PlacementGroupInfoGcsServiceStub(channel)
++
++    pg_spec = common_pb2.PlacementGroupSpec(
++        placement_group_id=b"1234567890123456789012345679",
++        name="test_r2",
++        strategy=common_pb2.PlacementStrategy.STRICT_PACK,
++        creator_job_id=b"1234567890123456789012345678",
++        creator_job_dead=False,
++    )
++
++    # Add a flat bundle
++    bundle1 = pg_spec.bundles.add()
++    bundle1.bundle_id.bundle_index = 0
++    bundle1.bundle_id.placement_group_id = pg_spec.placement_group_id
++    bundle1.unit_resources["CPU"] = 1.0
++
++    # Add a grouped bundle
++    bundle2 = pg_spec.bundles.add()
++    bundle2.bundle_id.bundle_index = 1
++    bundle2.bundle_id.placement_group_id = pg_spec.placement_group_id
++    bundle2.unit_resources["CPU"] = 1.0
++    bundle2.bundle_group_index = 0
++
++    request = gcs_service_pb2.CreatePlacementGroupRequest(placement_group_spec=pg_spec)
++    try:
++        response = stub.AddPlacementGroup(request)
++        print("Response status:", response.status)
++        assert response.status.code == gcs_pb2.GcsStatus.GCS_STATUS_INVALID
++        assert "mix of grouped bundles" in response.status.message
++    except Exception as e:
++        print("Exception:", e)
++
++
++if __name__ == "__main__":
++    pass

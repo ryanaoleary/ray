@@ -1351,6 +1351,58 @@ TEST_F(GcsPlacementGroupSchedulerTest, TestPrepareFromDeadNodes) {
   WaitPlacementGroupPendingDone(1, GcsPlacementGroupStatus::FAILURE);
 }
 
+TEST_F(GcsPlacementGroupSchedulerTest, TestHierarchicalPlacementGroupCommitFailure) {
+  auto node0 = GenNodeInfo(0);
+  auto node1 = GenNodeInfo(1);
+  AddNode(node0);
+  AddNode(node1);
+
+  NodeID node_id0 = NodeID::FromBinary(node0->node_id());
+  NodeID node_id1 = NodeID::FromBinary(node1->node_id());
+
+  cluster_resource_scheduler_->GetClusterResourceManager().SetNodeLabels(
+      scheduling::NodeID(node_id0.Binary()), {{"rack", "rack1"}});
+  cluster_resource_scheduler_->GetClusterResourceManager().SetNodeLabels(
+      scheduling::NodeID(node_id1.Binary()), {{"rack", "rack2"}});
+
+  // Make sure the cluster resources are not in use.
+  ASSERT_TRUE(EnsureClusterResourcesAreNotInUse());
+
+  // Create a placement group with 2 bundles (CPU=2) and outer STRICT_SPREAD on rack.
+  auto request =
+      GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::SPREAD, 2, 2.0);
+  request.mutable_placement_group_spec()->set_strategy(
+      rpc::PlacementStrategy::STRICT_SPREAD);
+  auto *topology = request.mutable_placement_group_spec()->add_topology_strategy();
+  (*topology->mutable_entries())["rack"] = rpc::PlacementStrategy::STRICT_SPREAD;
+
+  auto *spec = request.mutable_placement_group_spec();
+  spec->mutable_bundles(0)->set_bundle_group_index(0);
+  spec->mutable_bundles(1)->set_bundle_group_index(1);
+
+  auto placement_group =
+      std::make_shared<GcsPlacementGroup>(request, "", counter_, clock_);
+
+  // Schedule the unplaced bundles of the placement_group.
+  ScheduleUnplacedBundles(placement_group);
+
+  // Grant the prepare of bundle resources for both nodes.
+  GrantPrepareBundleResources(/*grant0=*/{true, Status::OK()},
+                              /*grant1=*/{true, Status::OK()});
+
+  // Now, one node fails to commit!
+  // Mock raylet 0 grants commit. Mock raylet 1 denies commit.
+  WaitPendingDone(raylet_clients_[0]->commit_callbacks, 1);
+  WaitPendingDone(raylet_clients_[1]->commit_callbacks, 1);
+
+  // Here node 0 grants commit, node 1 returns IOError (mocking raylet denies).
+  ASSERT_TRUE(raylet_clients_[0]->GrantCommitBundleResources(Status::OK()));
+  ASSERT_TRUE(raylet_clients_[1]->GrantCommitBundleResources(Status::IOError("fail")));
+
+  // Wait for the placement group to be rescheduled.
+  WaitPlacementGroupPendingDone(1, GcsPlacementGroupStatus::FAILURE);
+}
+
 TEST_F(GcsPlacementGroupSchedulerTest, TestCommitToDeadNodes) {
   auto node0 = GenNodeInfo(0);
   auto node1 = GenNodeInfo(1);

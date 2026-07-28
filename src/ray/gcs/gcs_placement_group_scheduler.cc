@@ -120,13 +120,6 @@ void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
         }
       }
       if (!local_group.empty()) {
-        if (local_group.size() != group.size()) {
-          RAY_LOG(ERROR).WithField(placement_group->GetPlacementGroupID())
-              << "Bundle group " << original_idx
-              << " cannot be partially unplaced. Failing scheduling.";
-          failure_callback(placement_group, /*is_feasible*/ true);
-          return;
-        }
         unplaced_group_indices.push_back(std::move(local_group));
         unplaced_original_group_indices.push_back(original_idx);
       }
@@ -622,6 +615,12 @@ void GcsPlacementGroupScheduler::OnAllBundleCommitRequestReturned(
         }
       }
 
+      std::vector<int> group_list;
+      for (int g : affected_groups) {
+        group_list.push_back(g);
+      }
+      placement_group->ClearGroupTopologyAssignments(group_list);
+
       DestroyPlacementGroupBundleIndices(placement_group_id, bundles_to_clear);
       for (int64_t idx : bundles_to_clear) {
         placement_group->GetMutableBundle(idx)->clear_node_id();
@@ -685,6 +684,8 @@ SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
     target_topology_assignment = {outer_entry->first, topology_label_value};
   }
 
+  // Note: Groups may span multiple inner domains under STRICT_PACK so we do not pin
+  // the inner topology assignment.
   if (inner_entry.has_value()) {
     std::optional<std::string> inner_topology_label_value =
         placement_group.GetTopologyAssignment(inner_entry->first);
@@ -793,22 +794,41 @@ SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
       }
     } else if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD ||
                options.outer_strategy_ == rpc::PlacementStrategy::SPREAD) {
-      for (const auto &pair : group_assignments) {
-        options.group_topology_pins_[pair.first] = pair.second;
-        options.previously_occupied_topologies_.insert(pair.second);
+      absl::flat_hash_set<int> scheduling_groups;
+      for (const auto &pair : group_to_indices) {
+        for (int bundle_idx : pair.second) {
+          const auto &bundle =
+              placement_group.GetPlacementGroupTableData().bundles(bundle_idx);
+          if (NodeID::FromBinary(bundle.node_id()).IsNil()) {
+            scheduling_groups.insert(pair.first);
+            break;
+          }
+        }
       }
 
-      for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size();
-           i++) {
-        const auto &bundle = placement_group.GetPlacementGroupTableData().bundles(i);
-        if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
-          scheduling::NodeID placed_node(bundle.node_id());
-          const auto &labels =
-              cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
-                  placed_node);
-          auto it = labels.find(outer_key);
-          if (it != labels.end()) {
-            options.previously_occupied_topologies_.insert(it->second);
+      for (const auto &pair : group_assignments) {
+        options.group_topology_pins_[pair.first] = pair.second;
+        if (!scheduling_groups.contains(pair.first)) {
+          options.previously_occupied_topologies_.insert(pair.second);
+        }
+      }
+
+      for (const auto &pair : group_to_indices) {
+        if (scheduling_groups.contains(pair.first)) {
+          continue;
+        }
+        for (int bundle_idx : pair.second) {
+          const auto &bundle =
+              placement_group.GetPlacementGroupTableData().bundles(bundle_idx);
+          if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
+            scheduling::NodeID placed_node(bundle.node_id());
+            const auto &labels =
+                cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
+                    placed_node);
+            auto it = labels.find(outer_key);
+            if (it != labels.end()) {
+              options.previously_occupied_topologies_.insert(it->second);
+            }
           }
         }
       }

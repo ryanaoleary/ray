@@ -1,0 +1,316 @@
+/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/site-packages/paramiko/pkey.py:82: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  "cipher": algorithms.TripleDES,
+/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/site-packages/paramiko/transport.py:253: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  "class": algorithms.TripleDES,
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-7.4.4, pluggy-1.3.0 -- /usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/bin/python
+cachedir: .pytest_cache
+rootdir: /usr/local/google/home/ryanaoleary/Desktop/forks/ray
+configfile: pytest.ini
+plugins: aiohttp-1.1.0, timeout-2.1.0, pytest_httpserver-1.1.3, anyio-4.12.0, forked-1.4.0, sphinx-0.5.1.dev0, docker-tools-3.1.3, mock-3.14.0, virtualenv-1.8.1, rerunfailures-11.1.2, sugar-0.9.5, asyncio-0.17.2, lazy-fixtures-1.1.2, shutil-1.8.1
+timeout: 180.0s
+timeout method: signal
+timeout func_only: False
+asyncio: mode=Mode.AUTO
+collecting ... collected 61 items
+
+python/ray/tests/test_resource_demand_scheduler.py::test_util_score PASSED [  1%]
+python/ray/tests/test_resource_demand_scheduler.py::test_gpu_node_util_score PASSED [  3%]
+python/ray/tests/test_resource_demand_scheduler.py::test_zero_resource PASSED [  4%]
+python/ray/tests/test_resource_demand_scheduler.py::test_bin_pack PASSED [  6%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_packing_heuristic PASSED [  8%]
+python/ray/tests/test_resource_demand_scheduler.py::test_node_packing_gpu_cpu_bundles PASSED [  9%]
+python/ray/tests/test_resource_demand_scheduler.py::test_gpu_node_avoid_cpu_task PASSED [ 11%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_respects_max_limit PASSED [ 13%]
+python/ray/tests/test_resource_demand_scheduler.py::test_add_min_workers_nodes PASSED [ 14%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_to_launch_with_min_workers PASSED [ 16%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_to_launch_with_min_workers_and_bin_packing PASSED [ 18%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_to_launch_limits PASSED [ 19%]
+python/ray/tests/test_resource_demand_scheduler.py::test_calculate_node_resources PASSED [ 21%]
+python/ray/tests/test_resource_demand_scheduler.py::test_request_resources_gpu_no_gpu_nodes PASSED [ 22%]
+python/ray/tests/test_resource_demand_scheduler.py::test_request_resources_existing_usage PASSED [ 24%]
+python/ray/tests/test_resource_demand_scheduler.py::test_do_not_add_nodes_based_on_object_store_memory PASSED [ 26%]
+python/ray/tests/test_resource_demand_scheduler.py::test_backlog_queue_impact_on_binpacking_time PASSED [ 27%]
+python/ray/tests/test_resource_demand_scheduler.py::TestPlacementGroupScaling::test_strategies PASSED [ 29%]
+python/ray/tests/test_resource_demand_scheduler.py::TestPlacementGroupScaling::test_hierarchical_strict_spread PASSED [ 31%]
+python/ray/tests/test_resource_demand_scheduler.py::TestPlacementGroupScaling::test_many_strict_spreads PASSED [ 32%]
+python/ray/tests/test_resource_demand_scheduler.py::TestPlacementGroupScaling::test_packing PASSED [ 34%]
+python/ray/tests/test_resource_demand_scheduler.py::TestPlacementGroupScaling::test_skip_placed_bundles PASSED [ 36%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_concurrent_resource_demand_to_launch PASSED [ 37%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_concurrent_resource_demand_to_launch_with_upscaling_speed PASSED [ 39%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_to_launch_max_launch_concurrency_placement_groups PASSED [ 40%]
+python/ray/tests/test_resource_demand_scheduler.py::test_get_nodes_to_launch_max_launch_concurrency PASSED [ 42%]
+python/ray/tests/test_resource_demand_scheduler.py::LoadMetricsTest::testPlacementGroupLoad PASSED [ 44%]
+python/ray/tests/test_resource_demand_scheduler.py::LoadMetricsTest::testResourceDemandVector PASSED [ 45%]
+python/ray/tests/test_resource_demand_scheduler.py::LoadMetricsTest::testSummary PASSED [ 47%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testCommandPassing PASSED [ 49%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testDockerWorkers PASSED [ 50%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testEmptyDocker PASSED [ 52%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testGetOrCreateMultiNodeType PASSED [ 54%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testGetOrCreateMultiNodeTypeCustomHeadResources PASSED [ 55%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testPlacementGroup PASSED [ 57%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testRequestBundles PASSED [ 59%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testRequestBundlesAccountsForHeadNode PASSED [ 60%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testRequestResourcesIdleTimeout 2026-07-27 00:44:11,484	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker exec -it  mock /bin/bash -c '"'"'bash --login -c -i '"'"'"'"'"'"'"'"'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_HEAD_IP=172.0.0.0; worker_setup_cmd)'"'"'"'"'"'"'"'"''"'"' )'[22m[26m`
+2026-07-27 00:44:11,484	INFO log_timer.py:25 -- NodeUpdater: 2: Setup commands succeeded [LogTimer=1ms]
+2026-07-27 00:44:11,484	INFO updater.py:509 -- [2m[7/7][22m [36mStarting the Ray runtime[39m
+2026-07-27 00:44:11,485	VINFO command_runner.py:390 -- Running `[1mdocker exec -it  mock /bin/bash -c 'bash --login -c -i '"'"'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_OVERRIDE_RESOURCES='"'"'"'"'"'"'"'"'{"CPU":2,"WORKER":1}'"'"'"'"'"'"'"'"';export RAY_HEAD_IP=172.0.0.0; start_ray_worker)'"'"'' [22m[26m`
+2026-07-27 00:44:11,485	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker exec -it  mock /bin/bash -c '"'"'bash --login -c -i '"'"'"'"'"'"'"'"'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_OVERRIDE_RESOURCES='"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'{"CPU":2,"WORKER":1}'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"';export RAY_HEAD_IP=172.0.0.0; start_ray_worker)'"'"'"'"'"'"'"'"''"'"' )'[22m[26m`
+2026-07-27 00:44:11,485	INFO log_timer.py:25 -- NodeUpdater: 2: Ray start commands succeeded [LogTimer=0ms]
+2026-07-27 00:44:11,485	INFO log_timer.py:25 -- NodeUpdater: 2: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=14ms]
+2026-07-27 00:44:11,485	INFO updater.py:210 -- [37mNew status[39m: [1mup-to-date[22m
+PASSED [ 62%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testRequestResourcesRaceConditionWithMinWorker PASSED [ 63%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testRequestResourcesRaceConditionWithResourceDemands PASSED [ 65%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testRequestResourcesRaceConditionsLong PASSED [ 67%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testResourcePassing PASSED [ 68%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testScaleUpIgnoreUsed PASSED [ 70%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testScaleUpLoadMetrics PASSED [ 72%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testScaleUpMinSanity 2026-07-27 00:44:12,836	INFO log_timer.py:25 -- NodeUpdater: 1: Initialization commands succeeded [LogTimer=1ms]
+2026-07-27 00:44:12,836	INFO updater.py:458 -- [2m[5/7][22m [36mInitializing command runner[39m
+2026-07-27 00:44:12,837	VINFO command_runner.py:390 -- Running `[1mcommand -v docker || echo 'NoExist'[22m[26m`
+2026-07-27 00:44:12,837	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (command -v docker || echo '"'"'NoExist'"'"')'[22m[26m`
+2026-07-27 00:44:12,837	VINFO command_runner.py:390 -- Running `[1mdocker pull example[22m[26m`
+2026-07-27 00:44:12,837	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker pull example)'[22m[26m`
+2026-07-27 00:44:12,837	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{.State.Running}}' mock || true[22m[26m`
+2026-07-27 00:44:12,837	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{.State.Running}}'"'"' mock || true)'[22m[26m`
+2026-07-27 00:44:12,837	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{json .Config.Env}}' example[22m[26m`
+2026-07-27 00:44:12,837	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{json .Config.Env}}'"'"' example)'[22m[26m`
+2026-07-27 00:44:12,837	ERR command_runner.py:820 -- [31mUnable to deserialize `image_env` to Python object. The `image_env` is:
+command-output[39m
+2026-07-27 00:44:12,837	INFO log_timer.py:25 -- NodeUpdater: 1: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=8ms]
+2026-07-27 00:44:12,838	ERR updater.py:177 -- [31mNew status: [1mupdate-failed[22m[26m[39m
+2026-07-27 00:44:12,838	ERR updater.py:179 -- [31m!!![39m
+2026-07-27 00:44:12,838	VERR updater.py:189 -- [31mException details: {'msg': 'Expecting value', 'doc': 'command-output', 'pos': 0, 'lineno': 1, 'colno': 1}[39m
+2026-07-27 00:44:12,838	INFO updater.py:277 -- [2m[3/7][22m No worker file mounts to sync
+2026-07-27 00:44:12,838	INFO updater.py:413 -- [37mNew status[39m: [1msetting-up[22m
+2026-07-27 00:44:12,838	INFO updater.py:416 -- [2m[4/7][22m [36mRunning initialization commands[39m
+2026-07-27 00:44:12,838	VINFO command_runner.py:390 -- Running `[1mexport RAY_HEAD_IP=172.0.0.0; init_cmd[22m[26m`
+2026-07-27 00:44:12,839	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o 'sExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i ource ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_HEAD_IP=172.0.0.0; init_cmd)'[22m[26m`
+2026-07-27 00:44:12,839	INFO log_timer.py:25 -- NodeUpdater: 2: Initialization commands succeeded [LogTimer=0ms]
+2026-07-27 00:44:12,839	INFO updater.py:458 -- [2m[5/7][22m [36mInitializing command runner[39m
+2026-07-27 00:44:12,839	VINFO command_runner.py:390 -- Running `[1mcommand -v docker || echo 'NoExist'[22m[26m`
+2026-07-27 00:44:12,839	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (command -v docker || echo '"'"'NoExist'"'"')'[22m[26m`
+2026-07-27 00:44:12,839	VINFO command_runner.py:390 -- Running `[1mdocker pull example[22m[26m`
+2026-07-27 00:44:12,839	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker pull example)'[22m[26m`
+2026-07-27 00:44:12,839	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{.State.Running}}' mock || true[22m[26m`
+2026-07-27 00:44:12,840	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{.State.Running}}'"'"' mock || true)'[22m[26m`
+2026-07-27 00:44:12,840	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{json .Config.Env}}' example[22m[26m`
+2026-07-27 00:44:12,840	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{json .Config.Env}}'"'"' example)'[22m[26m`
+2026-07-27 00:44:12,840	ERR command_runner.py:820 -- [31mUnable to deserialize `image_env` to Python object. The `image_env` is:
+command-output[39m
+2026-07-27 00:44:12,840	INFO log_timer.py:25 -- NodeUpdater: 2: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=8ms]
+2026-07-27 00:44:12,840	ERR updater.py:177 -- [31mNew status: [1mupdate-failed[22m[26m[39m
+2026-07-27 00:44:12,840	ERR updater.py:179 -- [31m!!![39m
+2026-07-27 00:44:12,840	VERR updater.py:189 -- [31mException details: {'msg': 'Expecting value', 'doc': 'command-output', 'pos': 0, 'lineno': 1, 'colno': 1}[39m
+PASSED [ 73%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testScaleUpMinSanityWithHeadNode 2026-07-27 00:44:12,971	VINFO command_runner.py:390 -- Running `[1muptime[22m[26m`
+2026-07-27 00:44:12,971	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=10s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (uptime)'[22m[26m`
+2026-07-27 00:44:12,971	SUCC updater.py:301 -- [32mSuccess.[39m
+2026-07-27 00:44:12,971	INFO log_timer.py:25 -- NodeUpdater: 1: Got remote shell  [LogTimer=1ms]
+2026-07-27 00:44:12,971	INFO updater.py:395 -- Updating cluster configuration.[0m[2m [hash=v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0][22m[0m
+2026-07-27 00:44:12,971	INFO updater.py:402 -- [37mNew status[39m: [1msyncing-files[22m
+2026-07-27 00:44:12,971	INFO updater.py:260 -- [2m[2/7][22m [36mProcessing file mounts[39m
+2026-07-27 00:44:12,971	INFO updater.py:277 -- [2m[3/7][22m No worker file mounts to sync
+2026-07-27 00:44:12,971	INFO updater.py:413 -- [37mNew status[39m: [1msetting-up[22m
+2026-07-27 00:44:12,971	INFO updater.py:416 -- [2m[4/7][22m [36mRunning initialization commands[39m
+2026-07-27 00:44:12,972	VINFO command_runner.py:390 -- Running `[1mexport RAY_HEAD_IP=172.0.0.0; init_cmd[22m[26m`
+2026-07-27 00:44:12,972	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_HEAD_IP=172.0.0.0; init_cmd)'[22m[26m`
+2026-07-27 00:44:12,972	INFO log_timer.py:25 -- NodeUpdater: 1: Initialization commands succeeded [LogTimer=0ms]
+2026-07-27 00:44:12,972	INFO updater.py:458 -- [2m[5/7][22m [36mInitializing command runner[39m
+2026-07-27 00:44:12,972	VINFO command_runner.py:390 -- Running `[1mcommand -v docker || echo 'NoExist'[22m[26m`
+2026-07-27 00:44:12,972	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (command -v docker || echo '"'"'NoExist'"'"')'[22m[26m`
+2026-07-27 00:44:12,972	INFO log_timer.py:25 -- NodeUpdater: 2: Got IP  [LogTimer=1ms]
+2026-07-27 00:44:12,972	VINFO command_runner.py:390 -- Running `[1muptime[22m[26m`
+2026-07-27 00:44:12,972	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=10s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (uptime)'[22m[26m`
+2026-07-27 00:44:12,972	SUCC updater.py:301 -- [32mSuccess.[39m
+2026-07-27 00:44:12,972	INFO log_timer.py:25 -- NodeUpdater: 2: Got remote shell  [LogTimer=2ms]
+2026-07-27 00:44:12,972	INFO updater.py:395 -- Updating cluster configuration.[0m[2m [hash=v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0][22m[0m
+2026-07-27 00:44:12,973	INFO updater.py:402 -- [37mNew status[39m: [1msyncing-files[22m
+2026-07-27 00:44:12,973	INFO updater.py:260 -- [2m[2/7][22m [36mProcessing file mounts[39m
+2026-07-27 00:44:12,973	INFO updater.py:277 -- [2m[3/7][22m No worker file mounts to sync
+2026-07-27 00:44:12,973	INFO updater.py:413 -- [37mNew status[39m: [1msetting-up[22m
+2026-07-27 00:44:12,973	INFO updater.py:416 -- [2m[4/7][22m [36mRunning initialization commands[39m
+2026-07-27 00:44:12,973	VINFO command_runner.py:390 -- Running `[1mexport RAY_HEAD_IP=172.0.0.0; init_cmd[22m[26m`
+2026-07-27 00:44:12,973	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_HEAD_IP=172.0.0.0; init_cmd)'[22m[26m`
+2026-07-27 00:44:12,973	INFO log_timer.py:25 -- NodeUpdater: 2: Initialization commands succeeded [LogTimer=0ms]
+2026-07-27 00:44:12,973	INFO updater.py:458 -- [2m[5/7][22m [36mInitializing command runner[39m
+2026-07-27 00:44:12,973	VINFO command_runner.py:390 -- Running `[1mcommand -v docker || echo 'NoExist'[22m[26m`
+2026-07-27 00:44:12,973	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (command -v docker || echo '"'"'NoExist'"'"')'[22m[26m`
+2026-07-27 00:44:12,973	VINFO command_runner.py:390 -- Running `[1mdocker pull example[22m[26m`
+2026-07-27 00:44:12,973	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker pull example)'[22m[26m`
+2026-07-27 00:44:12,973	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{.State.Running}}' mock || true[22m[26m`
+2026-07-27 00:44:12,973	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{.State.Running}}'"'"' mock || true)'[22m[26m`
+2026-07-27 00:44:12,974	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{json .Config.Env}}' example[22m[26m`
+2026-07-27 00:44:12,974	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{json .Config.Env}}'"'"' example)'[22m[26m`
+2026-07-27 00:44:12,974	ERR command_runner.py:820 -- [31mUnable to deserialize `image_env` to Python object. The `image_env` is:
+command-output[39m
+2026-07-27 00:44:12,974	INFO log_timer.py:25 -- NodeUpdater: 1: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=6ms]
+2026-07-27 00:44:12,974	ERR updater.py:177 -- [31mNew status: [1mupdate-failed[22m[26m[39m
+2026-07-27 00:44:12,974	ERR updater.py:179 -- [31m!!![39m
+2026-07-27 00:44:12,974	VERR updater.py:189 -- [31mException details: {'msg': 'Expecting value', 'doc': 'command-output', 'pos': 0, 'lineno': 1, 'colno': 1}[39m
+2026-07-27 00:44:12,975	ERR updater.py:191 -- [31mFull traceback: Traceback (most recent call last):
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 172, in run
+    self.do_update()
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 463, in do_update
+    self.cmd_runner.run_init(
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 824, in run_init
+    raise e
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 815, in run_init
+    for env_var in json.loads(image_env):
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+[39m
+2026-07-27 00:44:12,975	ERR updater.py:193 -- [31mError message: Expecting value: line 1 column 1 (char 0)[39m
+2026-07-27 00:44:12,975	ERR updater.py:194 -- [31m!!![39m
+2026-07-27 00:44:12,975	VINFO command_runner.py:390 -- Running `[1mdocker pull example[22m[26m`
+2026-07-27 00:44:12,975	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker pull example)'[22m[26m`
+2026-07-27 00:44:12,975	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{.State.Running}}' mock || true[22m[26m`
+2026-07-27 00:44:12,975	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{.State.Running}}'"'"' mock || true)'[22m[26m`
+2026-07-27 00:44:12,975	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{json .Config.Env}}' example[22m[26m`
+2026-07-27 00:44:12,975	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{json .Config.Env}}'"'"' example)'[22m[26m`
+2026-07-27 00:44:12,976	ERR command_runner.py:820 -- [31mUnable to deserialize `image_env` to Python object. The `image_env` is:
+command-output[39m
+2026-07-27 00:44:12,976	INFO log_timer.py:25 -- NodeUpdater: 2: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=6ms]
+2026-07-27 00:44:12,976	ERR updater.py:177 -- [31mNew status: [1mupdate-failed[22m[26m[39m
+2026-07-27 00:44:12,976	ERR updater.py:179 -- [31m!!![39m
+2026-07-27 00:44:12,976	VERR updater.py:189 -- [31mException details: {'msg': 'Expecting value', 'doc': 'command-output', 'pos': 0, 'lineno': 1, 'colno': 1}[39m
+2026-07-27 00:44:12,976	ERR updater.py:191 -- [31mFull traceback: Traceback (most recent call last):
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 172, in run
+    self.do_update()
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 463, in do_update
+    self.cmd_runner.run_init(
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 824, in run_init
+    raise e
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 815, in run_init
+    for env_var in json.loads(image_env):
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+[39m
+2026-07-27 00:44:12,976	ERR updater.py:193 -- [31mError message: Expecting value: line 1 column 1 (char 0)[39m
+2026-07-27 00:44:12,976	ERR updater.py:194 -- [31m!!![39m
+PASSED [ 75%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testScaleUpMinWorkers 2026-07-27 00:44:13,108	SUCC updater.py:301 -- [32mSuccess.[39m
+2026-07-27 00:44:13,108	INFO log_timer.py:25 -- NodeUpdater: 2: Got remote shell  [LogTimer=2ms]
+2026-07-27 00:44:13,109	INFO updater.py:395 -- Updating cluster configuration.[0m[2m [hash=v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0][22m[0m
+2026-07-27 00:44:13,109	INFO updater.py:402 -- [37mNew status[39m: [1msyncing-files[22m
+2026-07-27 00:44:13,109	INFO updater.py:260 -- [2m[2/7][22m [36mProcessing file mounts[39m
+2026-07-27 00:44:13,109	INFO updater.py:277 -- [2m[3/7][22m No worker file mounts to sync
+2026-07-27 00:44:13,109	INFO updater.py:413 -- [37mNew status[39m: [1msetting-up[22m
+2026-07-27 00:44:13,109	INFO updater.py:416 -- [2m[4/7][22m [36mRunning initialization commands[39m
+2026-07-27 00:44:13,109	VINFO command_runner.py:390 -- Running `[1mexport RAY_HEAD_IP=172.0.0.0; init_cmd[22m[26m`
+2026-07-27 00:44:13,109	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_HEAD_IP=172.0.0.0; init_cmd)'[22m[26m`
+2026-07-27 00:44:13,109	INFO log_timer.py:25 -- NodeUpdater: 2: Initialization commands succeeded [LogTimer=0ms]
+2026-07-27 00:44:13,109	INFO updater.py:458 -- [2m[5/7][22m [36mInitializing command runner[39m
+2026-07-27 00:44:13,109	VINFO command_runner.py:390 -- Running `[1mcommand -v docker || echo 'NoExist'[22m[26m`
+2026-07-27 00:44:13,109	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (command -v docker || echo '"'"'NoExist'"'"')'[22m[26m`
+2026-07-27 00:44:13,110	INFO updater.py:277 -- [2m[3/7][22m No worker file mounts to sync
+2026-07-27 00:44:13,110	INFO updater.py:413 -- [37mNew status[39m: [1msetting-up[22m
+2026-07-27 00:44:13,110	INFO updater.py:416 -- [2m[4/7][22m [36mRunning initialization commands[39m
+2026-07-27 00:44:13,110	VINFO command_runner.py:390 -- Running `[1mexport RAY_HEAD_IP=172.0.0.0; init_cmd[22m[26m`
+2026-07-27 00:44:13,110	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export RAY_HEAD_IP=172.0.0.0; init_cmd)'[22m[26m`
+2026-07-27 00:44:13,110	INFO log_timer.py:25 -- NodeUpdater: 1: Initialization commands succeeded [LogTimer=1ms]
+2026-07-27 00:44:13,111	INFO updater.py:458 -- [2m[5/7][22m [36mInitializing command runner[39m
+2026-07-27 00:44:13,111	VINFO command_runner.py:390 -- Running `[1mcommand -v docker || echo 'NoExist'[22m[26m`
+2026-07-27 00:44:13,111	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (command -v docker || echo '"'"'NoExist'"'"')'[22m[26m`
+2026-07-27 00:44:13,111	VINFO command_runner.py:390 -- Running `[1mdocker pull example[22m[26m`
+2026-07-27 00:44:13,111	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker pull example)'[22m[26m`
+2026-07-27 00:44:13,111	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{.State.Running}}' mock || true[22m[26m`
+2026-07-27 00:44:13,111	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{.State.Running}}'"'"' mock || true)'[22m[26m`
+2026-07-27 00:44:13,111	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{json .Config.Env}}' example[22m[26m`
+2026-07-27 00:44:13,111	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.2 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{json .Config.Env}}'"'"' example)'[22m[26m`
+2026-07-27 00:44:13,112	ERR command_runner.py:820 -- [31mUnable to deserialize `image_env` to Python object. The `image_env` is:
+command-output[39m
+2026-07-27 00:44:13,112	INFO log_timer.py:25 -- NodeUpdater: 2: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=7ms]
+2026-07-27 00:44:13,112	ERR updater.py:177 -- [31mNew status: [1mupdate-failed[22m[26m[39m
+2026-07-27 00:44:13,112	ERR updater.py:179 -- [31m!!![39m
+2026-07-27 00:44:13,112	VERR updater.py:189 -- [31mException details: {'msg': 'Expecting value', 'doc': 'command-output', 'pos': 0, 'lineno': 1, 'colno': 1}[39m
+2026-07-27 00:44:13,112	VINFO command_runner.py:390 -- Running `[1mdocker pull example[22m[26m`
+2026-07-27 00:44:13,112	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker pull example)'[22m[26m`
+2026-07-27 00:44:13,113	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{.State.Running}}' mock || true[22m[26m`
+2026-07-27 00:44:13,113	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{.State.Running}}'"'"' mock || true)'[22m[26m`
+2026-07-27 00:44:13,113	VINFO command_runner.py:390 -- Running `[1mdocker inspect -f '{{json .Config.Env}}' example[22m[26m`
+2026-07-27 00:44:13,113	VVINFO command_runner.py:392 -- Full command is `[1mssh -tt -i /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=auto -o ControlPath=/tmp/ray_ssh_eaf79a2cc6/37a8eec1ce/%C -o ControlPersist=10s -o ConnectTimeout=120s ubuntu@172.0.0.1 bash --login -c -i 'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker inspect -f '"'"'{{json .Config.Env}}'"'"' example)'[22m[26m`
+2026-07-27 00:44:13,113	ERR command_runner.py:820 -- [31mUnable to deserialize `image_env` to Python object. The `image_env` is:
+command-output[39m
+2026-07-27 00:44:13,113	INFO log_timer.py:25 -- NodeUpdater: 1: Applied config v15i5t9n0l1fjdgcphiskchjct5ef58nu0o8e2503nn9f8qnfpd0  [LogTimer=9ms]
+2026-07-27 00:44:13,113	ERR updater.py:177 -- [31mNew status: [1mupdate-failed[22m[26m[39m
+2026-07-27 00:44:13,113	ERR updater.py:179 -- [31m!!![39m
+2026-07-27 00:44:13,113	VERR updater.py:189 -- [31mException details: {'msg': 'Expecting value', 'doc': 'command-output', 'pos': 0, 'lineno': 1, 'colno': 1}[39m
+2026-07-27 00:44:13,114	ERR updater.py:191 -- [31mFull traceback: Traceback (most recent call last):
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 172, in run
+    self.do_update()
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 463, in do_update
+    self.cmd_runner.run_init(
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 824, in run_init
+    raise e
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 815, in run_init
+    for env_var in json.loads(image_env):
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+[39m
+2026-07-27 00:44:13,114	ERR updater.py:193 -- [31mError message: Expecting value: line 1 column 1 (char 0)[39m
+2026-07-27 00:44:13,114	ERR updater.py:194 -- [31m!!![39m
+2026-07-27 00:44:13,114	ERR updater.py:191 -- [31mFull traceback: Traceback (most recent call last):
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 172, in run
+    self.do_update()
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/updater.py", line 463, in do_update
+    self.cmd_runner.run_init(
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 824, in run_init
+    raise e
+  File "/usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/autoscaler/_private/command_runner.py", line 815, in run_init
+    for env_var in json.loads(image_env):
+                   ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/google/home/ryanaoleary/miniconda3/envs/myenv/lib/python3.11/json/decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+[39m
+2026-07-27 00:44:13,114	ERR updater.py:193 -- [31mError message: Expecting value: line 1 column 1 (char 0)[39m
+2026-07-27 00:44:13,114	ERR updater.py:194 -- [31m!!![39m
+PASSED [ 77%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testSummary PASSED [ 78%]
+python/ray/tests/test_resource_demand_scheduler.py::AutoscalingTest::testUpdateConfig PASSED [ 80%]
+python/ray/tests/test_resource_demand_scheduler.py::test_memory_string_formatting PASSED [ 81%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string PASSED [ 83%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_multiple_constraints PASSED [ 85%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_verbose PASSED [ 86%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_verbose_node_types PASSED [ 88%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_verbose_no_breakdown PASSED [ 90%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_with_launch_failures PASSED [ 91%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_with_launch_failures_verbose PASSED [ 93%]
+python/ray/tests/test_resource_demand_scheduler.py::test_info_string_failed_node_cap PASSED [ 95%]
+python/ray/tests/test_resource_demand_scheduler.py::test_placement_group_match_string PASSED [ 96%]
+python/ray/tests/test_resource_demand_scheduler.py::test_utilization_score_plugin_1 PASSED [ 98%]
+python/ray/tests/test_resource_demand_scheduler.py::test_utilization_score_plugin_2 PASSED [100%]
+
+============================== 61 passed in 7.44s ==============================

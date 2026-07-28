@@ -486,7 +486,10 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
   std::vector<std::string> group_to_domain_str(num_groups);
 
   // Pre-calculate raw resources for each domain and each group to short-circuit
-  // infeasible domains.
+  // infeasible domains. We use `.total` instead of `.available` so that groups
+  // that will *never* fit are marked Infeasible and skipped (PENDING), while
+  // groups that *might* fit (but are temporarily out of resources) proceed to
+  // the matching algorithm, which correctly fails them (transition to Failed).
   std::vector<ResourceSet> domain_raw_resources(num_domains);
   for (int d = 0; d < num_domains; ++d) {
     for (const auto &node_id : domain_buckets[domain_vals[d]]) {
@@ -664,10 +667,13 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
     }
   } else if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK ||
              options.outer_strategy_ == rpc::PlacementStrategy::PACK) {
+    // For outer-PACK, all bundle groups must map to the SAME domain.
+    // This is enforced by evaluating all groups within a single `domain_val` bucket.
     bool overall_success = false;
     bool all_infeasible = true;
 
-    for (const auto &domain_val : domain_vals) {
+    for (size_t domain_idx = 0; domain_idx < domain_vals.size(); ++domain_idx) {
+      const auto &domain_val = domain_vals[domain_idx];
       bool domain_success = true;
       bool domain_infeasible = false;
       std::vector<std::pair<scheduling::NodeID, const ResourceRequest *>> rollback_log;
@@ -692,10 +698,6 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
         for (int idx : indices) {
           sub_list.push_back(resource_request_list[idx]);
         }
-
-        int domain_idx =
-            std::distance(domain_vals.begin(),
-                          std::find(domain_vals.begin(), domain_vals.end(), domain_val));
         if (!(group_raw_resources[i] <= domain_raw_resources[domain_idx])) {
           domain_success = false;
           domain_infeasible = true;
@@ -773,14 +775,12 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
         std::string pin =
             pin_it != options.group_topology_pins_.end() ? pin_it->second : "";
 
-        for (const auto &domain_val : domain_vals) {
+        for (size_t domain_idx = 0; domain_idx < domain_vals.size(); ++domain_idx) {
+          const auto &domain_val = domain_vals[domain_idx];
           if (!pin.empty() && domain_val != pin) continue;
           if (require_unused && used_domains.contains(domain_val)) continue;
           if (!require_unused && !used_domains.contains(domain_val)) continue;
 
-          int domain_idx = std::distance(
-              domain_vals.begin(),
-              std::find(domain_vals.begin(), domain_vals.end(), domain_val));
           if (!(group_raw_resources[i] <= domain_raw_resources[domain_idx])) continue;
 
           SchedulingResult bucket_res =

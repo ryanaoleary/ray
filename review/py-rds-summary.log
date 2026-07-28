@@ -1,0 +1,15 @@
+ImportError while loading conftest '/usr/local/google/home/ryanaoleary/Desktop/forks/ray-fix-pg/python/ray/tests/conftest.py'.
+python/ray/tests/conftest.py:23: in <module>
+    import ray
+../ray/python/ray/__init__.py:76: in <module>
+    _configure_system()
+../ray/python/ray/__init__.py:73: in _configure_system
+    CDLL(so_path, ctypes.RTLD_GLOBAL)
+../../../miniconda3/lib/python3.13/ctypes/__init__.py:361: in __init__
+    self._handle = self._load_library(name, mode, handle, winmode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../miniconda3/lib/python3.13/ctypes/__init__.py:403: in _load_library
+    return _dlopen(name, mode)
+           ^^^^^^^^^^^^^^^^^^^
+E   OSError: /usr/local/google/home/ryanaoleary/Desktop/forks/ray/python/ray/_raylet.so: undefined symbol: _PyObject_NextNotImplemented
+EXIT=4
