@@ -18,6 +18,30 @@ logger = get_logger(__name__)
 
 AcceleratorType = Enum("AcceleratorType", vars(accelerators))
 
+
+class AcceleratorFamily(Enum):
+    GPU = "GPU"
+    TPU = "TPU"
+    NPU = "NPU"
+    CPU = "CPU"
+
+
+def get_accelerator_family(accelerator_type: Optional[str]) -> AcceleratorFamily:
+    if not accelerator_type:
+        return AcceleratorFamily.CPU
+    accelerator_type_upper = accelerator_type.upper()
+    if accelerator_type_upper.startswith("TPU"):
+        return AcceleratorFamily.TPU
+    if (
+        accelerator_type_upper.startswith("ASCEND")
+        or accelerator_type_upper.startswith("MXC")
+        or accelerator_type_upper.startswith("FURIOSA")
+    ):
+        return AcceleratorFamily.NPU
+    # Default to GPU for unknown or NVIDIA/AMD/INTEL/AWS types, to preserve backward compatibility
+    return AcceleratorFamily.GPU
+
+
 # Set of TPU string values from Ray's known accelerators.
 TPU_ACCELERATOR_VALUES = {
     member.value

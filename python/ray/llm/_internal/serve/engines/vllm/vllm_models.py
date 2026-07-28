@@ -16,13 +16,16 @@ from ray.llm._internal.serve.constants import (
 )
 from ray.llm._internal.serve.core.configs.accelerators import (
     AcceleratorBackend,
+    AcceleratorFamily,
     AnyAcceleratorConfig,
     CPUAccelerator,
     CPUConfig,
     GPUAccelerator,
+    GPUConfig,
     TPUAccelerator,
     TPUConfig,
     format_ray_accelerator_resource,
+    get_accelerator_family,
 )
 from ray.llm._internal.serve.core.configs.llm_config import (
     AcceleratorType,
@@ -112,9 +115,23 @@ class VLLMEngineConfig(BaseModelExtended):
             self._accelerator = TPUAccelerator(cfg)
         elif isinstance(cfg, CPUConfig):
             self._accelerator = CPUAccelerator()
-        else:
-            # Default to GPU if it's GPUConfig or isn't set
+        elif isinstance(cfg, GPUConfig):
+            family = get_accelerator_family(self.accelerator_type)
+            if family == AcceleratorFamily.TPU:
+                raise ValueError(
+                    f"accelerator_type='{self.accelerator_type}' is a TPU type, "
+                    "but an explicit GPUConfig was provided. These fields conflict."
+                )
             self._accelerator = GPUAccelerator()
+        else:
+            family = get_accelerator_family(self.accelerator_type)
+            if family == AcceleratorFamily.TPU:
+                # We instantiate a basic TPUConfig if none was provided
+                self._accelerator = TPUAccelerator(TPUConfig())
+            elif family == AcceleratorFamily.CPU:
+                self._accelerator = CPUAccelerator()
+            else:
+                self._accelerator = GPUAccelerator()
         return self
 
     @property
