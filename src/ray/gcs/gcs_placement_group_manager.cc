@@ -748,6 +748,8 @@ void GcsPlacementGroupManager::OnNodeDead(const NodeID &node_id) {
         }
         gcs_placement_group_scheduler_->DestroyPlacementGroupBundleIndices(
             iter->second->GetPlacementGroupID(), bundles_to_clear);
+        std::vector<int> group_list(affected_groups.begin(), affected_groups.end());
+        iter->second->ClearGroupTopologyAssignments(group_list);
         for (int64_t idx : bundles_to_clear) {
           iter->second->GetMutableBundle(idx)->clear_node_id();
         }

@@ -1010,3 +1010,73 @@ def test_hierarchical_pg_partial_recovery(ray_start_cluster):
         )
     ).remote()
     assert ray.get(a1.ping.remote()) == "pong"
+
+
+def test_hierarchical_pg_strict_pack_rejoin(ray_start_cluster):
+    # F1: outer-STRICT_PACK rejoin-siblings invariant test.
+    # We kill a node hosting one group. When it recovers, it must rejoin the same outer domain (rack).
+    cluster = ray_start_cluster
+
+    nodes = []
+    # 2 racks, 2 nodes each
+    for i in range(1, 3):
+        nodes.append(cluster.add_node(num_cpus=2, labels={"rack": f"rack-{i}"}))
+        nodes.append(cluster.add_node(num_cpus=2, labels={"rack": f"rack-{i}"}))
+
+    ray.init(address=cluster.address)
+
+    # 2 groups. Outer=STRICT_PACK(rack), Inner=PACK(node).
+    # Since outer is STRICT_PACK, both groups must land in the SAME rack.
+    bundles = [
+        [{"CPU": 1}, {"CPU": 1}],
+        [{"CPU": 1}, {"CPU": 1}],
+    ]
+    
+    pg = ray.util.placement_group(
+        bundles,
+        topology_strategy=[
+            {"rack": "STRICT_PACK"},
+            {"ray.io/node-id": "PACK"},
+        ],
+    )
+    ray.get(pg.ready(), timeout=15)
+
+    table = ray.util.placement_group_table(pg)
+    bundles_to_node = table["bundles_to_node_id"]
+    
+    g0_node_id = bundles_to_node[0]
+    g1_node_id = bundles_to_node[2]
+    
+    # Assert they are in the same rack
+    rack0 = None
+    rack1 = None
+    for n in ray.nodes():
+        if n["NodeID"] == g0_node_id:
+            rack0 = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get("rack")
+        if n["NodeID"] == g1_node_id:
+            rack1 = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get("rack")
+            
+    assert rack0 == rack1
+    assert rack0 is not None
+    
+    # Kill the node for group 1
+    for node in nodes:
+        if node.unique_id == g1_node_id:
+            cluster.remove_node(node)
+            break
+            
+    # Wait for group 1 to recover on the other node in the SAME rack.
+    # Group 0's node is still alive.
+    ray.get(pg.ready(), timeout=15)
+    
+    # Verify it recovered on the same rack
+    table = ray.util.placement_group_table(pg)
+    bundles_to_node = table["bundles_to_node_id"]
+    g1_node_id_new = bundles_to_node[2]
+    
+    rack1_new = None
+    for n in ray.nodes():
+        if n["NodeID"] == g1_node_id_new:
+            rack1_new = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get("rack")
+            
+    assert rack1_new == rack0

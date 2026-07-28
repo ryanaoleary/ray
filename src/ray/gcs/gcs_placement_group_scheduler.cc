@@ -769,21 +769,47 @@ SchedulingOptions GcsPlacementGroupScheduler::CreateSchedulingOptions(
     options.original_bundle_group_indices_.push_back(group_idx);
   }
 
-  if (outer_entry.has_value() &&
-      (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD ||
-       options.outer_strategy_ == rpc::PlacementStrategy::SPREAD)) {
+  if (outer_entry.has_value()) {
     const std::string &outer_key = outer_entry->first;
-    for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size();
-         i++) {
-      const auto &bundle = placement_group.GetPlacementGroupTableData().bundles(i);
-      if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
-        scheduling::NodeID placed_node(bundle.node_id());
-        const auto &labels =
-            cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
-                placed_node);
-        auto it = labels.find(outer_key);
-        if (it != labels.end()) {
-          options.previously_occupied_topologies_.insert(it->second);
+    absl::flat_hash_map<int, std::string> group_assignments;
+    for (int group_idx : sorted_group_indices) {
+      auto assignment = placement_group.GetGroupTopologyAssignment(group_idx, outer_key);
+      if (assignment.has_value()) {
+        group_assignments[group_idx] = *assignment;
+      }
+    }
+
+    if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK ||
+        options.outer_strategy_ == rpc::PlacementStrategy::PACK) {
+      std::string shared_pin = "";
+      for (const auto &pair : group_assignments) {
+        shared_pin = pair.second;
+        break;
+      }
+      if (!shared_pin.empty()) {
+        for (int group_idx : sorted_group_indices) {
+          options.group_topology_pins_[group_idx] = shared_pin;
+        }
+      }
+    } else if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_SPREAD ||
+               options.outer_strategy_ == rpc::PlacementStrategy::SPREAD) {
+      for (const auto &pair : group_assignments) {
+        options.group_topology_pins_[pair.first] = pair.second;
+        options.previously_occupied_topologies_.insert(pair.second);
+      }
+
+      for (int i = 0; i < placement_group.GetPlacementGroupTableData().bundles_size();
+           i++) {
+        const auto &bundle = placement_group.GetPlacementGroupTableData().bundles(i);
+        if (!NodeID::FromBinary(bundle.node_id()).IsNil()) {
+          scheduling::NodeID placed_node(bundle.node_id());
+          const auto &labels =
+              cluster_resource_scheduler_.GetClusterResourceManager().GetNodeLabels(
+                  placed_node);
+          auto it = labels.find(outer_key);
+          if (it != labels.end()) {
+            options.previously_occupied_topologies_.insert(it->second);
+          }
         }
       }
     }
