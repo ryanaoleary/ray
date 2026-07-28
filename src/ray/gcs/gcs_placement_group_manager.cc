@@ -218,31 +218,10 @@ void GcsPlacementGroupManager::OnPlacementGroupCreationFailed(
 
   auto stats = placement_group->GetMutableStats();
   if (!is_feasible) {
-    if (placement_group->GetState() == rpc::PlacementGroupTableData::RESCHEDULING &&
-        placement_group->GetTopologyStrategyKeys().has_value()) {
-      RAY_LOG(WARNING)
-          << "Topology-aware placement group " << placement_group->GetName()
-          << " is infeasible to reschedule on its current topology pins. "
-          << "Self-healing by destroying all placed bundles and resetting to PENDING.";
-      gcs_placement_group_scheduler_->DestroyPlacementGroupBundleResourcesIfExists(
-          placement_group->GetPlacementGroupID());
-      placement_group->ClearAllGroupTopologyAssignments();
-      placement_group->ClearTopologyAssignments();
-
-      for (int i = 0; i < placement_group->GetPlacementGroupTableData().bundles_size();
-           i++) {
-        placement_group->GetMutableBundle(i)->clear_node_id();
-      }
-
-      placement_group->UpdateState(rpc::PlacementGroupTableData::PENDING);
-      stats->set_scheduling_state(rpc::PlacementGroupStats::QUEUED);
-      AddToPendingQueue(std::move(placement_group), /*rank=*/0);
-    } else {
-      // We will attempt to schedule this placement_group once an eligible node is
-      // registered.
-      stats->set_scheduling_state(rpc::PlacementGroupStats::INFEASIBLE);
-      infeasible_placement_groups_.emplace_back(std::move(placement_group));
-    }
+    // We will attempt to schedule this placement_group once an eligible node is
+    // registered.
+    stats->set_scheduling_state(rpc::PlacementGroupStats::INFEASIBLE);
+    infeasible_placement_groups_.emplace_back(std::move(placement_group));
   } else {
     auto state = placement_group->GetState();
     RAY_CHECK(state == rpc::PlacementGroupTableData::RESCHEDULING ||

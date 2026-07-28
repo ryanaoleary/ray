@@ -944,3 +944,85 @@ def test_hierarchical_two_layer_same_label(ray_start_cluster):
 
     if az1 and az2:
         assert az1 != az2
+
+
+def test_hierarchical_pg_partial_recovery(ray_start_cluster):
+    # Test I2-1: 4-group PG, kill one node of group 2's domain.
+    # Assert groups 1/3/4 never destroyed, group 2 recovers.
+    cluster = ray_start_cluster
+
+    nodes = []
+    for i in range(1, 5):
+        nodes.append(cluster.add_node(num_cpus=2, labels={"rack": f"rack-{i}"}))
+        nodes.append(cluster.add_node(num_cpus=2, labels={"rack": f"rack-{i}"}))
+
+    ray.init(address=cluster.address)
+
+    # 4 groups, 2 bundles of CPU:1 each.
+    # Outer: SPREAD across racks, Inner: PACK within node.
+    bundles = [
+        [{"CPU": 1}, {"CPU": 1}],
+        [{"CPU": 1}, {"CPU": 1}],
+        [{"CPU": 1}, {"CPU": 1}],
+        [{"CPU": 1}, {"CPU": 1}],
+    ]
+
+    pg = ray.util.placement_group(
+        bundles,
+        topology_strategy=[
+            {"rack": "SPREAD"},
+            {"ray.io/node-id": "PACK"},
+        ],
+    )
+    ray.get(pg.ready(), timeout=15)
+
+    @ray.remote(num_cpus=0.1)
+    class Actor:
+        def ping(self):
+            return "pong"
+
+    # Schedule an actor in each group
+    actors = []
+    for i in range(4):
+        a = Actor.options(
+            scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=i * 2
+            )
+        ).remote()
+        actors.append(a)
+
+    assert ray.get([a.ping.remote() for a in actors]) == [
+        "pong",
+        "pong",
+        "pong",
+        "pong",
+    ]
+
+    table = ray.util.placement_group_table(pg)
+    bundles_to_node = table["bundles_to_node_id"]
+
+    # Group 1 (index 1) bundles are at index 2 and 3.
+    g1_node_id = bundles_to_node[2]
+
+    for node in nodes:
+        if node.unique_id == g1_node_id:
+            cluster.remove_node(node)
+            break
+    # Groups 0, 2, 3 should still be alive since partial self-heal is used.
+    import time
+
+    time.sleep(2)
+
+    assert ray.get(actors[0].ping.remote()) == "pong"
+    assert ray.get(actors[2].ping.remote()) == "pong"
+    assert ray.get(actors[3].ping.remote()) == "pong"
+
+    # Verify group 1 recovers on the other node in the same rack.
+    ray.get(pg.ready(), timeout=15)
+
+    a1 = Actor.options(
+        scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+            placement_group=pg, placement_group_bundle_index=2
+        )
+    ).remote()
+    assert ray.get(a1.ping.remote()) == "pong"
