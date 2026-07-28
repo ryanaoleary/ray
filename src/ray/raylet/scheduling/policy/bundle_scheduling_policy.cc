@@ -635,10 +635,31 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
         group_to_domain_str[i] = domain_vals[domain_idx];
       }
 
+      bool exact_fit_failure = false;
       for (size_t k = 0; k < indices.size(); k++) {
         final_nodes[indices[k]] = res.selected_nodes[k];
-        RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
-            final_nodes[indices[k]], *resource_request_list[indices[k]]));
+        if (!cluster_resource_manager_.SubtractNodeAvailableResources(
+                final_nodes[indices[k]], *resource_request_list[indices[k]])) {
+          exact_fit_failure = true;
+          final_nodes[indices[k]] = scheduling::NodeID::Nil();
+          break;
+        }
+      }
+
+      if (exact_fit_failure) {
+        // Rollback any subtractions that did succeed.
+        for (size_t rollback_idx = 0; rollback_idx < final_nodes.size(); rollback_idx++) {
+          if (!final_nodes[rollback_idx].IsNil()) {
+            if (!cluster_resource_manager_.AddNodeAvailableResources(
+                    final_nodes[rollback_idx],
+                    resource_request_list[rollback_idx]->GetResourceSet())) {
+              RAY_LOG(ERROR) << "Failed to add resources back to node "
+                             << final_nodes[rollback_idx];
+            }
+            final_nodes[rollback_idx] = scheduling::NodeID::Nil();
+          }
+        }
+        return SchedulingResult::Failed();
       }
     }
   } else if (options.outer_strategy_ == rpc::PlacementStrategy::STRICT_PACK ||
@@ -685,11 +706,19 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
             node_schedule_fn(sub_list, options, domain_buckets[domain_val]);
 
         if (bucket_res.status.IsSuccess()) {
+          bool exact_fit_failure = false;
           for (size_t k = 0; k < indices.size(); k++) {
             final_nodes[indices[k]] = bucket_res.selected_nodes[k];
-            RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
-                final_nodes[indices[k]], *sub_list[k]));
+            if (!cluster_resource_manager_.SubtractNodeAvailableResources(
+                    final_nodes[indices[k]], *sub_list[k])) {
+              exact_fit_failure = true;
+              break;
+            }
             rollback_log.push_back({final_nodes[indices[k]], sub_list[k]});
+          }
+          if (exact_fit_failure) {
+            domain_success = false;
+            break;
           }
         } else {
           domain_success = false;
@@ -711,8 +740,10 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
           all_infeasible = false;
         }
         for (auto &entry : rollback_log) {
-          RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
-              entry.first, entry.second->GetResourceSet()));
+          if (!cluster_resource_manager_.AddNodeAvailableResources(
+                  entry.first, entry.second->GetResourceSet())) {
+            RAY_LOG(ERROR) << "Failed to add resources back to node " << entry.first;
+          }
         }
       }
     }
@@ -755,11 +786,30 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
           SchedulingResult bucket_res =
               node_schedule_fn(sub_list, options, domain_buckets[domain_val]);
           if (bucket_res.status.IsSuccess()) {
+            bool exact_fit_failure = false;
+            size_t rollback_idx = 0;
             for (size_t k = 0; k < indices.size(); k++) {
               final_nodes[indices[k]] = bucket_res.selected_nodes[k];
-              RAY_CHECK(cluster_resource_manager_.SubtractNodeAvailableResources(
-                  final_nodes[indices[k]], *sub_list[k]));
+              if (!cluster_resource_manager_.SubtractNodeAvailableResources(
+                      final_nodes[indices[k]], *sub_list[k])) {
+                exact_fit_failure = true;
+                break;
+              }
+              rollback_idx++;
             }
+
+            if (exact_fit_failure) {
+              for (size_t k = 0; k < rollback_idx; k++) {
+                if (!cluster_resource_manager_.AddNodeAvailableResources(
+                        final_nodes[indices[k]], sub_list[k]->GetResourceSet())) {
+                  RAY_LOG(ERROR) << "Failed to add resources back to node "
+                                 << final_nodes[indices[k]];
+                }
+              }
+              group_has_failed_domain = true;
+              continue;
+            }
+
             used_domains.insert(domain_val);
             group_to_domain_str[i] = domain_val;
             return true;
@@ -788,8 +838,10 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
       // Revert any successful group assignments
       for (size_t i = 0; i < final_nodes.size(); i++) {
         if (!final_nodes[i].IsNil()) {
-          RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
-              final_nodes[i], resource_request_list[i]->GetResourceSet()));
+          if (!cluster_resource_manager_.AddNodeAvailableResources(
+                  final_nodes[i], resource_request_list[i]->GetResourceSet())) {
+            RAY_LOG(ERROR) << "Failed to add resources back to node " << final_nodes[i];
+          }
           final_nodes[i] = scheduling::NodeID::Nil();
         }
       }
@@ -801,8 +853,10 @@ SchedulingResult HierarchicalBundleSchedulingPolicy::Schedule(
   // Restore the temporarily subtracted resources so the caller gets a clean view.
   for (size_t i = 0; i < final_nodes.size(); i++) {
     if (!final_nodes[i].IsNil()) {
-      RAY_CHECK(cluster_resource_manager_.AddNodeAvailableResources(
-          final_nodes[i], resource_request_list[i]->GetResourceSet()));
+      if (!cluster_resource_manager_.AddNodeAvailableResources(
+              final_nodes[i], resource_request_list[i]->GetResourceSet())) {
+        RAY_LOG(ERROR) << "Failed to add resources back to node " << final_nodes[i];
+      }
     }
   }
 

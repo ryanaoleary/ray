@@ -1334,12 +1334,49 @@ TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingHeterogeneousGroupTest)
   ASSERT_EQ(result.selected_nodes.size(), 2);
 
   // The first bundle (1 CPU) should be placed on node1.
-  // The second bundle (3 CPU) must be placed on node0 since it is the only node with 3 CPUs.
-  // node0 has 3 CPUs total, so it cannot fit both bundles. Therefore the 1-CPU bundle is placed on node1.
+  // The second bundle (3 CPU) must be placed on node0 since it is the only node with 3
+  // CPUs. node0 has 3 CPUs total, so it cannot fit both bundles. Therefore the 1-CPU
+  // bundle is placed on node1.
   ASSERT_EQ(result.selected_nodes[0], node1);
   ASSERT_EQ(result.selected_nodes[1], node0);
 }
 
-}  // namespace raylet
+TEST_F(SchedulingPolicyTest, HeterogeneousBundleOutputOrderTest) {
+  // Test heterogeneous bundle list [CPU, GPU] mapping to correctly ordered output nodes.
+  scheduling::NodeID node0(0);
+  scheduling::NodeID node1(1);
+  nodes.emplace(node0, CreateNodeResources(2, 2, 0, 0, 0, 0));
+  nodes.emplace(node1, CreateNodeResources(0, 0, 0, 0, 2, 2));
 
+  auto cluster_resource_manager = MockClusterResourceManager(nodes);
+
+  ResourceRequest req_cpu = ResourceMapToResourceRequest(
+      absl::flat_hash_map<std::string, double>{{"CPU", 1}}, false);
+  ResourceRequest req_gpu = ResourceMapToResourceRequest(
+      absl::flat_hash_map<std::string, double>{{"GPU", 1}}, false);
+
+  std::vector<const ResourceRequest *> req_list = {&req_cpu, &req_gpu};
+
+  BundlePackSchedulingPolicy policy(*cluster_resource_manager);
+  SchedulingOptions options = SchedulingOptions::BundlePack();
+
+  SchedulingResult result =
+      policy.Schedule(req_list, options, GetCandidateNodes(*cluster_resource_manager));
+
+  ASSERT_TRUE(result.status.IsSuccess());
+  ASSERT_EQ(result.selected_nodes.size(), 2);
+  ASSERT_EQ(result.selected_nodes[0], node0);
+  ASSERT_EQ(result.selected_nodes[1], node1);
+
+  std::vector<const ResourceRequest *> req_list_rev = {&req_gpu, &req_cpu};
+  SchedulingResult result_rev = policy.Schedule(
+      req_list_rev, options, GetCandidateNodes(*cluster_resource_manager));
+
+  ASSERT_TRUE(result_rev.status.IsSuccess());
+  ASSERT_EQ(result_rev.selected_nodes.size(), 2);
+  ASSERT_EQ(result_rev.selected_nodes[0], node1);
+  ASSERT_EQ(result_rev.selected_nodes[1], node0);
+}
+
+}  // namespace raylet
 }  // namespace ray

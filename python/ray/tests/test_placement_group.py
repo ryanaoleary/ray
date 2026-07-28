@@ -1031,7 +1031,7 @@ def test_hierarchical_pg_strict_pack_rejoin(ray_start_cluster):
         [{"CPU": 1}, {"CPU": 1}],
         [{"CPU": 1}, {"CPU": 1}],
     ]
-    
+
     pg = ray.util.placement_group(
         bundles,
         topology_strategy=[
@@ -1043,40 +1043,78 @@ def test_hierarchical_pg_strict_pack_rejoin(ray_start_cluster):
 
     table = ray.util.placement_group_table(pg)
     bundles_to_node = table["bundles_to_node_id"]
-    
+
     g0_node_id = bundles_to_node[0]
     g1_node_id = bundles_to_node[2]
-    
+
     # Assert they are in the same rack
     rack0 = None
     rack1 = None
     for n in ray.nodes():
         if n["NodeID"] == g0_node_id:
-            rack0 = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get("rack")
+            rack0 = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get(
+                "rack"
+            )
         if n["NodeID"] == g1_node_id:
-            rack1 = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get("rack")
-            
+            rack1 = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get(
+                "rack"
+            )
+
     assert rack0 == rack1
     assert rack0 is not None
-    
+
     # Kill the node for group 1
     for node in nodes:
         if node.unique_id == g1_node_id:
             cluster.remove_node(node)
             break
-            
+
     # Wait for group 1 to recover on the other node in the SAME rack.
     # Group 0's node is still alive.
     ray.get(pg.ready(), timeout=15)
-    
+
     # Verify it recovered on the same rack
     table = ray.util.placement_group_table(pg)
     bundles_to_node = table["bundles_to_node_id"]
     g1_node_id_new = bundles_to_node[2]
-    
+
     rack1_new = None
     for n in ray.nodes():
         if n["NodeID"] == g1_node_id_new:
-            rack1_new = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get("rack")
-            
+            rack1_new = n.get("Labels", {}).get("rack") or n.get("Resources", {}).get(
+                "rack"
+            )
+
     assert rack1_new == rack0
+
+
+def test_hierarchical_pg_exact_fit_race(ray_start_cluster):
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=2)
+    cluster.wait_for_nodes()
+
+    ray.init(address=cluster.address)
+
+    # We submit two placement groups at the same time, both requesting the exact
+    # full capacity of the cluster (2 CPUs).
+    # Only one should succeed, the other should remain pending without crashing GCS.
+    pg1 = ray.util.placement_group(
+        [{"CPU": 2}],
+        strategy="PACK",
+    )
+
+    pg2 = ray.util.placement_group(
+        [{"CPU": 2}],
+        strategy="PACK",
+    )
+
+    # Wait for one to become CREATED
+    ready, unready = ray.wait([pg1.ready(), pg2.ready()], num_returns=1, timeout=5.0)
+    assert len(ready) == 1
+
+    # The other one should be PENDING
+    assert len(unready) == 1
+
+    # Clean up
+    ray.util.remove_placement_group(pg1)
+    ray.util.remove_placement_group(pg2)
