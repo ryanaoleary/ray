@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from ray.util.placement_group import (
@@ -67,6 +69,12 @@ class TestPlacementGroupValidation:
             validate_placement_group(
                 bundles=[{"CPU": 1}],
                 topology_strategy={NODE_ID_LABEL_KEY: "invalid"},
+            )
+
+        with pytest.raises(ValueError, match="Topology strategy 'PACK' for non-node label 'rack' is not supported"):
+            validate_placement_group(
+                bundles=[[{"CPU": 1}]],
+                topology_strategy=[{"rack": "PACK"}, {NODE_ID_LABEL_KEY: "STRICT_PACK"}],
             )
 
         with pytest.raises(ValueError, match="Invalid topology strategy"):
@@ -156,7 +164,7 @@ class TestPlacementGroupValidation:
         # and not raise an error.
         validate_placement_group(
             bundles=hierarchical_bundles,
-            strategy="STRICT_PACK",
+            topology_strategy=[{"ray.io/node-id": "STRICT_PACK"}],
             bundle_label_selector=selectors,
         )
 
@@ -167,13 +175,31 @@ class TestPlacementGroupValidation:
         ]
         validate_placement_group(
             bundles=hierarchical_bundles,
-            strategy="STRICT_PACK",
+            topology_strategy=[{"ray.io/node-id": "STRICT_PACK"}],
             bundle_label_selector=valid_selectors,
         )
 
         # STRICT_SPREAD allows conflicting labels within a group, no error should be raised.
         validate_placement_group(
             bundles=hierarchical_bundles,
-            strategy="STRICT_SPREAD",
+            topology_strategy=[{"ray.io/node-id": "STRICT_SPREAD"}],
             bundle_label_selector=selectors,
         )
+
+    def test_ray_client_guard(self, monkeypatch):
+        """Test that Ray Client mode rejects hierarchical placement groups."""
+        pg_module = sys.modules["ray.util.placement_group"]
+        monkeypatch.setattr(
+            pg_module,
+            "client_mode_should_convert",
+            lambda: True,
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="Hierarchical placement groups and multi-layer topology strategies are not supported via Ray Client.",
+        ):
+            validate_placement_group(
+                bundles=[[{"CPU": 1}]],
+                topology_strategy=[{"ray.io/node-id": "STRICT_PACK"}],
+            )
+

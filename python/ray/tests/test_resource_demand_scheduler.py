@@ -39,6 +39,7 @@ from ray.autoscaler._private.resource_demand_scheduler import (
     _resource_based_utilization_scorer,
     get_bin_pack_residual,
     get_nodes_for as _get,
+    placement_groups_to_resource_demands,
 )
 from ray.autoscaler._private.util import (
     LoadMetricsSummary,
@@ -3992,6 +3993,43 @@ def test_placement_group_match_string():
     assert is_placement_group_resource("GPU") is False
     assert is_placement_group_resource("custom_resource") is False
     assert is_placement_group_resource("ip:192.168.1.1") is False
+
+
+def test_hierarchical_placement_group_demand_conversion():
+    """Test that placement_groups_to_resource_demands converts hierarchical PGs properly."""
+    # STRICT_PACK hierarchical PG
+    pg_strict_pack = PlacementGroupTableData()
+    pg_strict_pack.strategy = PlacementStrategy.STRICT_PACK
+    b1 = pg_strict_pack.bundles.add()
+    b1.bundle_group_index = 0
+    b1.unit_resources["CPU"] = 1
+    b2 = pg_strict_pack.bundles.add()
+    b2.bundle_group_index = 0
+    b2.unit_resources["CPU"] = 1
+    b3 = pg_strict_pack.bundles.add()
+    b3.bundle_group_index = 1
+    b3.unit_resources["CPU"] = 2
+
+    demands, unconverted = placement_groups_to_resource_demands([pg_strict_pack])
+    assert demands == [{"CPU": 2.0}, {"CPU": 2.0}]
+    assert unconverted == []
+
+    # STRICT_SPREAD hierarchical PG
+    pg_strict_spread = PlacementGroupTableData()
+    pg_strict_spread.strategy = PlacementStrategy.STRICT_SPREAD
+    b1 = pg_strict_spread.bundles.add()
+    b1.bundle_group_index = 0
+    b1.unit_resources["CPU"] = 1
+    b2 = pg_strict_spread.bundles.add()
+    b2.bundle_group_index = 0
+    b2.unit_resources["CPU"] = 1
+    b3 = pg_strict_spread.bundles.add()
+    b3.bundle_group_index = 1
+    b3.unit_resources["CPU"] = 2
+
+    demands, unconverted = placement_groups_to_resource_demands([pg_strict_spread])
+    assert demands == []
+    assert unconverted == [[{"CPU": 1.0}, {"CPU": 1.0}], [{"CPU": 2.0}]]
 
     provider = MockProvider()
     new_types = copy.deepcopy(TYPES_A)

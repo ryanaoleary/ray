@@ -1,3 +1,4 @@
+import logging
 import warnings
 from typing import Dict, List, Optional, Union
 
@@ -9,6 +10,8 @@ from ray._private.label_utils import validate_label_selector
 from ray._private.utils import get_ray_doc_version
 from ray._raylet import PlacementGroupID
 from ray.util.annotations import DeveloperAPI, PublicAPI
+
+logger = logging.getLogger(__name__)
 
 VALID_PLACEMENT_GROUP_STRATEGIES = {
     "PACK",
@@ -385,6 +388,20 @@ def check_placement_group_index(
         )
 
 
+def _has_multiple_custom_topology_layers(
+    topology_strategy: Optional[Union[Dict[str, str], List[Dict[str, str]]]]
+) -> bool:
+    """Returns True if topology_strategy defines more than one custom non-node topology layer."""
+    if not isinstance(topology_strategy, list):
+        return False
+    custom_layers = [
+        layer
+        for layer in topology_strategy
+        if any(k != NODE_ID_LABEL_KEY for k in layer)
+    ]
+    return len(custom_layers) > 1
+
+
 def _derive_node_level_strategy(
     strategy: Optional[str],
     topology_strategy: Optional[Union[Dict[str, str], List[Dict[str, str]]]],
@@ -414,6 +431,13 @@ def validate_placement_group(
 
     Raises ValueError if inputs are invalid.
     """
+    if client_mode_should_convert():
+        if topology_strategy is not None or (bundles and isinstance(bundles[0], list)):
+            raise NotImplementedError(
+                "Hierarchical placement groups and multi-layer topology strategies "
+                "are not supported via Ray Client."
+            )
+
     # Mutual exclusion: `strategy` and `topology_strategy` cannot both be passed.
     if topology_strategy is not None and strategy is not None:
         raise ValueError(
@@ -448,16 +472,7 @@ def validate_placement_group(
     _validate_bundles(bundles)
 
     if (
-        topology_strategy is not None
-        and isinstance(topology_strategy, list)
-        and len(
-            [
-                layer
-                for layer in topology_strategy
-                if any(k != NODE_ID_LABEL_KEY for k in layer)
-            ]
-        )
-        > 1
+        _has_multiple_custom_topology_layers(topology_strategy)
         and bundles
         and not isinstance(bundles[0], list)
     ):
@@ -465,6 +480,15 @@ def validate_placement_group(
             "Multi-layer `topology_strategy` requires hierarchical bundle groups "
             "(a list of lists of bundle resource dicts). "
             f"Got flat bundles instead: {bundles}"
+        )
+
+    if (
+        bundles
+        and isinstance(bundles[0], list)
+        and topology_strategy is None
+    ):
+        raise ValueError(
+            "Hierarchical bundle groups require a `topology_strategy`."
         )
 
     if bundle_label_selector is not None:
@@ -490,9 +514,6 @@ def validate_placement_group(
                     for k, v in selector.items():
                         if k in group_labels and group_labels[k] != v:
                             if node_level_strategy == "STRICT_PACK":
-                                import logging
-
-                                logger = logging.getLogger(__name__)
                                 logger.warning(
                                     f"Conflicting label selector values for key '{k}' "
                                     "within the same bundle group. The autoscaler may not provision correctly."
@@ -561,11 +582,16 @@ def _validate_topology_strategy(
                 )
             if not key == NODE_ID_LABEL_KEY:
                 topology_label_keys.append(key)
-                if i > 0 and value not in ["STRICT_PACK", "PACK"]:
+                if value == "PACK":
+                    raise ValueError(
+                        f"Topology strategy 'PACK' for non-node label {key!r} is not supported. "
+                        "Use 'STRICT_PACK' for hard domain co-location or 'STRICT_SPREAD' / 'SPREAD' "
+                        "for domain distribution."
+                    )
+                if i > 0 and value not in ["STRICT_PACK"]:
                     raise ValueError(
                         f"Invalid strategy {value!r} for inner topology label {key!r}. "
-                        "Inner custom topology layers currently only support "
-                        "'STRICT_PACK' or 'PACK'."
+                        "Inner custom topology layers currently only support 'STRICT_PACK'."
                     )
 
         if len(topology_label_keys) > 1:
