@@ -1333,13 +1333,9 @@ TEST_F(SchedulingPolicyTest, HierarchicalBundleSchedulingHeterogeneousGroupTest)
   ASSERT_TRUE(result.status.IsSuccess());
   ASSERT_EQ(result.selected_nodes.size(), 2);
 
-  // The first bundle (1 CPU) should be placed. It can go on either node.
-  // The second bundle (3 CPU) MUST go on node0.
-  // Wait, if it packs, the 3-CPU bundle goes on node0.
-  // The 1-CPU bundle will also go on node0 because PACK will fit it there, EXCEPT node0
-  // only has 3 CPUs total! Wait, if node0 has 3 CPUs, it can't fit BOTH 3-CPU and 1-CPU.
-  // So the 1-CPU bundle MUST go on node1.
-  // Let's assert exactly that.
+  // The first bundle (1 CPU) should be placed on node1.
+  // The second bundle (3 CPU) must be placed on node0 since it is the only node with 3 CPUs.
+  // node0 has 3 CPUs total, so it cannot fit both bundles. Therefore the 1-CPU bundle is placed on node1.
   ASSERT_EQ(result.selected_nodes[0], node1);
   ASSERT_EQ(result.selected_nodes[1], node0);
 }

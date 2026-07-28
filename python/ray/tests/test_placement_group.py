@@ -847,8 +847,8 @@ def test_hierarchical_pg_strict_pack_scheduling(ray_start_cluster):
 
     # Success case: request 2 bundle groups of {"CPU": 3} each, STRICT_PACKed in the same zone.
     # zone-A has 4 + 2 = 6 CPUs, but no combination of nodes can fit {"CPU": 3} on one node and {"CPU": 3} on another because nodes are 4 and 2. The second {"CPU": 3} will fail on the 2-CPU node.
-    # Therefore, zone-A should FAIL. It should backtrack and try zone-B!
-    # zone-B has one node with 6 CPUs, so both {"CPU": 3} bundles can pack on it!
+    # Therefore, zone-A should FAIL. It should backtrack and try zone-B.
+    # zone-B has one node with 6 CPUs, so both {"CPU": 3} bundles can pack on it.
     pg = ray.util.placement_group(
         bundles=[[{"CPU": 3}], [{"CPU": 3}]],
         topology_strategy=[
@@ -879,15 +879,9 @@ def test_hierarchical_two_layer_same_label(ray_start_cluster):
     # group 2 is strictly packed onto one node in az-2).
     bundles = [[{"CPU": 1}, {"CPU": 1}], [{"CPU": 1}, {"CPU": 1}]]
 
-    # We use "ray.io/az" at BOTH layers!
-    # Layer 1: STRICT_SPREAD across ray.io/az
-    # Layer 2 (node-level): STRICT_PACK (default because of how hierarchical PGs map the inner layer to node-level).
-    # Wait, the inner layer is implicitly node-level if it's ray.io/node-id.
-    # To use the same label at two layers, we could do:
-    # [{"ray.io/az": "STRICT_SPREAD"}, {"ray.io/az": "STRICT_PACK"}]
-    # But wait! If the inner layer is "ray.io/az", it means pack within the same AZ!
-    # And then we also need node-level strategy? Node level defaults to PACK if not provided.
-    # Let's test precisely:
+    # Test that the same label can be used at multiple layers.
+    # Outer strategy: STRICT_SPREAD across AZ.
+    # Inner strategy: STRICT_PACK within AZ and STRICT_PACK within node.
     pg = ray.util.placement_group(
         bundles,
         topology_strategy=[
@@ -922,18 +916,8 @@ def test_hierarchical_two_layer_same_label(ray_start_cluster):
         node_to_az[n["NodeID"]] = (
             n["Resources"].get("ray.io/az") or n["NodeManagerAddress"]
         )  # fallback to IP if label not in resources
-        # Actually labels are in n["NodeManagerAddress"] or something? No, labels are in n["Resources"] (e.g. ray.io/az: 1.0)
-
-    # Wait, cluster.add_node(labels={"ray.io/az": "az-1"}) adds the label into Resources as a resource or what?
-    # In ray, node labels are surfaced in the Node dictionary, maybe under "Labels"?
-    # For now let's just assert the nodes are different, which for 4 nodes with STRICT_SPREAD across 2 AZs guarantees they are in different AZs since STRICT_SPREAD forces it!
-    # Wait! Actually they could just be different nodes in the same AZ if STRICT_SPREAD wasn't working.
-    # But wait, there are only 2 AZs, and 2 groups. STRICT_SPREAD across AZ will guarantee they are in different AZs!
-    # Let's just check the nodes are different. But wait, if STRICT_SPREAD failed, they could be on different nodes in the same AZ.
-    # Let's check the AZ of the nodes!
+    # Verify the nodes are in different AZs.
     nodes_info = ray.nodes()
-    # Labels in ray.nodes() are stored in "NodeManagerAddress" or what?
-    # Let's just find the nodes in nodes_info and check if they have different AZ resource or something.
     az1 = None
     az2 = None
     for n in nodes_info:
