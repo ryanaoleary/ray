@@ -23,8 +23,8 @@ from ray.llm._internal.serve.core.configs.accelerators import (
     GPUConfig,
     TPUAccelerator,
     TPUConfig,
-    get_accelerator_backend,
     format_ray_accelerator_resource,
+    get_accelerator_backend,
 )
 from ray.llm._internal.serve.core.configs.llm_config import (
     AcceleratorType,

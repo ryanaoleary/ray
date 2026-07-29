@@ -602,13 +602,47 @@ class TestApplyCheckpointInfo:
         assert mock_from_pretrained.call_args.args[0] == "org/plain-model"
         assert config._model_architecture == "Qwen2ForCausalLM"
 
-    @patch("transformers.AutoConfig.from_pretrained")
-    def test_load_failure_raises_value_error(self, mock_from_pretrained):
         mock_from_pretrained.side_effect = OSError("no config.json")
         config = self._make_llm_config()
 
         with pytest.raises(ValueError, match="Failed to load Hugging Face config"):
             config.apply_checkpoint_info("org/missing-model")
+
+    def test_get_accelerator_backend_tpu(self):
+        """Test get_accelerator_backend correctly selects TPUAccelerator for TPU accelerator types."""
+        from ray.llm._internal.serve.core.configs.accelerators import (
+            TPUAccelerator,
+            get_accelerator_backend,
+        )
+
+        backend = get_accelerator_backend("TPU-V6E")
+        assert isinstance(backend, TPUAccelerator)
+
+    def test_vllm_engine_config_conflicting_accelerator(self):
+        """Test VLLMEngineConfig raises ValueError when TPU accelerator type conflicts with GPUConfig."""
+        with pytest.raises(
+            ValueError, match="accelerator_type='TPU-V6E' is a TPU type"
+        ):
+            VLLMEngineConfig(
+                model_loading_config=ModelLoadingConfig(model_id="test_model"),
+                accelerator_type="TPU-V6E",
+                accelerator_config=GPUConfig(),
+            )
+
+    @patch("ray.llm._internal.serve.core.configs.accelerators.placement_group")
+    def test_tpu_accelerator_batch_placement_group(self, mock_placement_group):
+        """Test TPUAccelerator creates atomic TPU placement group for batch inference."""
+        from ray.llm._internal.serve.core.configs.accelerators import (
+            TPUAccelerator,
+            TPUConfig,
+        )
+
+        acc = TPUAccelerator(TPUConfig())
+        acc.create_batch_placement_group(num_bundles_per_replica=4)
+        mock_placement_group.assert_called_once_with(
+            [{"TPU": 4, "CPU": 1}],
+            strategy="PACK",
+        )
 
 
 if __name__ == "__main__":

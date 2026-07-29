@@ -397,9 +397,6 @@ class TPUAccelerator(AcceleratorBackend):
         )
 
 
-
-
-
 def get_accelerator_backend(
     accelerator_type: Optional[str] = None,
     accelerator_config: Optional[AnyAcceleratorConfig] = None,
