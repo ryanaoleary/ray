@@ -24,6 +24,7 @@ from ray._private.accelerators.tpu import (
     reserve_tpu_slice,
 )
 from ray._private.client_mode_hook import client_mode_wrap
+from ray.runtime_env import RuntimeEnv
 from ray.util.annotations import DeveloperAPI, PublicAPI
 from ray.util.placement_group import (
     PlacementGroup,
@@ -273,6 +274,46 @@ def get_tpu_coordinator_env_vars(
         "MEGASCALE_NUM_SLICES": str(num_slices),
         "MEGASCALE_SLICE_ID": str(slice_id),
     }
+
+
+def normalize_torchtpu_topology(topology: str, tpu_resource_per_chip: int = 1) -> str:
+    """Normalizes TPU topology strings for PyTorch/XLA (e.g. '4x4' -> '4,4,1'; '2x2x4' -> '2,2,4,2')."""
+    clean_topo = topology.strip().lower().replace("x", ",")
+    dims = [d for d in clean_topo.split(",") if d.isdigit()]
+    if len(dims) == 2:
+        dims.append(str(tpu_resource_per_chip))
+    elif len(dims) == 3 and tpu_resource_per_chip > 1:
+        dims.append(str(tpu_resource_per_chip))
+    return ",".join(dims)
+
+
+@PublicAPI(stability="alpha")
+def get_torchtpu_env_vars(
+    topology: str,
+    slicebuilder_addresses: Optional[List[str]] = None,
+    tpu_resource_per_chip: int = 1,
+) -> Dict[str, str]:
+    """Returns environment variables required for PyTorch TPU (torch_tpu) slice or sub-slice execution.
+
+    Args:
+        topology: The target TPU topology string (e.g. "4x4", "2x4", or "4,4,1").
+        slicebuilder_addresses: Optional list of address:port strings for the slice nodes.
+        tpu_resource_per_chip: Logical TPU resources per physical chip (defaults to 1).
+
+    Returns:
+        A dictionary mapping PyTorch TPU environment variables to their values.
+    """
+    normalized_topology = normalize_torchtpu_topology(topology, tpu_resource_per_chip)
+    env_vars = {
+        "TORCH_TPU_TOPOLOGY": normalized_topology,
+    }
+    if slicebuilder_addresses:
+        env_vars["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(slicebuilder_addresses)
+    return env_vars
+
+
+
+
 
 
 @PublicAPI(stability="alpha")
@@ -925,6 +966,34 @@ class SlicePlacementGroup:
                     getattr(pg, "id", pg),
                 )
         self.release_head_pgs()
+
+    @PublicAPI(stability="alpha")
+    def get_tpu_env_vars(
+        self,
+        slicebuilder_addresses: Optional[List[str]] = None,
+    ) -> Dict[str, str]:
+        """Returns the PyTorch TPU (torch_tpu) environment variables for this slice."""
+        return get_torchtpu_env_vars(
+            topology=self._topology,
+            slicebuilder_addresses=slicebuilder_addresses,
+            tpu_resource_per_chip=getattr(self, "_tpu_resource_per_chip", 1),
+        )
+
+
+
+    @PublicAPI(stability="alpha")
+    def get_runtime_env(
+        self,
+        slicebuilder_addresses: Optional[List[str]] = None,
+    ) -> Any:
+        """Returns a Ray RuntimeEnv populated with PyTorch TPU environment variables."""
+        return RuntimeEnv(
+            env_vars=self.get_tpu_env_vars(
+                slicebuilder_addresses=slicebuilder_addresses
+            )
+        )
+
+
 
 
 @PublicAPI(stability="alpha")
@@ -1876,6 +1945,33 @@ class SubslicePlacementGroup:
                 )
             self._placement_group = None
         self.release_head_pgs()
+
+    @PublicAPI(stability="alpha")
+    def get_tpu_env_vars(
+        self,
+        slicebuilder_addresses: Optional[List[str]] = None,
+    ) -> Dict[str, str]:
+        """Returns the PyTorch TPU (torch_tpu) environment variables for this sub-slice."""
+        return get_torchtpu_env_vars(
+            topology=self._subslice_topology,
+            slicebuilder_addresses=slicebuilder_addresses,
+        )
+
+
+
+    @PublicAPI(stability="alpha")
+    def get_runtime_env(
+        self,
+        slicebuilder_addresses: Optional[List[str]] = None,
+    ) -> Any:
+        """Returns a Ray RuntimeEnv with sub-slice TPU environment variables."""
+        return RuntimeEnv(
+            env_vars=self.get_tpu_env_vars(
+                slicebuilder_addresses=slicebuilder_addresses
+            )
+        )
+
+
 
 
 def _build_slice_worker_to_node(

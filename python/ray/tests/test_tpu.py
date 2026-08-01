@@ -2637,5 +2637,49 @@ def test_find_undiscovered_idle_slice_skips_held_head():
     assert check(avail) is None
 
 
+def test_torchtpu_env_vars():
+    """Test get_torchtpu_env_vars, normalize_torchtpu_topology, and SubslicePlacementGroup."""
+    from ray.util.tpu import (
+        get_torchtpu_env_vars,
+        normalize_torchtpu_topology,
+        SubslicePlacementGroup,
+    )
+
+    # 1. Test topology normalization for 2D Torus and 3D Torus (Ironwood v7x)
+    assert normalize_torchtpu_topology("4x4", tpu_resource_per_chip=1) == "4,4,1"
+    assert normalize_torchtpu_topology("2x2x4", tpu_resource_per_chip=2) == "2,2,4,2"
+
+    # 2. Test get_torchtpu_env_vars for full slice and sub-slice
+    env_vars = get_torchtpu_env_vars(
+        topology="2x4",
+        slicebuilder_addresses=["10.0.0.1:8431", "10.0.0.2:8431"],
+    )
+    assert env_vars["TORCH_TPU_TOPOLOGY"] == "2,4,1"
+    assert env_vars["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "10.0.0.1:8431,10.0.0.2:8431"
+
+    # 3. Test real SubslicePlacementGroup instance (without mocks)
+    ss_pg = SubslicePlacementGroup(
+        placement_group=None,
+        parent_topology="4x4",
+        subslice_topology="2x4",
+        subslice_index=0,
+        slice_name="slice-0",
+        num_hosts=2,
+        chips_per_host=4,
+        bundle_resources={"TPU": 4},
+    )
+
+    ss_env = ss_pg.get_tpu_env_vars(["10.0.0.1:8431", "10.0.0.2:8431"])
+    assert ss_env["TORCH_TPU_TOPOLOGY"] == "2,4,1"
+    assert ss_env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "10.0.0.1:8431,10.0.0.2:8431"
+
+    runtime_env = ss_pg.get_runtime_env(["10.0.0.1:8431", "10.0.0.2:8431"])
+    assert runtime_env["env_vars"]["TORCH_TPU_TOPOLOGY"] == "2,4,1"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-sv", __file__]))
+
+
+
+
