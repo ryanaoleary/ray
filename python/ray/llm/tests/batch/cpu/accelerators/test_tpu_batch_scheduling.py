@@ -51,8 +51,19 @@ _ACCEL = "ray.llm._internal.common.accelerators"
 
 
 class FakePlacementGroup:
-    def __init__(self, pg_id: str = "pg-fake-123"):
+    def __init__(
+        self,
+        pg_id: str = "pg-fake-123",
+        *,
+        num_bundles: int = 4,
+        chips_per_host: int = 4,
+        cpu_per_host: float = 2.0,
+    ):
         self.id = pg_id
+        self.bundle_specs = [
+            {"CPU": cpu_per_host, "TPU": float(chips_per_host)}
+            for _ in range(num_bundles)
+        ]
 
     def ready(self):
         return None
@@ -64,15 +75,25 @@ class FakeSlicePlacementGroupHandle:
         topology: str = "4x4",
         num_hosts: int = 4,
         chips_per_host: int = 4,
-        slice_name: str = "tpu-slice-0",
+        slice_name: Optional[str] = "tpu-slice-0",
     ):
         self.topology = topology
         self.num_hosts = num_hosts
+        self.num_bundles = num_hosts
         self.chips_per_host = chips_per_host
-        self.placement_group = FakePlacementGroup()
-        self.bundle_label_selector = [
-            {"ray.io/tpu-slice-name": slice_name} for _ in range(num_hosts)
-        ]
+        self.devices_per_host = chips_per_host
+        self.placement_group = FakePlacementGroup(
+            num_bundles=num_hosts, chips_per_host=chips_per_host
+        )
+        # Single-host SlicePlacementGroups do not attach slice-name labels.
+        if slice_name is None or num_hosts <= 1:
+            self.bundle_label_selector: List[Dict[str, str]] = [
+                {} for _ in range(num_hosts)
+            ]
+        else:
+            self.bundle_label_selector = [
+                {"ray.io/tpu-slice-name": slice_name} for _ in range(num_hosts)
+            ]
         self.released_head_pgs = 0
         self.shutdown_calls = 0
 
@@ -695,46 +716,62 @@ def test_direct_backend_validation_failures(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "accelerator_type, topology, total_chips",
+    "accelerator_type, topology, total_chips, chips_per_vm, num_vms",
     [
-        ("TPU-V6E", "1x1", 1),
-        ("TPU-V6E", "2x2", 4),
-        ("TPU-V6E", "2x4", 8),
-        ("TPU-V4", "2x2x1", 4),
+        ("TPU-V6E", "1x1", 1, 1, 1),
+        ("TPU-V6E", "2x2", 4, 4, 1),
+        ("TPU-V6E", "2x4", 8, 8, 1),
+        ("TPU-V6E", "4x4", 16, 4, 4),
     ],
 )
-def test_single_host_topology_rejected(
-    monkeypatch, accelerator_type, topology, total_chips
+def test_default_topology_layouts(
+    monkeypatch, accelerator_type, topology, total_chips, chips_per_vm, num_vms
 ):
-    """Topologies that resolve to one TPU VM under Ray defaults reject early.
-
-    ``SlicePlacementGroup`` only gang-schedules by slice name for multi-host
-    topologies. Ambiguous shapes such as v6e ``2x4`` use Ray's default single-VM
-    layout in this MVP (no ``chips_per_vm``), so they are rejected before any
-    slice is reserved.
-    """
+    """Ray's default chips-per-VM resolution drives single- and multi-VM layouts."""
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    slice_calls = []
+    node_lookups = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology=topology,
+        num_hosts=num_vms,
+        chips_per_host=chips_per_vm,
+        slice_name=None if num_vms == 1 else "tpu-slice-0",
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_nodes=lambda slice_name, nodes=None: (
+            node_lookups.append(slice_name),
+            _create_mock_v6e_nodes(num_hosts=num_vms, tpu_per_host=chips_per_vm),
+        )[1],
+    )
 
-    def spy_slice_placement_group(**kwargs):
-        slice_calls.append(kwargs)
-        raise AssertionError("Must not reserve a slice for a single-host topology.")
-
-    monkeypatch.setattr(f"{_ACCEL}.slice_placement_group", spy_slice_placement_group)
-
-    with pytest.raises(ValueError, match="requires a multi-host topology"):
-        TPUAccelerator().build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type=accelerator_type,
-                accelerator_config=TPUConfig(topology=topology),
-                tensor_parallel_size=total_chips,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                concurrency=1,
-            )
+    acquired = TPUAccelerator().build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type=accelerator_type,
+            accelerator_config=TPUConfig(topology=topology),
+            tensor_parallel_size=total_chips,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            executor_backend="ray",
+            concurrency=1,
         )
-    assert slice_calls == []
+    )
+
+    kwargs = acquired.plan.map_batches_kwargs
+    assert kwargs["num_cpus"] == PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
+    assert kwargs["num_gpus"] == 0
+    assert kwargs["resources"] == {}
+    strategy = kwargs["scheduling_strategy"]
+    assert strategy.placement_group_bundle_index == 0
+    assert strategy.placement_group_capture_child_tasks is True
+    assert len(fake_handle.placement_group.bundle_specs) == num_vms
+    for bundle in fake_handle.placement_group.bundle_specs:
+        assert bundle["TPU"] == float(chips_per_vm)
+    if num_vms == 1:
+        assert node_lookups == []
+    else:
+        assert node_lookups == ["tpu-slice-0"]
+    acquired.close_handle.shutdown()
 
 
 def test_slice_allocation_kwargs_and_head_release_ordering(monkeypatch):

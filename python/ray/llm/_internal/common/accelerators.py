@@ -136,27 +136,30 @@ def infer_hardware_kind_from_bundles(
 
 @dataclass(frozen=True)
 class TPUReplicaLayout:
-    """Physical layout of a TPU slice.
+    """Resolved TPU topology layout for one model replica.
 
     Attributes:
-        topology: The requested topology string, such as ``"4x4"``.
+        topology: The requested topology string, such as ``"4x4"`` or ``"2x4"``.
         accelerator_type: The canonical Ray accelerator type, such as ``"TPU-V6E"``.
         accelerator_version: The generation alone, such as ``"v6e"``.
-        physical_chips: Total chips across the slice. ``tensor_parallel_size`` must
+        total_chips: Total chips across the topology. ``tensor_parallel_size`` must
             equal this.
-        num_hosts: Host VMs in the slice, which is also the placement group's bundle
-            count.
-        physical_chips_per_host: Chips local to one host VM. Because the backend
-            requires ``RAY_TPU_RESOURCE_PER_CHIP == 1``, this is also the Ray ``TPU``
-            resource each host advertises.
+        chips_per_vm: Chips on each resolved TPU VM (Ray's default ``chips_per_host`` /
+            ``chips_per_vm``). With ``RAY_TPU_RESOURCE_PER_CHIP == 1``, this is also
+            the Ray ``TPU`` resource each host bundle advertises.
+        num_vms: Number of TPU VMs, which is also the placement-group bundle count.
     """
 
     topology: str
     accelerator_type: str
     accelerator_version: str
-    physical_chips: int
-    num_hosts: int
-    physical_chips_per_host: int
+    total_chips: int
+    chips_per_vm: int
+    num_vms: int
+
+    @property
+    def is_single_host(self) -> bool:
+        return self.num_vms == 1
 
 
 @dataclass(frozen=True)
@@ -221,7 +224,11 @@ class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
     topology: Optional[str] = Field(
         default=None,
-        description="Physical TPU slice topology (e.g. '4x4', '2x2x2'). Required for multi-host TPU batch inference.",
+        description=(
+            "Physical TPU topology string (e.g. '4x4', '2x4', '2x2x2'). Required for "
+            "topology-backed TPU batch inference. Ambiguous shapes such as v6e '2x4' "
+            "use Ray's default chips-per-VM resolution."
+        ),
     )
 
 
@@ -594,22 +601,28 @@ class TPUAccelerator(AcceleratorBackend):
                 self._slice_pg_wrapper = None
 
     def _derive_layout(self, topology: str, accelerator_type: str) -> TPUReplicaLayout:
-        """Derive physical chip counts and host counts without querying current node."""
+        """Derive the resolved VM layout from Ray's default chips-per-host rules."""
         accel_version = get_tpu_version_from_type(accelerator_type)
-        physical_chips = get_num_chips_from_topology(topology)
-        chips_per_host = get_chips_per_host(topology, accel_version)
-        if chips_per_host <= 0:
+        total_chips = get_num_chips_from_topology(topology)
+        chips_per_vm = get_chips_per_host(topology, accel_version)
+        if chips_per_vm <= 0:
             raise ValueError(
-                f"Resolved chips per host must be positive, got {chips_per_host}"
+                f"Resolved chips per VM must be positive, got {chips_per_vm}"
             )
-        num_hosts = max(1, physical_chips // chips_per_host)
+        if total_chips % chips_per_vm != 0:
+            raise ValueError(
+                f"Topology '{topology}' on {accelerator_type} resolves to "
+                f"{total_chips} chips with {chips_per_vm} chips per VM, which does "
+                "not divide evenly."
+            )
+        num_vms = total_chips // chips_per_vm
         return TPUReplicaLayout(
             topology=topology,
             accelerator_type=accelerator_type,
             accelerator_version=accel_version,
-            physical_chips=physical_chips,
-            num_hosts=num_hosts,
-            physical_chips_per_host=chips_per_host,
+            total_chips=total_chips,
+            chips_per_vm=chips_per_vm,
+            num_vms=num_vms,
         )
 
     def build_batch_scheduling_plan(
@@ -667,22 +680,9 @@ class TPUAccelerator(AcceleratorBackend):
 
         layout = self._derive_layout(tpu_config.topology, canonical_accel)
 
-        # SlicePlacementGroup only gang-schedules by slice name when the topology
-        # spans more than one host; single-host requests carry no slice label and
-        # would need the engine actor itself to hold the chips.
-        if layout.physical_chips <= layout.physical_chips_per_host:
+        if tp != layout.total_chips:
             raise ValueError(
-                f"TPU batch inference requires a multi-host topology. Topology "
-                f"'{layout.topology}' on {layout.accelerator_type} places all "
-                f"{layout.physical_chips} chips on a single host "
-                f"({layout.physical_chips_per_host} chips per host). Single-host TPU "
-                "batch inference is not supported in this release; request a topology "
-                "that spans more than one host, such as '4x4' on TPU-V6E."
-            )
-
-        if tp != layout.physical_chips:
-            raise ValueError(
-                f"tensor_parallel_size must match the total number of physical TPU chips ({layout.physical_chips}) "
+                f"tensor_parallel_size must match the total number of physical TPU chips ({layout.total_chips}) "
                 f"for topology '{layout.topology}'; got {tp}."
             )
         if pp != 1:
@@ -729,10 +729,10 @@ class TPUAccelerator(AcceleratorBackend):
                 )
         env_vars.update(TPU_ENGINE_ENV_VARS)
 
-        # Host bundles reserve CPU for the engine actor. SlicePlacementGroup still
-        # advertises the per-host TPU chips on every bundle. G1 hardware gate must
-        # confirm the TPU executor accepts that mixed {CPU, TPU} shape rather than
-        # only PGs it built itself.
+        # Each resolved TPU VM becomes one PG bundle. CPU is reserved for the
+        # engine actor; SlicePlacementGroup still advertises per-VM TPU chips on
+        # every bundle. Hardware validation must confirm the TPU executor accepts
+        # that mixed {CPU, TPU} shape rather than only PGs it built itself.
         resources_per_bundle = {
             "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
         }
@@ -756,17 +756,16 @@ class TPUAccelerator(AcceleratorBackend):
                 raise TimeoutError(
                     f"Timed out after {timeout_s}s waiting for TPU slice placement "
                     f"group readiness. Requested {layout.accelerator_type} "
-                    f"topology={layout.topology} ({layout.num_hosts} hosts). This "
-                    "usually means the cluster has no intact slice of that shape "
+                    f"topology={layout.topology} ({layout.num_vms} VMs). This "
+                    "usually means the cluster has no intact topology of that shape "
                     f"available. Set {SLICE_READY_TIMEOUT_ENV_VAR} to wait longer "
-                    "while a slice is provisioned."
+                    "while capacity is provisioned."
                 ) from exc
 
-            # Release the head markers only once the worker placement group holds the
-            # TPU resources, otherwise another caller could claim the slice name.
+            # Idempotent for single-host (no head reservation PGs) and multi-host.
             handle.release_head_pgs()
 
-            _validate_selected_slice(handle, layout)
+            _validate_reserved_layout(handle, layout)
 
             # Schedule the Ray Data engine actor into the driver-owned SlicePG.
             # Child-task capture keeps tpu_inference workers in the same PG.
@@ -804,14 +803,63 @@ class TPUAccelerator(AcceleratorBackend):
                     )
 
 
-def _validate_selected_slice(
+def _validate_reserved_layout(handle: Any, layout: TPUReplicaLayout) -> None:
+    """Validate the reserved SlicePlacementGroup matches the derived VM layout.
+
+    Structural checks cover both single-host and multi-host topologies. Multi-host
+    reservations additionally verify slice-name gang identity via GCS, because Ray
+    only attaches ``ray.io/tpu-slice-name`` labels for multi-VM topologies.
+    """
+    if getattr(handle, "num_hosts", None) != layout.num_vms:
+        raise RuntimeError(
+            f"Reserved SlicePlacementGroup reports {handle.num_hosts} hosts, but "
+            f"topology '{layout.topology}' requires {layout.num_vms} VMs."
+        )
+    if getattr(handle, "num_bundles", None) != layout.num_vms:
+        raise RuntimeError(
+            f"Reserved SlicePlacementGroup reports {handle.num_bundles} bundles, but "
+            f"topology '{layout.topology}' requires {layout.num_vms}."
+        )
+    if getattr(handle, "chips_per_host", None) != layout.chips_per_vm:
+        raise RuntimeError(
+            f"Reserved SlicePlacementGroup reports {handle.chips_per_host} chips per "
+            f"host, but layout requires {layout.chips_per_vm}."
+        )
+    # While RAY_TPU_RESOURCE_PER_CHIP == 1, logical devices equal physical chips.
+    if getattr(handle, "devices_per_host", None) != layout.chips_per_vm:
+        raise RuntimeError(
+            f"Reserved SlicePlacementGroup reports {handle.devices_per_host} devices "
+            f"per host, but layout requires {layout.chips_per_vm}."
+        )
+
+    pg = handle.placement_group
+    bundle_specs = getattr(pg, "bundle_specs", None)
+    if bundle_specs is None:
+        raise RuntimeError(
+            "Reserved placement group is missing bundle_specs; cannot validate the "
+            "TPU layout."
+        )
+    if len(bundle_specs) != layout.num_vms:
+        raise RuntimeError(
+            f"Reserved placement group has {len(bundle_specs)} bundles, but topology "
+            f"'{layout.topology}' requires {layout.num_vms}."
+        )
+    for idx, bundle in enumerate(bundle_specs):
+        tpu_amount = bundle.get("TPU", 0)
+        if tpu_amount != layout.chips_per_vm:
+            raise RuntimeError(
+                f"Reserved placement group bundle {idx} advertises TPU={tpu_amount}, "
+                f"but layout requires TPU={layout.chips_per_vm}."
+            )
+
+    if not layout.is_single_host:
+        _validate_multihost_slice_identity(handle, layout)
+
+
+def _validate_multihost_slice_identity(
     handle: Any, layout: TPUReplicaLayout
 ) -> List[Dict[str, Any]]:
-    """Validate advertised TPU capacity on the hosts SlicePlacementGroup selected.
-
-    Runs after the slice has been acquired, so it inspects the selected slice's hosts
-    and chooses nothing itself.
-    """
+    """Validate multi-host slice-name identity and per-node TPU capacity via GCS."""
     label_selectors = getattr(handle, "bundle_label_selector", [])
     slice_names = {
         selector[_raylet.RAY_NODE_TPU_SLICE_NAME_KEY]
@@ -829,20 +877,20 @@ def _validate_selected_slice(
     slice_name = next(iter(slice_names))
     selected_nodes = get_tpu_nodes_for_slice(slice_name)
 
-    if len(selected_nodes) != layout.num_hosts:
+    if len(selected_nodes) != layout.num_vms:
         raise RuntimeError(
             f"Slice '{slice_name}' selected by placement group contains {len(selected_nodes)} "
-            f"alive nodes, but topology '{layout.topology}' requires {layout.num_hosts} hosts."
+            f"alive nodes, but topology '{layout.topology}' requires {layout.num_vms} VMs."
         )
 
     for node in selected_nodes:
         resources = node.get("Resources", {})
         tpu_count = resources.get("TPU", 0)
-        if tpu_count != layout.physical_chips_per_host:
+        if tpu_count != layout.chips_per_vm:
             node_id = node.get("NodeID")
             raise RuntimeError(
                 f"Node '{node_id}' in selected slice '{slice_name}' advertises {tpu_count} TPU "
-                f"resources, but layout requires {layout.physical_chips_per_host} chips per host."
+                f"resources, but layout requires {layout.chips_per_vm} chips per VM."
             )
 
     return selected_nodes

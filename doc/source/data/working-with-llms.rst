@@ -350,15 +350,15 @@ TPU batch inference
 .. note::
     TPU batch inference is available as an **alpha** feature.
 
-Ray Data LLM runs a vLLM model replica across a multi-host TPU slice. Set
-``accelerator_type`` to your TPU generation and pass ``accelerator_config`` as a
-dict with ``kind="tpu"`` and the slice ``topology``.
+Ray Data LLM runs a vLLM model replica across a complete TPU topology (one or more
+TPU VMs). Set ``accelerator_type`` to your TPU generation and pass
+``accelerator_config`` as a dict with ``kind="tpu"`` and the slice ``topology``.
 
-``build_processor(...)`` acquires the TPU slice eagerly: it creates the slice
-placement group and may block while the slice is scheduled or provisioned. This
+``build_processor(...)`` acquires the topology eagerly: it creates the slice
+placement group and may block while capacity is scheduled or provisioned. This
 differs from the GPU path, where placement-group creation remains lazy through
-Ray Data's worker creation path. The processor holds the slice for as long as it
-is open, so every worker lands on a single intact slice.
+Ray Data's worker creation path. The processor holds the reservation for as long
+as it is open, so every worker lands on the same intact topology.
 
 .. code-block:: python
 
@@ -394,22 +394,23 @@ group and rejects later calls to the processor. Ray logs placement-group removal
 failures; driver exit remains the fallback fate-sharing boundary. Materialize every
 Dataset the processor produces before you close it.
 
-This alpha release runs one model replica on one multi-host slice:
+This alpha release runs one model replica on one complete TPU topology:
 
 - ``concurrency`` must be the integer ``1``. Autoscaling and multi-replica TPU pools
   aren't supported.
 - ``tensor_parallel_size`` must equal the total chip count of the topology, such as
-  ``16`` for a v6e ``4x4`` slice.
+  ``16`` for a v6e ``4x4`` slice or ``8`` for a v6e ``2x4`` slice.
 - ``pipeline_parallel_size`` and ``data_parallel_size`` must both be ``1``.
-- The topology must resolve to more than one TPU VM. Ambiguous topologies such as
-  v6e ``2x4`` use Ray's default single-VM layout in this alpha release and are
-  therefore rejected; use an unambiguous multi-VM topology such as v6e ``4x4``.
+- The topology resolves through Ray's default chips-per-VM rules into one or more
+  TPU VMs. A single-host shape such as v6e ``2x4`` becomes one VM with eight chips;
+  a multi-host shape such as v6e ``4x4`` becomes four VMs with four chips each.
+  Explicit ``chips_per_vm`` overrides for ambiguous topologies are not exposed yet.
 - ``placement_group_config`` isn't supported. The accelerator backend owns the slice
   layout and placement.
 - TPU Batch fixes Ray's TPU resource-per-chip setting to ``1`` and rejects conflicting
   driver or runtime-environment values.
-- Ray Data selects vLLM's Ray executor. Don't override
-  ``distributed_executor_backend``.
+- Ray Data selects vLLM's Ray executor for both single-host and multi-host topologies.
+  Don't override ``distributed_executor_backend``.
 - Run one Dataset at a time per processor.
 
 .. _openai_compatible_api_endpoint:
