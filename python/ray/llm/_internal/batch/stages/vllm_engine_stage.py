@@ -1,15 +1,12 @@
 """The stage that runs vLLM engine."""
 
 import asyncio
-import copy
 import dataclasses
 import logging
 import math
 import os
 import time
 import uuid
-from collections import Counter
-from functools import partial
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Tuple, Type
 
 import numpy as np
@@ -25,12 +22,8 @@ if TYPE_CHECKING:
 else:
     MultiModalDataDict = Any
 
-import ray
 from ray.llm._internal.batch.constants import TypeVLLMTaskType, vLLMTaskType
-from ray.llm._internal.batch.stages.base import (
-    StatefulStage,
-    StatefulStageUDF,
-)
+from ray.llm._internal.batch.stages.base import StatefulStage, StatefulStageUDF
 from ray.llm._internal.batch.stages.common import (
     maybe_convert_ndarray_to_list,
     truncate_str,
@@ -43,7 +36,7 @@ from ray.llm._internal.common.utils.download_utils import (
     download_model_files,
 )
 from ray.llm._internal.common.utils.lora_utils import download_lora_adapter
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.placement_group import get_current_placement_group
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +67,10 @@ def _get_vllm_prompt_classes():
             from vllm.inputs.llm import TextPrompt, TokensPrompt
         except ImportError:
             # vLLM < 0.19: classes were re-exported from vllm.inputs directly.
-            from vllm.inputs import TextPrompt, TokensPrompt  # type: ignore[no-redef]
+            from vllm.inputs import (
+                TextPrompt,  # type: ignore[no-redef]
+                TokensPrompt,
+            )
         _VLLM_PROMPT_CLASSES = (TokensPrompt, TextPrompt)
     return _VLLM_PROMPT_CLASSES
 
@@ -246,6 +242,8 @@ class vLLMEngineWrapper:
             ``-1``) to disable the semaphore entirely.
         dynamic_lora_loading_path: The S3 path to the dynamic LoRA adapter.
         log_engine_metrics: Whether to export vLLM metrics to Ray's Prometheus endpoint.
+        reuse_current_placement_group: Whether to pin the engine's workers to the
+            placement group this actor is already scheduled in.
         **kwargs: The keyword arguments for the engine.
     """
 
@@ -255,6 +253,7 @@ class vLLMEngineWrapper:
         max_pending_requests: Optional[int] = None,
         dynamic_lora_loading_path: Optional[str] = None,
         log_engine_metrics: bool = True,
+        reuse_current_placement_group: bool = False,
         **kwargs,
     ):
         self.request_id = 0
@@ -322,9 +321,14 @@ class vLLMEngineWrapper:
                 "Metrics will be available at Ray's Prometheus endpoint."
             )
 
-        self.engine = vllm.AsyncLLMEngine.from_engine_args(
-            engine_args, stat_loggers=stat_loggers
-        )
+        if reuse_current_placement_group:
+            self.engine = self._build_engine_in_current_placement_group(
+                engine_args, stat_loggers
+            )
+        else:
+            self.engine = vllm.AsyncLLMEngine.from_engine_args(
+                engine_args, stat_loggers=stat_loggers
+            )
 
         # The performance gets really bad if there are too many requests in the pending queue.
         # We work around it with semaphore to limit the number of concurrent requests in the engine.
@@ -355,6 +359,69 @@ class vLLMEngineWrapper:
         else:
             self.semaphore = asyncio.NullContext()
 
+    def _build_engine_in_current_placement_group(
+        self,
+        engine_args: Any,
+        stat_loggers: Optional[List[Any]],
+    ) -> Any:
+        """Build the engine so its workers land in this actor's placement group.
+
+        ``AsyncLLMEngine.from_engine_args`` resolves its own engine config, which
+        leaves ``parallel_config.placement_group`` unset. Some Ray executors, such as
+        tpu_inference's, then allocate a second placement group instead of resolving
+        the current one, and that request can never be satisfied while this
+        placement group holds the accelerators. Passing the group through the engine
+        config is the supported way to hand a pre-reserved topology to the executor.
+
+        Requires ``self._vllm_config`` to already exist (``__init__`` creates it via
+        ``engine_args.create_engine_config()`` before taking this branch) and vLLM V1.
+        """
+        if getattr(self, "_vllm_config", None) is None:
+            raise RuntimeError(
+                "vLLM engine config must be created before reusing the current "
+                "placement group. This indicates engine construction ran out of order."
+            )
+
+        try:
+            from vllm.v1.engine.async_llm import AsyncLLM
+            from vllm.v1.executor.abstract import Executor
+        except ImportError as e:
+            raise RuntimeError(
+                "Reusing a reserved placement group requires vLLM V1 "
+                "(vllm.v1.engine.async_llm.AsyncLLM). Install a vLLM build that "
+                "provides the V1 engine API."
+            ) from e
+
+        placement_group = get_current_placement_group()
+        if placement_group is None:
+            raise RuntimeError(
+                "The engine actor must run inside a placement group so the inference "
+                "engine can schedule its workers on the reserved accelerators, but "
+                "no current placement group was found. The scheduling strategy from "
+                "the accelerator backend did not take effect."
+            )
+
+        self._vllm_config.parallel_config.placement_group = placement_group
+        executor_class = Executor.get_class(self._vllm_config)
+        logger.info(
+            "Reusing the current placement group for the vLLM engine with executor "
+            "class %s.",
+            executor_class,
+        )
+        # Prefer enable_log_requests (current vLLM / Serve). Fall back to the older
+        # disable_log_requests polarity when that attribute is missing.
+        if hasattr(engine_args, "enable_log_requests"):
+            log_requests = engine_args.enable_log_requests
+        else:
+            log_requests = not getattr(engine_args, "disable_log_requests", True)
+        return AsyncLLM(
+            vllm_config=self._vllm_config,
+            executor_class=executor_class,
+            log_requests=log_requests,
+            log_stats=not engine_args.disable_log_stats,
+            stat_loggers=stat_loggers,
+        )
+
     async def _maybe_get_lora_request(
         self,
         row: Dict[str, Any],
@@ -375,7 +442,6 @@ class vLLMEngineWrapper:
 
         lora_request = None
         if "model" in row and row["model"] != self.model:
-
             lora_name = row["model"]
             if lora_name not in self.lora_name_to_request:
                 if is_remote_path(lora_name):
@@ -627,9 +693,10 @@ class vLLMEngineStageUDF(StatefulStageUDF):
         dynamic_lora_loading_path: Optional[str] = None,
         should_continue_on_error: bool = False,
         log_engine_metrics: bool = True,
+        required_env_vars: Optional[Dict[str, str]] = None,
+        reuse_current_placement_group: bool = False,
     ):
-        """
-        Initialize the vLLMEngineStageUDF.
+        """Initialize the vLLMEngineStageUDF.
 
         Args:
             data_column: The data column name.
@@ -639,10 +706,8 @@ class vLLMEngineStageUDF(StatefulStageUDF):
             model: The model to use for the vLLM engine.
             engine_kwargs: The kwargs to pass to the vLLM engine.
             task_type: The task to use for the vLLM engine (e.g., "generate", "embed", etc).
-            max_pending_requests: The maximum number of pending requests. If None,
-                it will be set to ``ceil(1.1 * max_num_seqs * pipeline_parallel_size)``,
-                where ``max_num_seqs`` and ``pipeline_parallel_size`` are read from
-                vLLM's resolved engine config (so the default tracks vLLM's
+            max_pending_requests: The maximum number of pending requests. When None,
+                it is dynamically set based on the engine's scheduler config (using the
                 GPU-dependent ``max_num_seqs``, not a hardcoded value).
             dynamic_lora_loading_path: The path to the dynamic LoRA adapter. It is expected
                 to hold subfolders each for a different lora checkpoint.
@@ -651,7 +716,22 @@ class vLLMEngineStageUDF(StatefulStageUDF):
                 set to the error message.
             log_engine_metrics: If True, export vLLM engine metrics (prefix cache hit rate,
                 TTFT, TPOT, KV cache utilization, etc.) to Ray's Prometheus endpoint.
+            required_env_vars: Environment variables that must already hold these exact
+                values in this actor. The accelerator backend sets them through the
+                actor's runtime environment; checking them here fails fast with an
+                actionable message if they did not propagate.
+            reuse_current_placement_group: If True, hand the actor's placement group to
+                the engine so its workers run on the accelerators reserved for it.
         """
+        for name, required in (required_env_vars or {}).items():
+            actual = os.environ.get(name)
+            if actual != required:
+                raise RuntimeError(
+                    f"This accelerator requires {name}={required!r} in the engine "
+                    f"actor environment; got {actual!r}. The runtime environment did "
+                    "not propagate to this actor."
+                )
+
         super().__init__(data_column, expected_input_keys)
         self.model = model
         self.should_continue_on_error = should_continue_on_error
@@ -688,6 +768,7 @@ class vLLMEngineStageUDF(StatefulStageUDF):
             max_pending_requests=max_pending_requests,
             dynamic_lora_loading_path=dynamic_lora_loading_path,
             log_engine_metrics=log_engine_metrics,
+            reuse_current_placement_group=reuse_current_placement_group,
             **self.engine_kwargs,
         )
         # The wrapper resolves a None into a concrete value using vLLM's
@@ -851,151 +932,10 @@ class vLLMEngineStageUDF(StatefulStageUDF):
             self.llm.shutdown()
 
 
-def _ray_scheduling_strategy_fn(
-    num_bundles_per_replica: int,
-    accelerator_type: Optional[str] = None,
-    placement_group_config: Optional[Dict[str, Any]] = None,
-):
-    """Create a Ray scheduling strategy for the engine.
-
-    Args:
-        num_bundles_per_replica: The number of device bundles per
-            engine replica.
-        accelerator_type: The accelerator type. If None, the
-            accelerator_type label will not be set.
-        placement_group_config: The custom placement group configuration.
-            If None, we use the default placement group configuration.
-
-    Returns:
-        The Ray scheduling strategy.
-    """
-
-    def _get_bundle() -> Dict[str, float]:
-        # GPU bundles
-        bundle = {"GPU": 1, "CPU": 1}
-
-        # Accelerator type
-        if accelerator_type:
-            bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-        return bundle
-
-    if placement_group_config:
-        placement_group_config = copy.deepcopy(placement_group_config)
-
-        if accelerator_type:
-            for bundle in placement_group_config["bundles"]:
-                bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-
-        pg = ray.util.placement_group(**placement_group_config)
-    else:
-        pg = ray.util.placement_group(
-            [_get_bundle()] * num_bundles_per_replica,
-            strategy="PACK",
-        )
-    return dict(
-        scheduling_strategy=PlacementGroupSchedulingStrategy(
-            pg, placement_group_capture_child_tasks=True
-        )
-    )
-
-
 class vLLMEngineStage(StatefulStage):
-    """
-    A stage that runs vLLM engine.
-    """
+    """A stage that runs vLLM engine."""
 
     fn: Type[StatefulStageUDF] = vLLMEngineStageUDF
-
-    @root_validator(pre=True)
-    def post_init(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-initialize the stage. Specifically,
-        this function determines the num_gpus and Ray remote args
-        for the .map_batches() call in this stage.
-
-        Args:
-            values: The raw stage values.
-        Returns:
-            The updated values.
-        """
-        map_batches_kwargs = values["map_batches_kwargs"]
-        accelerator_type = map_batches_kwargs.get("accelerator_type", "")
-        fn_constructor_kwargs = values["fn_constructor_kwargs"]
-        engine_kwargs = fn_constructor_kwargs.get("engine_kwargs", {})
-
-        ray_remote_args = {}
-        if accelerator_type:
-            ray_remote_args["accelerator_type"] = accelerator_type
-
-        # Setup num_workers required per vLLM engine.
-        tp_size = engine_kwargs.get("tensor_parallel_size", 1)
-        pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
-        num_bundles_per_replica = tp_size * pp_size
-
-        # Select distributed executor backend:
-        # - "uni": Single-process executor for single-GPU inference. Avoids unnecessary
-        #   process spawning and IPC overhead which is noticeable for small models
-        #   or short decode lengths.
-        # - "ray": Ray-based executor for multi-GPU (TP/PP > 1) with better resource
-        #   cleanup, unification with multi-node pipeline parallelism, and advanced control
-        #   over the placement group.
-        engine_kwargs.setdefault(
-            "distributed_executor_backend",
-            "uni" if num_bundles_per_replica == 1 else "ray",
-        )
-        executor_backend = engine_kwargs.get("distributed_executor_backend")
-
-        # When Ray is used in the vLLM engine, we set num_devices to 0 so that
-        # Ray Data won't reserve GPUs in advance. Instead, we specify scheduling
-        # strategy in .map_batches() arguments and let vLLM Ray executor to
-        # create placement groups for each TP/PP worker.
-        placement_group_config = fn_constructor_kwargs.pop(
-            "placement_group_config", None
-        )
-
-        # If bundle_per_worker is specified inside placement_group_config,
-        # expand it into full bundles list
-        if placement_group_config is not None:
-            bundle_per_worker = placement_group_config.pop("bundle_per_worker", None)
-            if bundle_per_worker is not None:
-                placement_group_config["bundles"] = [
-                    bundle_per_worker.copy() for _ in range(num_bundles_per_replica)
-                ]
-        if executor_backend == "ray":
-            # Note that we have to use partial() to pass a function
-            # instead of an object.
-            map_batches_kwargs["ray_remote_args_fn"] = partial(
-                _ray_scheduling_strategy_fn,
-                num_bundles_per_replica,
-                accelerator_type,
-                placement_group_config,
-            )
-            ray_remote_args["num_gpus"] = 0
-        else:
-            if not placement_group_config:
-                # Default to GPUs per bundle if placement group is not specified.
-                ray_remote_args["num_gpus"] = num_bundles_per_replica
-            else:
-                bundles = placement_group_config["bundles"]
-                resource_counter = Counter()
-                for bundle in bundles:
-                    resource_counter.update(bundle)
-
-                total_cpus = resource_counter.pop("CPU", 0)
-                total_gpus = resource_counter.pop("GPU", 0)
-
-                # Ray Data expects CPU/GPU to be specified via num_cpus/num_gpus,
-                # not inside the resources dict.
-                if total_cpus:
-                    ray_remote_args["num_cpus"] = total_cpus
-                if total_gpus:
-                    ray_remote_args["num_gpus"] = total_gpus
-
-                # Keep only non-CPU/GPU custom resources, if any.
-                if resource_counter:
-                    ray_remote_args["resources"] = dict(resource_counter)
-
-        map_batches_kwargs.update(ray_remote_args)
-        return values
 
     def _get_task_type(self) -> TypeVLLMTaskType:
         return self.fn_constructor_kwargs.get("task_type", vLLMTaskType.GENERATE)

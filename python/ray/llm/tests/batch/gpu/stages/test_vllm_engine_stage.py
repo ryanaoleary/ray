@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +17,6 @@ from ray.llm._internal.batch.stages.vllm_engine_stage import (
     vLLMEngineWrapper,
     vLLMOutputData,
 )
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 @pytest.fixture
@@ -70,6 +70,11 @@ def mock_vllm_wrapper():
 
 
 def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
+    """Stage construction stays accelerator-neutral; GPU PG bundles are owned by the backend.
+
+    Accelerator token injection and bundle shape (F-8) are covered by
+    ``GPUAccelerator.build_batch_scheduling_plan`` tests that invoke ``ray_remote_args_fn``.
+    """
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
             model=model_llama_3_2_216M,
@@ -99,27 +104,169 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
             "distributed_executor_backend": "ray",
         },
     }
-    ray_remote_args_fn = stage.map_batches_kwargs.pop("ray_remote_args_fn")
-    compute = stage.map_batches_kwargs.pop("compute")
+    compute = stage.map_batches_kwargs.get("compute")
     assert isinstance(compute, ActorPoolStrategy)
     assert compute.min_size == 1
     assert compute.max_size == 1
+    assert stage.map_batches_kwargs["zero_copy_batch"] is True
+    assert stage.map_batches_kwargs["max_concurrency"] == 4
+    assert stage.map_batches_kwargs["accelerator_type"] == gpu_type
+    # Scheduling strategy / ray_remote_args_fn is supplied by the processor backend,
+    # not by stage.post_init.
+    assert "ray_remote_args_fn" not in stage.map_batches_kwargs
+    assert "num_gpus" not in stage.map_batches_kwargs
 
-    assert stage.map_batches_kwargs == {
-        "zero_copy_batch": True,
-        "max_concurrency": 4,
-        "accelerator_type": gpu_type,
-        "num_gpus": 0,
-    }
-    scheduling_strategy = ray_remote_args_fn()["scheduling_strategy"]
-    assert isinstance(scheduling_strategy, PlacementGroupSchedulingStrategy)
 
-    bundle_specs = scheduling_strategy.placement_group.bundle_specs
-    assert len(bundle_specs) == 4
-    for bundle_spec in bundle_specs:
-        assert bundle_spec[f"accelerator_type:{gpu_type}"] == 0.001
-        assert bundle_spec["CPU"] == 1.0
-        assert bundle_spec["GPU"] == 1.0
+def _wrapper_with_fake_config():
+    """Build a wrapper with only the state the engine-construction path reads."""
+    wrapper = vLLMEngineWrapper.__new__(vLLMEngineWrapper)
+    wrapper._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(placement_group=None)
+    )
+    return wrapper
+
+
+def test_engine_reuses_current_placement_group(monkeypatch):
+    """The reserved placement group must reach vLLM's parallel config.
+
+    ``AsyncLLMEngine.from_engine_args`` leaves ``parallel_config.placement_group``
+    unset. Executors that don't resolve the current placement group themselves, such
+    as tpu_inference's, then allocate a second one that can never be satisfied while
+    this group holds the accelerators.
+    """
+    import vllm.v1.engine.async_llm as async_llm_module
+    import vllm.v1.executor.abstract as executor_module
+
+    sentinel_pg = object()
+    captured = {}
+
+    class FakeAsyncLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(async_llm_module, "AsyncLLM", FakeAsyncLLM)
+    monkeypatch.setattr(
+        executor_module.Executor, "get_class", lambda config: "FakeExecutor"
+    )
+    monkeypatch.setattr(
+        "ray.llm._internal.batch.stages.vllm_engine_stage.get_current_placement_group",
+        lambda: sentinel_pg,
+    )
+
+    wrapper = _wrapper_with_fake_config()
+    engine_args = SimpleNamespace(enable_log_requests=False, disable_log_stats=True)
+
+    engine = wrapper._build_engine_in_current_placement_group(engine_args, None)
+
+    assert isinstance(engine, FakeAsyncLLM)
+    assert wrapper._vllm_config.parallel_config.placement_group is sentinel_pg
+    assert captured["vllm_config"] is wrapper._vllm_config
+    assert captured["executor_class"] == "FakeExecutor"
+    assert captured["log_requests"] is False
+    assert captured["log_stats"] is False
+
+
+def test_engine_requires_a_current_placement_group(monkeypatch):
+    monkeypatch.setattr(
+        "ray.llm._internal.batch.stages.vllm_engine_stage.get_current_placement_group",
+        lambda: None,
+    )
+
+    wrapper = _wrapper_with_fake_config()
+    engine_args = SimpleNamespace(enable_log_requests=False, disable_log_stats=True)
+
+    with pytest.raises(RuntimeError, match="no current placement group was found"):
+        wrapper._build_engine_in_current_placement_group(engine_args, None)
+
+
+def test_engine_requires_vllm_config_before_reuse(monkeypatch):
+    monkeypatch.setattr(
+        "ray.llm._internal.batch.stages.vllm_engine_stage.get_current_placement_group",
+        lambda: object(),
+    )
+    wrapper = vLLMEngineWrapper.__new__(vLLMEngineWrapper)
+    engine_args = SimpleNamespace(enable_log_requests=False, disable_log_stats=True)
+
+    with pytest.raises(RuntimeError, match="engine config must be created"):
+        wrapper._build_engine_in_current_placement_group(engine_args, None)
+
+
+def test_engine_falls_back_to_disable_log_requests(monkeypatch):
+    import vllm.v1.engine.async_llm as async_llm_module
+    import vllm.v1.executor.abstract as executor_module
+
+    captured = {}
+
+    class FakeAsyncLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(async_llm_module, "AsyncLLM", FakeAsyncLLM)
+    monkeypatch.setattr(
+        executor_module.Executor, "get_class", lambda config: "FakeExecutor"
+    )
+    monkeypatch.setattr(
+        "ray.llm._internal.batch.stages.vllm_engine_stage.get_current_placement_group",
+        lambda: object(),
+    )
+
+    wrapper = _wrapper_with_fake_config()
+    # Older vLLM spellings used disable_log_requests instead of enable_log_requests.
+    engine_args = SimpleNamespace(disable_log_requests=False, disable_log_stats=True)
+    wrapper._build_engine_in_current_placement_group(engine_args, None)
+    assert captured["log_requests"] is True
+
+
+def test_engine_init_creates_config_before_reusing_placement_group(monkeypatch):
+    """Real __init__ must populate ``_vllm_config`` before the reuse branch runs."""
+    import types
+
+    order = []
+
+    class FakeEngineArgs:
+        def __init__(self, **kwargs):
+            self.enable_log_requests = False
+            self.disable_log_stats = True
+
+        def create_engine_config(self):
+            order.append("create_engine_config")
+            return SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    placement_group=None, pipeline_parallel_size=1
+                ),
+                scheduler_config=SimpleNamespace(max_num_seqs=16),
+            )
+
+    fake_vllm = types.SimpleNamespace(
+        AsyncEngineArgs=FakeEngineArgs,
+        AsyncLLMEngine=SimpleNamespace(from_engine_args=lambda *a, **k: None),
+        config=SimpleNamespace(PoolerConfig=object),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "vllm", fake_vllm)
+
+    def fake_build(self, engine_args, stat_loggers):
+        order.append("build_in_current_pg")
+        assert self._vllm_config is not None
+        assert self._vllm_config.scheduler_config.max_num_seqs == 16
+        self.engine = object()
+        return self.engine
+
+    monkeypatch.setattr(
+        vLLMEngineWrapper,
+        "_build_engine_in_current_placement_group",
+        fake_build,
+    )
+
+    wrapper = vLLMEngineWrapper(
+        idx_in_batch_column="__idx",
+        model="model-id",
+        model_source="model-source",
+        reuse_current_placement_group=True,
+        max_pending_requests=100,
+        log_engine_metrics=False,
+    )
+    assert order == ["create_engine_config", "build_in_current_pg"]
+    assert wrapper.engine is not None
 
 
 @pytest.mark.asyncio

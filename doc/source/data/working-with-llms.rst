@@ -17,6 +17,7 @@ The :ref:`ray.data.llm <llm-ref>` module enables scalable batch inference on Ray
 * :ref:`Embeddings <embedding_models>` - Generate text embeddings
 * :ref:`Classification <classification_models>` - Content classifiers and sentiment analyzers
 * :ref:`Multimodality <multimodal>` - Batch inference with VLM / omni models on multimodal data
+* :ref:`TPU batch inference <tpu_batch_inference>` - Batch inference on Google Cloud TPUs
 * :ref:`OpenAI-compatible endpoints <openai_compatible_api_endpoint>` - Query deployed models
 * :ref:`Serve deployments <serve_deployments>` - Share vLLM engines across processors
 * :ref:`Custom tokenizers <custom_tokenizers>` - Use vLLM tokenizers for models not supported by HuggingFace
@@ -340,6 +341,67 @@ Key differences for classification models:
 - Set ``chat_template_stage=False`` and ``detokenize_stage=False``
 - Use direct ``prompt`` input instead of ``messages``
 - Access classification logits through ``row["embeddings"]``
+
+.. _tpu_batch_inference:
+
+TPU batch inference
+-------------------
+
+.. note::
+    TPU batch inference is available as an **alpha** feature.
+
+Ray Data LLM runs a vLLM model replica across a multi-host TPU slice. Set
+``accelerator_type`` to your TPU generation and pass :class:`~ray.data.llm.TPUConfig`
+with the slice topology. Ray Data reserves the whole slice at once, so every worker
+lands on a single intact slice.
+
+.. code-block:: python
+
+    import ray
+    from ray.data.llm import TPUConfig, build_processor, vLLMEngineProcessorConfig
+
+    config = vLLMEngineProcessorConfig(
+        model_source="meta-llama/Llama-3.1-8B-Instruct",
+        accelerator_type="TPU-V6E",
+        accelerator_config=TPUConfig(topology="4x4"),
+        concurrency=1,
+        engine_kwargs={
+            "tensor_parallel_size": 16,
+            "pipeline_parallel_size": 1,
+            "data_parallel_size": 1,
+        },
+    )
+
+    ds = ray.data.from_items([
+        {"prompt": "What is the capital of France?"},
+        {"prompt": "Explain general relativity in simple terms."},
+    ])
+
+    with build_processor(config) as processor:
+        results = processor(ds).materialize()
+
+    for row in results.take_all():
+        print(row)
+
+The processor holds the TPU slice for as long as it's open. Leaving the context
+manager, or calling ``processor.close()``, releases the slice and rejects later calls
+to the processor. Materialize every Dataset the processor produces before you close it.
+
+This alpha release runs one model replica on one multi-host slice:
+
+- ``concurrency`` must be the integer ``1``. Autoscaling and multi-replica TPU pools
+  aren't supported.
+- ``tensor_parallel_size`` must equal the total chip count of the topology, such as
+  ``16`` for a v6e ``4x4`` slice.
+- ``pipeline_parallel_size`` and ``data_parallel_size`` must both be ``1``.
+- The topology must span more than one host. Single-host slices, such as v6e ``2x4``,
+  aren't supported yet.
+- ``placement_group_config`` isn't supported. The accelerator backend owns the slice
+  layout and placement.
+- ``RAY_TPU_RESOURCE_PER_CHIP`` must be ``1`` in the driver environment.
+- Ray Data selects vLLM's Ray executor. Don't override
+  ``distributed_executor_backend``.
+- Run one Dataset at a time per processor.
 
 .. _openai_compatible_api_endpoint:
 
