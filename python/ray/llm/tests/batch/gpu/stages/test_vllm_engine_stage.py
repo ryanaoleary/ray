@@ -16,7 +16,6 @@ from ray.llm._internal.batch.stages.vllm_engine_stage import (
     vLLMEngineWrapper,
     vLLMOutputData,
 )
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 @pytest.fixture
@@ -70,6 +69,11 @@ def mock_vllm_wrapper():
 
 
 def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
+    """Stage construction stays accelerator-neutral; GPU PG bundles are owned by the backend.
+
+    Accelerator token injection and bundle shape (F-8) are covered by
+    ``GPUAccelerator.build_batch_scheduling_plan`` tests that invoke ``ray_remote_args_fn``.
+    """
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
             model=model_llama_3_2_216M,
@@ -99,27 +103,17 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
             "distributed_executor_backend": "ray",
         },
     }
-    ray_remote_args_fn = stage.map_batches_kwargs.pop("ray_remote_args_fn")
-    compute = stage.map_batches_kwargs.pop("compute")
+    compute = stage.map_batches_kwargs.get("compute")
     assert isinstance(compute, ActorPoolStrategy)
     assert compute.min_size == 1
     assert compute.max_size == 1
-
-    assert stage.map_batches_kwargs == {
-        "zero_copy_batch": True,
-        "max_concurrency": 4,
-        "accelerator_type": gpu_type,
-        "num_gpus": 0,
-    }
-    scheduling_strategy = ray_remote_args_fn()["scheduling_strategy"]
-    assert isinstance(scheduling_strategy, PlacementGroupSchedulingStrategy)
-
-    bundle_specs = scheduling_strategy.placement_group.bundle_specs
-    assert len(bundle_specs) == 4
-    for bundle_spec in bundle_specs:
-        assert bundle_spec[f"accelerator_type:{gpu_type}"] == 0.001
-        assert bundle_spec["CPU"] == 1.0
-        assert bundle_spec["GPU"] == 1.0
+    assert stage.map_batches_kwargs["zero_copy_batch"] is True
+    assert stage.map_batches_kwargs["max_concurrency"] == 4
+    assert stage.map_batches_kwargs["accelerator_type"] == gpu_type
+    # Scheduling strategy / ray_remote_args_fn is supplied by the processor backend,
+    # not by stage.post_init.
+    assert "ray_remote_args_fn" not in stage.map_batches_kwargs
+    assert "num_gpus" not in stage.map_batches_kwargs
 
 
 @pytest.mark.asyncio

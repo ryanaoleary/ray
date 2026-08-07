@@ -253,7 +253,7 @@ class HardwareUsage:
         """Infer the GPU type from the hardware when the accelerator type on llm config is
         not specified.
         """
-        from ray.llm._internal.serve.core.configs.accelerators import AcceleratorType
+        from ray.llm._internal.common.accelerators import AcceleratorType
 
         all_accelerator_types = [t.value for t in AcceleratorType]
         gcs_client = ray.experimental.internal_kv.internal_kv_get_gcs_client()
