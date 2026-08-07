@@ -297,7 +297,14 @@ class _ManagedVLLMProcessor(Processor):
         self._lock = threading.Lock()
 
     def close(self) -> None:
-        """Idempotently and retry-safely release underlying batch resources."""
+        """Idempotently release driver-owned batch resources.
+
+        Marks the processor closed, then requests release of any owned handle.
+        If a custom handle's ``shutdown()`` raises, the handle is retained so a
+        later ``close()`` can retry. Production ``SlicePlacementGroup.shutdown()``
+        typically logs placement-group removal failures and returns successfully,
+        so driver exit remains the fallback fate-sharing boundary for those cases.
+        """
         with self._lock:
             self._closed = True
             if self._close_handle is None:
@@ -432,24 +439,40 @@ def build_vllm_engine_processor(
         runtime_env=config.runtime_env,
         concurrency=config.concurrency,
     )
-    acquired = backend.build_batch_scheduling_plan(request)
 
-    stages: List[StatefulStage] = []
+    # Resolve all stage configs before acquiring expensive accelerator resources
+    # (e.g. a TPU slice) so invalid stage configuration fails cheaply.
     processor_defaults = {
         "batch_size": config.batch_size,
         "concurrency": config.concurrency,
         "runtime_env": config.runtime_env,
         "model_source": config.model_source,
     }
+    prepare_multimodal_stage_cfg = resolve_stage_config(
+        config.prepare_multimodal_stage,
+        PrepareMultimodalStageConfig,
+        processor_defaults,
+    )
+    chat_template_stage_cfg = resolve_stage_config(
+        getattr(config, "chat_template_stage", config.apply_chat_template),
+        ChatTemplateStageConfig,
+        processor_defaults,
+    )
+    tokenize_stage_cfg = resolve_stage_config(
+        getattr(config, "tokenize_stage", config.tokenize),
+        TokenizerStageConfig,
+        processor_defaults,
+    )
+    detokenize_stage_cfg = resolve_stage_config(
+        getattr(config, "detokenize_stage", config.detokenize),
+        DetokenizeStageConfig,
+        processor_defaults,
+    )
 
+    acquired = backend.build_batch_scheduling_plan(request)
+
+    stages: List[StatefulStage] = []
     try:
-        # Resolve and build PrepareMultimodalStage if enabled.
-        prepare_multimodal_stage_cfg = resolve_stage_config(
-            config.prepare_multimodal_stage,
-            PrepareMultimodalStageConfig,
-            processor_defaults,
-        )
-
         if prepare_multimodal_stage_cfg.enabled:
             base_model_config_kwargs = (
                 prepare_multimodal_stage_cfg.model_config_kwargs or {}
@@ -471,12 +494,6 @@ def build_vllm_engine_processor(
                 )
             )
 
-        # Resolve and build ChatTemplateStage if enabled
-        chat_template_stage_cfg = resolve_stage_config(
-            getattr(config, "chat_template_stage", config.apply_chat_template),
-            ChatTemplateStageConfig,
-            processor_defaults,
-        )
         if chat_template_stage_cfg.enabled:
             stages.append(
                 ChatTemplateStage(
@@ -497,12 +514,6 @@ def build_vllm_engine_processor(
                 )
             )
 
-        # Resolve and build TokenizeStage if enabled
-        tokenize_stage_cfg = resolve_stage_config(
-            getattr(config, "tokenize_stage", config.tokenize),
-            TokenizerStageConfig,
-            processor_defaults,
-        )
         if tokenize_stage_cfg.enabled:
             stages.append(
                 TokenizeStage(
@@ -546,12 +557,6 @@ def build_vllm_engine_processor(
             )
         )
 
-        # Resolve and build DetokenizeStage if enabled
-        detokenize_stage_cfg = resolve_stage_config(
-            getattr(config, "detokenize_stage", config.detokenize),
-            DetokenizeStageConfig,
-            processor_defaults,
-        )
         if detokenize_stage_cfg.enabled:
             stages.append(
                 DetokenizeStage(

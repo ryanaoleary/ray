@@ -706,11 +706,12 @@ def test_direct_backend_validation_failures(monkeypatch):
 def test_single_host_topology_rejected(
     monkeypatch, accelerator_type, topology, total_chips
 ):
-    """Single-host slices carry no slice-name label, so they must reject early.
+    """Topologies that resolve to one TPU VM under Ray defaults reject early.
 
     ``SlicePlacementGroup`` only gang-schedules by slice name for multi-host
-    topologies. Accepting a single-host request would reserve a slice and then fail
-    validation, so the backend must reject before allocating anything.
+    topologies. Ambiguous shapes such as v6e ``2x4`` use Ray's default single-VM
+    layout in this MVP (no ``chips_per_vm``), so they are rejected before any
+    slice is reserved.
     """
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     slice_calls = []
@@ -1051,7 +1052,13 @@ def test_managed_processor_lifecycle_no_finalizer():
     assert fake_handle_del.shutdown_calls == 0
 
 
-def test_managed_processor_retry_safe_close():
+def test_managed_processor_shutdown_exception_retains_handle():
+    """If a custom handle's shutdown raises, close keeps the handle for another try.
+
+    Production SlicePlacementGroup.shutdown() typically logs PG removal failures and
+    returns successfully, so this exercises defensive handle retention rather than
+    guaranteed retry of Ray core PG removal.
+    """
     fake_handle = FakeSlicePlacementGroupHandle()
     proc_config = vLLMEngineProcessorConfig(
         model_source="test-model",

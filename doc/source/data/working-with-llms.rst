@@ -389,8 +389,10 @@ is open, so every worker lands on a single intact slice.
         print(row)
 
 The processor holds the TPU slice for as long as it's open. Leaving the context
-manager, or calling ``processor.close()``, releases the slice and rejects later calls
-to the processor. Materialize every Dataset the processor produces before you close it.
+manager, or calling ``processor.close()``, requests release of the slice placement
+group and rejects later calls to the processor. Ray logs placement-group removal
+failures; driver exit remains the fallback fate-sharing boundary. Materialize every
+Dataset the processor produces before you close it.
 
 This alpha release runs one model replica on one multi-host slice:
 
@@ -399,8 +401,9 @@ This alpha release runs one model replica on one multi-host slice:
 - ``tensor_parallel_size`` must equal the total chip count of the topology, such as
   ``16`` for a v6e ``4x4`` slice.
 - ``pipeline_parallel_size`` and ``data_parallel_size`` must both be ``1``.
-- The topology must span more than one host. Single-host slices, such as v6e ``2x4``,
-  aren't supported yet.
+- The topology must resolve to more than one TPU VM. Ambiguous topologies such as
+  v6e ``2x4`` use Ray's default single-VM layout in this alpha release and are
+  therefore rejected; use an unambiguous multi-VM topology such as v6e ``4x4``.
 - ``placement_group_config`` isn't supported. The accelerator backend owns the slice
   layout and placement.
 - TPU Batch fixes Ray's TPU resource-per-chip setting to ``1`` and rejects conflicting
