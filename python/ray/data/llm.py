@@ -17,9 +17,6 @@ from ray.llm._internal.batch.stages.configs import (
     PrepareMultimodalStageConfig as _PrepareMultimodalStageConfig,
     TokenizerStageConfig as _TokenizerStageConfig,
 )
-from ray.llm._internal.common.accelerators import (
-    TPUConfig as _TPUConfig,
-)
 from ray.util.annotations import PublicAPI
 
 logger = logging.getLogger(__name__)
@@ -46,17 +43,6 @@ class ProcessorConfig(_ProcessorConfig):
             If ``concurrency`` is an ``int`` ``n``, Ray uses either a fixed pool of ``n``
             workers or an autoscaling pool from ``1`` to ``n`` workers, depending on
             the processor and stage.
-    """
-
-    pass
-
-
-@PublicAPI(stability="alpha")
-class TPUConfig(_TPUConfig):
-    """Configuration for topology-backed TPU vLLM batch inference.
-
-    Args:
-        topology: Physical TPU topology string (e.g. '4x4', '2x2x2'). Required for multi-host TPU batch inference.
     """
 
     pass
@@ -752,7 +738,6 @@ def build_processor(
 
 
 __all__ = [
-    "TPUConfig",
     "ProcessorConfig",
     "Processor",
     "HttpRequestProcessorConfig",

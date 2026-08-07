@@ -625,8 +625,10 @@ class TPUAccelerator(AcceleratorBackend):
         )
         if not isinstance(tpu_config, TPUConfig) or not tpu_config.topology:
             raise ValueError(
-                "TPU batch inference requires an explicit `TPUConfig(topology=...)` "
-                f"(e.g. TPUConfig(topology='4x4')). Got config: {tpu_config}"
+                "TPU batch inference requires an explicit `accelerator_config` with "
+                "`kind='tpu'` and `topology=...` "
+                "(e.g. {'kind': 'tpu', 'topology': '4x4'}). "
+                f"Got config: {tpu_config}"
             )
 
         # The bundle layout below assumes one Ray TPU resource per physical chip.

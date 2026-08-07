@@ -351,19 +351,19 @@ TPU batch inference
     TPU batch inference is available as an **alpha** feature.
 
 Ray Data LLM runs a vLLM model replica across a multi-host TPU slice. Set
-``accelerator_type`` to your TPU generation and pass :class:`~ray.data.llm.TPUConfig`
-with the slice topology. Ray Data reserves the whole slice at once, so every worker
-lands on a single intact slice.
+``accelerator_type`` to your TPU generation and pass ``accelerator_config`` as a
+dict with ``kind="tpu"`` and the slice ``topology``. Ray Data reserves the whole
+slice at once, so every worker lands on a single intact slice.
 
 .. code-block:: python
 
     import ray
-    from ray.data.llm import TPUConfig, build_processor, vLLMEngineProcessorConfig
+    from ray.data.llm import build_processor, vLLMEngineProcessorConfig
 
     config = vLLMEngineProcessorConfig(
         model_source="meta-llama/Llama-3.1-8B-Instruct",
         accelerator_type="TPU-V6E",
-        accelerator_config=TPUConfig(topology="4x4"),
+        accelerator_config={"kind": "tpu", "topology": "4x4"},
         concurrency=1,
         engine_kwargs={
             "tensor_parallel_size": 16,

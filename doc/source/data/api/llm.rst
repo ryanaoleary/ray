@@ -36,16 +36,6 @@ Processor configs
     ~vLLMEngineProcessorConfig
     ~SGLangEngineProcessorConfig
 
-Accelerator configs
--------------------
-
-.. autosummary::
-    :nosignatures:
-    :template: autosummary/class_without_autosummary_noinheritance.rst
-    :toctree: doc/
-
-    ~TPUConfig
-
 .. _stage-configs-ref:
 
 Stage configs

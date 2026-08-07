@@ -126,8 +126,11 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
-        description="Accelerator configuration for the LLM stage (e.g. TPUConfig(topology='4x4')). "
-        "An omitted accelerator type preserves GPU batch behavior for this processor.",
+        description=(
+            "Accelerator configuration for the LLM stage. For TPU batch inference, "
+            "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'}. An omitted "
+            "accelerator type preserves GPU batch behavior for this processor."
+        ),
     )
 
     @field_validator("accelerator_config", mode="before")

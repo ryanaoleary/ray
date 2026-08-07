@@ -15,7 +15,6 @@ import pytest
 import ray
 from ray.data import ActorPoolStrategy
 from ray.data.llm import (
-    TPUConfig as PublicTPUConfig,
     build_processor,
     vLLMEngineProcessorConfig,
 )
@@ -154,15 +153,15 @@ def mock_tpu_slice_environment(monkeypatch):
 # -------------------------------------------------------------------------
 
 
-def test_public_tpu_config_wrapper():
-    """Verify public TPUConfig wrapper survives Pydantic model normalization."""
-    public_cfg = PublicTPUConfig(topology="4x4")
+def test_dict_accelerator_config_normalizes():
+    """Verify public dict accelerator_config normalizes to internal TPUConfig."""
     config = vLLMEngineProcessorConfig(
         model_source="test-model",
         accelerator_type="TPU-V6E",
-        accelerator_config=public_cfg,
+        accelerator_config={"kind": "tpu", "topology": "4x4"},
     )
     assert isinstance(config.accelerator_config, TPUConfig)
+    assert config.accelerator_config.kind == "tpu"
     assert config.accelerator_config.topology == "4x4"
 
 
@@ -479,7 +478,7 @@ def test_direct_backend_validation_failures(monkeypatch):
 
     # 1. Missing topology
     with pytest.raises(
-        ValueError, match="TPU batch inference requires an explicit `TPUConfig"
+        ValueError, match="TPU batch inference requires an explicit `accelerator_config"
     ):
         backend.build_batch_scheduling_plan(
             BatchSchedulingRequest(
