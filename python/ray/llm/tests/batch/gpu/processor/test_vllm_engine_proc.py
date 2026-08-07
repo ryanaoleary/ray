@@ -72,7 +72,6 @@ def test_vllm_engine_processor(
         "should_continue_on_error": False,
         "log_engine_metrics": True,
         "required_env_vars": None,
-        "reuse_current_placement_group": False,
     }
 
     runtime_env = stage.map_batches_kwargs.pop("runtime_env")

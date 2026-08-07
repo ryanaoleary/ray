@@ -5,6 +5,7 @@ import logging
 import threading
 from typing import Any, Dict, List, Optional
 
+import transformers
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 import ray
@@ -60,11 +61,8 @@ from ray.llm._internal.common.utils.download_utils import (
     NodeModelDownloadable,
     download_model_files,
 )
-from ray.llm._internal.common.utils.import_utils import try_import
 
 logger = logging.getLogger(__name__)
-
-transformers = try_import("transformers")
 
 DEFAULT_MODEL_ARCHITECTURE = "UNKNOWN_MODEL_ARCHITECTURE"
 
@@ -118,11 +116,18 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     # Custom placement group config for TP/PP.
     placement_group_config: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Ray placement group configuration for scheduling GPU vLLM engine workers. "
-        "Available only for GPU vLLM batch deployments; TPU-backed batch uses a backend-owned "
-        "topology layout. Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or 'bundles' "
-        "(full list of resource dicts). Optionally include 'strategy' key "
-        "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD').",
+        description=(
+            "Ray placement group configuration for scheduling GPU vLLM engine "
+            "workers. Topology-backed TPU batch inference manages placement "
+            "internally and does not accept this field. "
+            "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or "
+            "'bundles' (full list of resource dicts). Optionally include 'strategy' "
+            "key ('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
+            "Example with bundle_per_worker: "
+            "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
+            "Example with bundles: "
+            "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
+        ),
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
@@ -234,15 +239,19 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         elif self.accelerator_config is None:
             object.__setattr__(self, "accelerator_config", GPUConfig())
 
-        if (
-            isinstance(self.accelerator_config, TPUConfig)
-            and self.placement_group_config is not None
-        ):
-            raise ValueError(
-                "placement_group_config is not supported for topology-backed TPU "
-                "batch inference. The TPU slice bundle layout and placement are "
-                "managed by the accelerator backend."
-            )
+        if isinstance(self.accelerator_config, TPUConfig):
+            if not self.accelerator_config.topology:
+                raise ValueError(
+                    "TPU batch inference requires accelerator_config with "
+                    "kind='tpu' and topology=..., for example "
+                    "{'kind': 'tpu', 'topology': '4x4'}."
+                )
+            if self.placement_group_config is not None:
+                raise ValueError(
+                    "placement_group_config is not supported for topology-backed TPU "
+                    "batch inference. The TPU slice bundle layout and placement are "
+                    "managed by the accelerator backend."
+                )
 
         return self
 
@@ -345,6 +354,10 @@ def build_vllm_engine_processor(
 
     # Finish downloads and telemetry before acquiring accelerator slices so a
     # later failure does not leave a reserved TPU slice stranded.
+    # We download the config files here so that we can report the underlying
+    # architecture to the telemetry system. This should be a lightweight operation.
+    # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
+    # since custom model architectures require Python config files to be downloaded.
     trust_remote_code = config.engine_kwargs.get("trust_remote_code", False)
     if config.engine_kwargs.get(
         "load_format", None
@@ -365,6 +378,10 @@ def build_vllm_engine_processor(
             trust_remote_code=config.engine_kwargs.get("trust_remote_code", False),
         )
     except Exception:
+        # Failed to retrieve HuggingFace config for telemetry purposes.
+        # This is non-fatal: we fall back to DEFAULT_MODEL_ARCHITECTURE for telemetry.
+        # The actual model loading happens later in vLLM, which may support models
+        # that aren't available via HuggingFace's AutoConfig.
         logger.warning(
             f"Failed to retrieve HuggingFace config for {config.model_source}"
         )
@@ -403,9 +420,7 @@ def build_vllm_engine_processor(
         )
     )
 
-    backend = get_accelerator_backend(
-        config.accelerator_type, config.accelerator_config
-    )
+    backend = get_accelerator_backend(config.accelerator_config)
     request = BatchSchedulingRequest(
         accelerator_type=config.accelerator_type,
         accelerator_config=config.accelerator_config,
@@ -526,7 +541,6 @@ def build_vllm_engine_processor(
                     should_continue_on_error=config.should_continue_on_error,
                     log_engine_metrics=config.log_engine_metrics,
                     required_env_vars=acquired.plan.required_engine_env_vars,
-                    reuse_current_placement_group=acquired.plan.reuse_current_placement_group,
                 ),
                 map_batches_kwargs=vllm_map_batches_kwargs,
             )

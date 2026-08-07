@@ -23,7 +23,10 @@ else:
     MultiModalDataDict = Any
 
 from ray.llm._internal.batch.constants import TypeVLLMTaskType, vLLMTaskType
-from ray.llm._internal.batch.stages.base import StatefulStage, StatefulStageUDF
+from ray.llm._internal.batch.stages.base import (
+    StatefulStage,
+    StatefulStageUDF,
+)
 from ray.llm._internal.batch.stages.common import (
     maybe_convert_ndarray_to_list,
     truncate_str,
@@ -36,7 +39,6 @@ from ray.llm._internal.common.utils.download_utils import (
     download_model_files,
 )
 from ray.llm._internal.common.utils.lora_utils import download_lora_adapter
-from ray.util.placement_group import get_current_placement_group
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +69,7 @@ def _get_vllm_prompt_classes():
             from vllm.inputs.llm import TextPrompt, TokensPrompt
         except ImportError:
             # vLLM < 0.19: classes were re-exported from vllm.inputs directly.
-            from vllm.inputs import (
-                TextPrompt,  # type: ignore[no-redef]
-                TokensPrompt,
-            )
+            from vllm.inputs import TextPrompt, TokensPrompt  # type: ignore[no-redef]
         _VLLM_PROMPT_CLASSES = (TokensPrompt, TextPrompt)
     return _VLLM_PROMPT_CLASSES
 
@@ -242,8 +241,6 @@ class vLLMEngineWrapper:
             ``-1``) to disable the semaphore entirely.
         dynamic_lora_loading_path: The S3 path to the dynamic LoRA adapter.
         log_engine_metrics: Whether to export vLLM metrics to Ray's Prometheus endpoint.
-        reuse_current_placement_group: Whether to pin the engine's workers to the
-            placement group this actor is already scheduled in.
         **kwargs: The keyword arguments for the engine.
     """
 
@@ -253,7 +250,6 @@ class vLLMEngineWrapper:
         max_pending_requests: Optional[int] = None,
         dynamic_lora_loading_path: Optional[str] = None,
         log_engine_metrics: bool = True,
-        reuse_current_placement_group: bool = False,
         **kwargs,
     ):
         self.request_id = 0
@@ -321,14 +317,14 @@ class vLLMEngineWrapper:
                 "Metrics will be available at Ray's Prometheus endpoint."
             )
 
-        if reuse_current_placement_group:
-            self.engine = self._build_engine_in_current_placement_group(
-                engine_args, stat_loggers
-            )
-        else:
-            self.engine = vllm.AsyncLLMEngine.from_engine_args(
-                engine_args, stat_loggers=stat_loggers
-            )
+        # When this actor is already scheduled inside a placement group (e.g. a
+        # driver-owned TPU SlicePG), vLLM's create_engine_config() — called from
+        # from_engine_args — copies get_current_placement_group() into
+        # ParallelConfig.placement_group. Executors such as tpu_inference reuse
+        # that field rather than allocating a second placement group.
+        self.engine = vllm.AsyncLLMEngine.from_engine_args(
+            engine_args, stat_loggers=stat_loggers
+        )
 
         # The performance gets really bad if there are too many requests in the pending queue.
         # We work around it with semaphore to limit the number of concurrent requests in the engine.
@@ -359,69 +355,6 @@ class vLLMEngineWrapper:
         else:
             self.semaphore = asyncio.NullContext()
 
-    def _build_engine_in_current_placement_group(
-        self,
-        engine_args: Any,
-        stat_loggers: Optional[List[Any]],
-    ) -> Any:
-        """Build the engine so its workers land in this actor's placement group.
-
-        ``AsyncLLMEngine.from_engine_args`` resolves its own engine config, which
-        leaves ``parallel_config.placement_group`` unset. Some Ray executors, such as
-        tpu_inference's, then allocate a second placement group instead of resolving
-        the current one, and that request can never be satisfied while this
-        placement group holds the accelerators. Passing the group through the engine
-        config is the supported way to hand a pre-reserved topology to the executor.
-
-        Requires ``self._vllm_config`` to already exist (``__init__`` creates it via
-        ``engine_args.create_engine_config()`` before taking this branch) and vLLM V1.
-        """
-        if getattr(self, "_vllm_config", None) is None:
-            raise RuntimeError(
-                "vLLM engine config must be created before reusing the current "
-                "placement group. This indicates engine construction ran out of order."
-            )
-
-        try:
-            from vllm.v1.engine.async_llm import AsyncLLM
-            from vllm.v1.executor.abstract import Executor
-        except ImportError as e:
-            raise RuntimeError(
-                "Reusing a reserved placement group requires vLLM V1 "
-                "(vllm.v1.engine.async_llm.AsyncLLM). Install a vLLM build that "
-                "provides the V1 engine API."
-            ) from e
-
-        placement_group = get_current_placement_group()
-        if placement_group is None:
-            raise RuntimeError(
-                "The engine actor must run inside a placement group so the inference "
-                "engine can schedule its workers on the reserved accelerators, but "
-                "no current placement group was found. The scheduling strategy from "
-                "the accelerator backend did not take effect."
-            )
-
-        self._vllm_config.parallel_config.placement_group = placement_group
-        executor_class = Executor.get_class(self._vllm_config)
-        logger.info(
-            "Reusing the current placement group for the vLLM engine with executor "
-            "class %s.",
-            executor_class,
-        )
-        # Prefer enable_log_requests (current vLLM / Serve). Fall back to the older
-        # disable_log_requests polarity when that attribute is missing.
-        if hasattr(engine_args, "enable_log_requests"):
-            log_requests = engine_args.enable_log_requests
-        else:
-            log_requests = not getattr(engine_args, "disable_log_requests", True)
-        return AsyncLLM(
-            vllm_config=self._vllm_config,
-            executor_class=executor_class,
-            log_requests=log_requests,
-            log_stats=not engine_args.disable_log_stats,
-            stat_loggers=stat_loggers,
-        )
-
     async def _maybe_get_lora_request(
         self,
         row: Dict[str, Any],
@@ -442,6 +375,7 @@ class vLLMEngineWrapper:
 
         lora_request = None
         if "model" in row and row["model"] != self.model:
+
             lora_name = row["model"]
             if lora_name not in self.lora_name_to_request:
                 if is_remote_path(lora_name):
@@ -694,9 +628,9 @@ class vLLMEngineStageUDF(StatefulStageUDF):
         should_continue_on_error: bool = False,
         log_engine_metrics: bool = True,
         required_env_vars: Optional[Dict[str, str]] = None,
-        reuse_current_placement_group: bool = False,
     ):
-        """Initialize the vLLMEngineStageUDF.
+        """
+        Initialize the vLLMEngineStageUDF.
 
         Args:
             data_column: The data column name.
@@ -706,8 +640,10 @@ class vLLMEngineStageUDF(StatefulStageUDF):
             model: The model to use for the vLLM engine.
             engine_kwargs: The kwargs to pass to the vLLM engine.
             task_type: The task to use for the vLLM engine (e.g., "generate", "embed", etc).
-            max_pending_requests: The maximum number of pending requests. When None,
-                it is dynamically set based on the engine's scheduler config (using the
+            max_pending_requests: The maximum number of pending requests. If None,
+                it will be set to ``ceil(1.1 * max_num_seqs * pipeline_parallel_size)``,
+                where ``max_num_seqs`` and ``pipeline_parallel_size`` are read from
+                vLLM's resolved engine config (so the default tracks vLLM's
                 GPU-dependent ``max_num_seqs``, not a hardcoded value).
             dynamic_lora_loading_path: The path to the dynamic LoRA adapter. It is expected
                 to hold subfolders each for a different lora checkpoint.
@@ -720,8 +656,6 @@ class vLLMEngineStageUDF(StatefulStageUDF):
                 values in this actor. The accelerator backend sets them through the
                 actor's runtime environment; checking them here fails fast with an
                 actionable message if they did not propagate.
-            reuse_current_placement_group: If True, hand the actor's placement group to
-                the engine so its workers run on the accelerators reserved for it.
         """
         for name, required in (required_env_vars or {}).items():
             actual = os.environ.get(name)
@@ -768,7 +702,6 @@ class vLLMEngineStageUDF(StatefulStageUDF):
             max_pending_requests=max_pending_requests,
             dynamic_lora_loading_path=dynamic_lora_loading_path,
             log_engine_metrics=log_engine_metrics,
-            reuse_current_placement_group=reuse_current_placement_group,
             **self.engine_kwargs,
         )
         # The wrapper resolves a None into a concrete value using vLLM's
@@ -933,7 +866,9 @@ class vLLMEngineStageUDF(StatefulStageUDF):
 
 
 class vLLMEngineStage(StatefulStage):
-    """A stage that runs vLLM engine."""
+    """
+    A stage that runs vLLM engine.
+    """
 
     fn: Type[StatefulStageUDF] = vLLMEngineStageUDF
 

@@ -32,6 +32,7 @@ from ray.llm._internal.common.accelerators import (
     AcceleratorBackend,
     AnyAcceleratorConfig,
     BatchSchedulingRequest,
+    CPUAccelerator,
     CPUConfig,
     GPUAccelerator,
     GPUConfig,
@@ -227,13 +228,18 @@ def test_config_normalization_typed_tpu():
 
 
 def test_config_default_inference():
-    # 1. TPU accelerator_type with absent accelerator_config infers TPUConfig()
-    cfg_tpu = vLLMEngineProcessorConfig(
-        model_source="test-model",
-        accelerator_type="TPU-V6E",
-    )
-    assert isinstance(cfg_tpu.accelerator_config, TPUConfig)
-    assert cfg_tpu.accelerator_config.topology is None
+    # 1. TPU without topology fails at config construction
+    with pytest.raises(ValueError, match="requires accelerator_config"):
+        vLLMEngineProcessorConfig(
+            model_source="test-model",
+            accelerator_type="TPU-V6E",
+        )
+    with pytest.raises(ValueError, match="requires accelerator_config"):
+        vLLMEngineProcessorConfig(
+            model_source="test-model",
+            accelerator_type="TPU-V6E",
+            accelerator_config={"kind": "tpu"},
+        )
 
     # 2. GPU / absent accelerator_type with absent accelerator_config infers GPUConfig()
     cfg_gpu = vLLMEngineProcessorConfig(
@@ -368,11 +374,11 @@ def test_builder_to_backend_tpu(mock_tpu_slice_environment):
     assert strategy.placement_group_bundle_index == 0
     assert strategy.placement_group_capture_child_tasks is True
 
-    # The engine must reuse the reserved slice rather than let the vLLM executor
-    # allocate a second placement group, and it must verify the TPU environment
-    # reached the actor before initializing.
+    # The parent actor is scheduled into the SlicePG with child capture so
+    # vLLM from_engine_args can publish the current PG into ParallelConfig;
+    # required_env_vars fail fast if the TPU runtime env did not propagate.
     fn_kwargs = vllm_stage.fn_constructor_kwargs
-    assert fn_kwargs["reuse_current_placement_group"] is True
+    assert "reuse_current_placement_group" not in fn_kwargs
     assert fn_kwargs["required_env_vars"] == {
         "TPU_MULTIHOST_BACKEND": "ray",
         "RAY_TPU_RESOURCE_PER_CHIP": "1",
@@ -854,7 +860,19 @@ def test_slice_ready_timeout_is_configurable(monkeypatch):
     assert _slice_ready_timeout_s() == 12.5
 
     monkeypatch.setenv(SLICE_READY_TIMEOUT_ENV_VAR, "0")
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="must be a finite positive number"):
+        _slice_ready_timeout_s()
+
+    monkeypatch.setenv(SLICE_READY_TIMEOUT_ENV_VAR, "-1")
+    with pytest.raises(ValueError, match="must be a finite positive number"):
+        _slice_ready_timeout_s()
+
+    monkeypatch.setenv(SLICE_READY_TIMEOUT_ENV_VAR, "nan")
+    with pytest.raises(ValueError, match="must be a finite positive number"):
+        _slice_ready_timeout_s()
+
+    monkeypatch.setenv(SLICE_READY_TIMEOUT_ENV_VAR, "inf")
+    with pytest.raises(ValueError, match="must be a finite positive number"):
         _slice_ready_timeout_s()
 
     monkeypatch.setenv(SLICE_READY_TIMEOUT_ENV_VAR, "not-a-number")
@@ -1138,11 +1156,10 @@ def test_udf_accepts_satisfied_required_env_vars(monkeypatch, recording_engine_w
             "TPU_MULTIHOST_BACKEND": "ray",
             "RAY_TPU_RESOURCE_PER_CHIP": "1",
         },
-        reuse_current_placement_group=True,
     )
 
     assert len(recording_engine_wrapper) == 1
-    assert recording_engine_wrapper[0]["reuse_current_placement_group"] is True
+    assert "reuse_current_placement_group" not in recording_engine_wrapper[0]
 
 
 def test_udf_gpu_path_checks_no_env_vars(monkeypatch, recording_engine_wrapper):
@@ -1153,7 +1170,7 @@ def test_udf_gpu_path_checks_no_env_vars(monkeypatch, recording_engine_wrapper):
     _build_udf(required_env_vars=None)
 
     assert len(recording_engine_wrapper) == 1
-    assert recording_engine_wrapper[0]["reuse_current_placement_group"] is False
+    assert "reuse_current_placement_group" not in recording_engine_wrapper[0]
 
 
 # -------------------------------------------------------------------------
@@ -1192,9 +1209,9 @@ def test_production_plan_round_trips_through_pickle(mock_tpu_slice_environment):
     strategy = kwargs["scheduling_strategy"]
     assert strategy.placement_group_bundle_index == 0
     assert strategy.placement_group_capture_child_tasks is True
-    assert loaded.reuse_current_placement_group is True
     assert loaded.required_engine_env_vars == kwargs["runtime_env"]["env_vars"]
     assert not hasattr(loaded, "close_handle")
+    assert not hasattr(loaded, "reuse_current_placement_group")
 
 
 def test_fresh_interpreter_imports():
@@ -1209,34 +1226,16 @@ def test_fresh_interpreter_imports():
 
 
 def test_neutral_backend_factory():
-    """Factory is fail-closed on unknown TPU types, CPU, and type/config mismatches."""
+    """Factory dispatches on a fully resolved typed config only."""
     assert isinstance(
-        get_accelerator_backend(
-            accelerator_type="TPU-V6E", accelerator_config=TPUConfig()
-        ),
+        get_accelerator_backend(TPUConfig(topology="4x4")),
         TPUAccelerator,
     )
-    assert isinstance(
-        get_accelerator_backend(accelerator_config=GPUConfig()), GPUAccelerator
-    )
-    assert isinstance(
-        get_accelerator_backend(accelerator_type="TPU-V6E"), TPUAccelerator
-    )
-    assert isinstance(get_accelerator_backend(accelerator_type="A100"), GPUAccelerator)
-    assert isinstance(get_accelerator_backend(), GPUAccelerator)
+    assert isinstance(get_accelerator_backend(GPUConfig()), GPUAccelerator)
+    assert isinstance(get_accelerator_backend(CPUConfig()), CPUAccelerator)
 
-    with pytest.raises(ValueError, match="Unknown or unsupported TPU"):
-        get_accelerator_backend(accelerator_type="TPU-BOGUS")
-    with pytest.raises(ValueError, match="Explicit 'CPU' accelerator type"):
-        get_accelerator_backend(accelerator_type="CPU")
-    with pytest.raises(ValueError, match="CPUConfig is not supported"):
-        get_accelerator_backend(accelerator_config=CPUConfig())
-    with pytest.raises(ValueError, match="TPUConfig requires a TPU accelerator_type"):
-        get_accelerator_backend(accelerator_config=TPUConfig())
-    with pytest.raises(ValueError, match="GPUConfig cannot be used with TPU"):
-        get_accelerator_backend(
-            accelerator_type="TPU-V6E", accelerator_config=GPUConfig()
-        )
+    with pytest.raises(TypeError, match="Unsupported accelerator config"):
+        get_accelerator_backend(object())  # type: ignore[arg-type]
 
 
 def test_serve_shares_the_accelerator_definitions():
@@ -1272,7 +1271,6 @@ def test_gpu_build_batch_scheduling_plan_uni():
     )
 
     assert acquired.close_handle is None
-    assert acquired.plan.reuse_current_placement_group is False
     assert acquired.plan.required_engine_env_vars is None
     kwargs = acquired.plan.map_batches_kwargs
     assert kwargs["accelerator_type"] == "A100"
@@ -1312,7 +1310,6 @@ def test_gpu_build_batch_scheduling_plan_ray_executor(monkeypatch):
     )
 
     assert acquired.close_handle is None
-    assert acquired.plan.reuse_current_placement_group is False
     assert acquired.plan.required_engine_env_vars is None
     kwargs = acquired.plan.map_batches_kwargs
     assert kwargs["accelerator_type"] == "A100"

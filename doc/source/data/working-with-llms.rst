@@ -352,8 +352,13 @@ TPU batch inference
 
 Ray Data LLM runs a vLLM model replica across a multi-host TPU slice. Set
 ``accelerator_type`` to your TPU generation and pass ``accelerator_config`` as a
-dict with ``kind="tpu"`` and the slice ``topology``. Ray Data reserves the whole
-slice at once, so every worker lands on a single intact slice.
+dict with ``kind="tpu"`` and the slice ``topology``.
+
+``build_processor(...)`` acquires the TPU slice eagerly: it creates the slice
+placement group and may block while the slice is scheduled or provisioned. This
+differs from the GPU path, where placement-group creation remains lazy through
+Ray Data's worker creation path. The processor holds the slice for as long as it
+is open, so every worker lands on a single intact slice.
 
 .. code-block:: python
 
@@ -398,7 +403,8 @@ This alpha release runs one model replica on one multi-host slice:
   aren't supported yet.
 - ``placement_group_config`` isn't supported. The accelerator backend owns the slice
   layout and placement.
-- ``RAY_TPU_RESOURCE_PER_CHIP`` must be ``1`` in the driver environment.
+- TPU Batch fixes Ray's TPU resource-per-chip setting to ``1`` and rejects conflicting
+  driver or runtime-environment values.
 - Ray Data selects vLLM's Ray executor. Don't override
   ``distributed_executor_backend``.
 - Run one Dataset at a time per processor.

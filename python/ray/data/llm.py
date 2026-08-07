@@ -149,10 +149,15 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             (one per subfolder). If unset and LoRA is used, the ``model`` in a
             LoRA request is interpreted as a HF model ID.
         placement_group_config: Optional placement group config for scheduling
-            vLLM engine workers. Accepts ``bundle_per_worker`` (auto-replicated by
-            ``tp*pp``) or ``bundles`` (full list of resource dicts), plus an
-            optional ``strategy``
+            GPU vLLM engine workers. Topology-backed TPU batch inference manages
+            placement internally and does not accept this field. Accepts
+            ``bundle_per_worker`` (auto-replicated by ``tp*pp``) or ``bundles``
+            (full list of resource dicts), plus an optional ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
+        accelerator_config: Optional accelerator configuration for the LLM stage.
+            For TPU batch inference, pass a mapping such as
+            ``{"kind": "tpu", "topology": "4x4"}``. When omitted with a non-TPU
+            ``accelerator_type``, GPU batch behavior is preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

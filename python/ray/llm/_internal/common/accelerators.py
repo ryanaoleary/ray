@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import math
 import os
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -72,9 +73,10 @@ def _slice_ready_timeout_s() -> float:
         raise ValueError(
             f"{SLICE_READY_TIMEOUT_ENV_VAR} must be a number of seconds; got {raw!r}."
         ) from exc
-    if timeout_s <= 0:
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError(
-            f"{SLICE_READY_TIMEOUT_ENV_VAR} must be positive; got {timeout_s}."
+            f"{SLICE_READY_TIMEOUT_ENV_VAR} must be a finite positive number of "
+            f"seconds; got {timeout_s}."
         )
     return timeout_s
 
@@ -187,15 +189,11 @@ class BatchSchedulingPlan:
 
     Attributes:
         map_batches_kwargs: Ray Data ``map_batches`` arguments for the engine actor.
-        reuse_current_placement_group: If True, the engine must reuse the placement
-            group the actor is already scheduled in rather than let the inference
-            engine allocate its own.
         required_engine_env_vars: Environment variables that must already hold these
             exact values inside the engine actor before the engine initializes.
     """
 
     map_batches_kwargs: Dict[str, Any]
-    reuse_current_placement_group: bool = False
     required_engine_env_vars: Optional[Dict[str, str]] = None
 
 
@@ -770,9 +768,12 @@ class TPUAccelerator(AcceleratorBackend):
 
             _validate_selected_slice(handle, layout)
 
-            # The engine actor reserves CPU only: the TPU resources in every bundle
-            # are for the vLLM child workers, which the actor spawns into this same
-            # placement group via child-task capture.
+            # Schedule the Ray Data engine actor into the driver-owned SlicePG.
+            # Child-task capture keeps tpu_inference workers in the same PG.
+            # vLLM's create_engine_config() (via AsyncLLMEngine.from_engine_args)
+            # copies get_current_placement_group() into ParallelConfig.placement_group
+            # when running inside this actor; tpu_inference reuses that field and does
+            # not call get_current_placement_group() itself.
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=handle.placement_group,
                 placement_group_bundle_index=0,
@@ -787,9 +788,6 @@ class TPUAccelerator(AcceleratorBackend):
                     "scheduling_strategy": scheduling_strategy,
                     "runtime_env": merged_runtime_env,
                 },
-                # tpu_inference's Ray executor reuses a placement group only when the
-                # engine config carries one; it never resolves the current group.
-                reuse_current_placement_group=True,
                 required_engine_env_vars=dict(TPU_ENGINE_ENV_VARS),
             )
 
@@ -851,50 +849,18 @@ def _validate_selected_slice(
 
 
 def get_accelerator_backend(
-    accelerator_type: Optional[str] = None,
-    accelerator_config: Optional[AcceleratorConfig] = None,
+    accelerator_config: AcceleratorConfig,
 ) -> AcceleratorBackend:
-    """Resolve and instantiate the appropriate AcceleratorBackend.
+    """Instantiate an AcceleratorBackend for a fully resolved accelerator config.
 
-    Fail closed on unknown TPU spellings, explicit CPU, and type/config mismatches.
-    Public processor config validation is the primary guard; this factory is the
-    backstop for direct internal callers.
+    Callers (e.g. vLLM Batch processor config validation) must finish defaulting and
+    compatibility checks before invoking this helper. This function only dispatches
+    on the typed config.
     """
-    if (
-        accelerator_type is not None
-        and normalize_tpu_accelerator_type(accelerator_type)
-        == CPU_ACCELERATOR_TYPE_LITERAL
-    ):
-        raise ValueError(
-            "Explicit 'CPU' accelerator type is not supported for vLLM batch inference."
-        )
-
-    is_tpu_like = False
-    if accelerator_type is not None:
-        normalized = normalize_tpu_accelerator_type(accelerator_type)
-        if normalized.startswith("TPU"):
-            if normalized not in TPU_ACCELERATOR_VALUES:
-                raise ValueError(
-                    f"Unknown or unsupported TPU accelerator type: {accelerator_type!r}. "
-                    f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
-                )
-            is_tpu_like = True
-
-    if accelerator_config is None:
-        accelerator_config = TPUConfig() if is_tpu_like else GPUConfig()
-
-    if isinstance(accelerator_config, CPUConfig):
-        raise ValueError("CPUConfig is not supported for vLLM batch inference.")
     if isinstance(accelerator_config, TPUConfig):
-        if not is_tpu_like:
-            raise ValueError(
-                f"TPUConfig requires a TPU accelerator_type; got {accelerator_type!r}."
-            )
         return TPUAccelerator(accelerator_config)
     if isinstance(accelerator_config, GPUConfig):
-        if is_tpu_like:
-            raise ValueError(
-                f"GPUConfig cannot be used with TPU accelerator_type {accelerator_type!r}."
-            )
         return GPUAccelerator()
+    if isinstance(accelerator_config, CPUConfig):
+        return CPUAccelerator()
     raise TypeError(f"Unsupported accelerator config: {accelerator_config!r}")
