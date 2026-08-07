@@ -403,10 +403,15 @@ def build_vllm_engine_processor(
     tp_size = engine_kwargs.get("tensor_parallel_size", 1)
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
     dp_size = engine_kwargs.get("data_parallel_size", 1)
-    executor_backend = engine_kwargs.get(
-        "distributed_executor_backend",
-        "uni" if tp_size * pp_size == 1 else "ray",
-    )
+    if "distributed_executor_backend" in engine_kwargs:
+        executor_backend = engine_kwargs["distributed_executor_backend"]
+    elif isinstance(config.accelerator_config, TPUConfig):
+        # Topology-backed TPU always uses the Ray executor so one SlicePG owns
+        # both the parent actor and every TPU worker, including single-VM shapes.
+        executor_backend = "ray"
+    else:
+        # Preserve exact legacy GPU behavior.
+        executor_backend = "uni" if tp_size * pp_size == 1 else "ray"
     engine_kwargs["distributed_executor_backend"] = executor_backend
 
     telemetry_agent = get_or_create_telemetry_agent()

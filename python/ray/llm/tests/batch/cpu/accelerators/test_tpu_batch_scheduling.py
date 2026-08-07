@@ -428,6 +428,101 @@ def test_builder_returns_ordinary_processor_for_gpu(monkeypatch):
     assert type(processor) is Processor
 
 
+@pytest.mark.parametrize(
+    "topology, tensor_parallel_size, chips_per_vm",
+    [
+        ("1x1", 1, 1),
+        ("2x4", 8, 8),
+    ],
+)
+def test_builder_defaults_tpu_executor_backend_to_ray(
+    monkeypatch, topology, tensor_parallel_size, chips_per_vm
+):
+    """TPU topologies always default to the Ray executor, including single-chip 1x1."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    monkeypatch.setattr(
+        "ray.llm._internal.batch.processor.vllm_engine_proc.download_model_files",
+        lambda *args, **kwargs: "/tmp/mock-model",
+    )
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology=topology,
+        num_hosts=1,
+        chips_per_host=chips_per_vm,
+        slice_name=None,
+    )
+    _install_tpu_slice_fakes(monkeypatch, fake_handle)
+
+    config = vLLMEngineProcessorConfig(
+        model_source="test-model",
+        accelerator_type="TPU-V6E",
+        accelerator_config={"kind": "tpu", "topology": topology},
+        concurrency=1,
+        engine_kwargs={
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_parallel_size": 1,
+        },
+    )
+    assert "distributed_executor_backend" not in config.engine_kwargs
+
+    processor = build_processor(config)
+    assert isinstance(processor, _ManagedVLLMProcessor)
+    fn_kwargs = processor.get_stage_by_name("vLLMEngineStage").fn_constructor_kwargs
+    assert fn_kwargs["engine_kwargs"]["distributed_executor_backend"] == "ray"
+    # Caller config must remain unmodified.
+    assert "distributed_executor_backend" not in config.engine_kwargs
+    processor.close()
+    assert fake_handle.shutdown_calls == 1
+
+
+def test_builder_rejects_explicit_tpu_uni_executor(mock_tpu_slice_environment):
+    config = vLLMEngineProcessorConfig(
+        model_source="test-model",
+        accelerator_type="TPU-V6E",
+        accelerator_config={"kind": "tpu", "topology": "1x1"},
+        concurrency=1,
+        engine_kwargs={
+            "tensor_parallel_size": 1,
+            "distributed_executor_backend": "uni",
+        },
+    )
+    with pytest.raises(ValueError, match="executor_backend='ray'"):
+        build_processor(config)
+    assert mock_tpu_slice_environment.shutdown_calls == 0
+
+
+@pytest.mark.parametrize(
+    "tensor_parallel_size, expected_backend",
+    [
+        (1, "uni"),
+        (2, "ray"),
+    ],
+)
+def test_builder_preserves_gpu_executor_backend_defaults(
+    monkeypatch, tensor_parallel_size, expected_backend
+):
+    monkeypatch.setattr(
+        "ray.llm._internal.batch.processor.vllm_engine_proc.download_model_files",
+        lambda *args, **kwargs: "/tmp/mock-model",
+    )
+    config = vLLMEngineProcessorConfig(
+        model_source="test-model",
+        accelerator_type="A100",
+        accelerator_config=GPUConfig(),
+        concurrency=1,
+        engine_kwargs={
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_parallel_size": 1,
+        },
+    )
+    processor = build_processor(config)
+    assert type(processor) is Processor
+    fn_kwargs = processor.get_stage_by_name("vLLMEngineStage").fn_constructor_kwargs
+    assert (
+        fn_kwargs["engine_kwargs"]["distributed_executor_backend"] == expected_backend
+    )
+    assert "distributed_executor_backend" not in config.engine_kwargs
+
+
 def test_builder_cleanup_on_construction_failure(
     mock_tpu_slice_environment, monkeypatch, caplog
 ):
@@ -730,6 +825,7 @@ def test_default_topology_layouts(
     """Ray's default chips-per-VM resolution drives single- and multi-VM layouts."""
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     node_lookups = []
+    slice_kwargs = []
     fake_handle = FakeSlicePlacementGroupHandle(
         topology=topology,
         num_hosts=num_vms,
@@ -739,6 +835,7 @@ def test_default_topology_layouts(
     _install_tpu_slice_fakes(
         monkeypatch,
         fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
         on_nodes=lambda slice_name, nodes=None: (
             node_lookups.append(slice_name),
             _create_mock_v6e_nodes(num_hosts=num_vms, tpu_per_host=chips_per_vm),
@@ -767,10 +864,67 @@ def test_default_topology_layouts(
     assert len(fake_handle.placement_group.bundle_specs) == num_vms
     for bundle in fake_handle.placement_group.bundle_specs:
         assert bundle["TPU"] == float(chips_per_vm)
+    assert len(slice_kwargs) == 1
     if num_vms == 1:
         assert node_lookups == []
+        # Single-VM SlicePGs skip slice-name reservation; pin generation/topology.
+        generation = accelerator_type.lower().replace("tpu-", "")
+        expected_pod_type = f"{generation}-{total_chips}"
+        assert slice_kwargs[0]["bundle_label_selector"] == [
+            {
+                "ray.io/tpu-topology": topology,
+                "ray.io/tpu-pod-type": expected_pod_type,
+            }
+        ]
     else:
         assert node_lookups == ["tpu-slice-0"]
+        # Multi-VM path must not inject caller hardware labels.
+        assert slice_kwargs[0]["bundle_label_selector"] is None
+    acquired.close_handle.shutdown()
+
+
+def test_single_vm_slice_allocation_uses_topology_pod_type_labels(monkeypatch):
+    """v6e 2x4 must constrain SlicePG placement via TPU-native node labels."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="2x4", num_hosts=1, chips_per_host=8, slice_name=None
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+    )
+
+    acquired = TPUAccelerator().build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="2x4"),
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            executor_backend="ray",
+            concurrency=1,
+        )
+    )
+
+    assert slice_kwargs == [
+        {
+            "topology": "2x4",
+            "accelerator_version": "v6e",
+            "resources_per_bundle": {
+                "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
+            },
+            "bundle_label_selector": [
+                {
+                    "ray.io/tpu-topology": "2x4",
+                    "ray.io/tpu-pod-type": "v6e-8",
+                }
+            ],
+            "strategy": "SPREAD",
+            "tpu_resource_per_chip": 1,
+        }
+    ]
     acquired.close_handle.shutdown()
 
 
@@ -824,6 +978,7 @@ def test_slice_allocation_kwargs_and_head_release_ordering(monkeypatch):
             "resources_per_bundle": {
                 "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
             },
+            "bundle_label_selector": None,
             "strategy": "SPREAD",
             "tpu_resource_per_chip": 1,
         }

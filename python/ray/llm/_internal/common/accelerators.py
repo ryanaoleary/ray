@@ -20,6 +20,7 @@ import ray.util.accelerators.accelerators as accelerators
 from ray._private.accelerators.tpu import (
     get_chips_per_host,
     get_num_chips_from_topology,
+    infer_tpu_pod_type_from_topology,
 )
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -158,7 +159,7 @@ class TPUReplicaLayout:
     num_vms: int
 
     @property
-    def is_single_host(self) -> bool:
+    def is_single_vm(self) -> bool:
         return self.num_vms == 1
 
 
@@ -737,6 +738,26 @@ class TPUAccelerator(AcceleratorBackend):
             "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
         }
 
+        # Single-VM SlicePGs skip Ray's multi-host slice-name reservation, so the
+        # caller must constrain placement to the requested generation/topology.
+        # Multi-VM SlicePGs inject ray.io/tpu-slice-name themselves after head
+        # reservation; leave that path unchanged.
+        bundle_label_selector = None
+        if layout.is_single_vm:
+            pod_type = infer_tpu_pod_type_from_topology(
+                layout.topology, layout.accelerator_type
+            )
+            if not pod_type:
+                raise ValueError(
+                    f"Failed to infer TPU pod type for topology '{layout.topology}' "
+                    f"and accelerator_type '{layout.accelerator_type}'."
+                )
+            selector = {
+                _raylet.RAY_NODE_TPU_TOPOLOGY_KEY: layout.topology,
+                _raylet.RAY_NODE_TPU_POD_TYPE_KEY: pod_type,
+            }
+            bundle_label_selector = [dict(selector) for _ in range(layout.num_vms)]
+
         handle = None
         success = False
         timeout_s = _slice_ready_timeout_s()
@@ -746,6 +767,7 @@ class TPUAccelerator(AcceleratorBackend):
                 topology=layout.topology,
                 accelerator_version=layout.accelerator_version,
                 resources_per_bundle=resources_per_bundle,
+                bundle_label_selector=bundle_label_selector,
                 strategy="SPREAD",
                 tpu_resource_per_chip=1,
             )
@@ -852,7 +874,7 @@ def _validate_reserved_layout(handle: Any, layout: TPUReplicaLayout) -> None:
                 f"but layout requires TPU={layout.chips_per_vm}."
             )
 
-    if not layout.is_single_host:
+    if not layout.is_single_vm:
         _validate_multihost_slice_identity(handle, layout)
 
 
