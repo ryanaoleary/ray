@@ -413,6 +413,7 @@ def test_builder_to_backend_tpu(mock_tpu_slice_environment):
     processor = build_processor(config)
     assert isinstance(processor, _ManagedVLLMProcessor)
     assert isinstance(processor._close_handle.backend, TPUAccelerator)
+    assert processor._close_handle.wrapper is fake_handle
     assert processor._close_handle.backend._slice_pg_wrapper is fake_handle
 
     # Ensure config.engine_kwargs is not mutated
@@ -626,7 +627,7 @@ def test_builder_cleanup_on_construction_failure(
 
     assert fake_handle_failing.shutdown_calls == 1
     assert any(
-        "Failed to release TPU batch resources after processor construction failed"
+        "Failed to release accelerator batch resources after processor construction failed"
         in r.getMessage()
         for r in log_records
     )
@@ -1057,7 +1058,9 @@ def test_bundle_granularity_matrix(
             for s in selectors
         )
         assert slice_kwargs[0]["strategy"] == (
-            "SPREAD" if tpu_per_bundle is None else "PACK"
+            "SPREAD"
+            if tpu_per_bundle is None
+            else ("STRICT_PACK" if expected_bundles > 1 else "PACK")
         )
     else:
         assert slice_kwargs[0]["bundle_label_selector"] is None
@@ -1094,7 +1097,130 @@ def test_batch_cpu_floor_and_gpu_rejection(monkeypatch):
     assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
     acquired.close_handle.shutdown()
 
-    with pytest.raises(ValueError, match="GPU resources are not supported"):
+    for bad_pg in (
+        {"bundle_per_worker": {"GPU": 1, "TPU": 1}},
+        {"bundle_per_worker": {"GPU": 1}},
+        {"bundle_per_worker": {"GPU": 1, "TPU": 0}},
+    ):
+        with pytest.raises(ValueError, match="GPU resources are not supported"):
+            backend.build_batch_scheduling_plan(
+                BatchSchedulingRequest(
+                    accelerator_type="TPU-V6E",
+                    accelerator_config=TPUConfig(topology="4x4"),
+                    tensor_parallel_size=16,
+                    executor_backend="ray",
+                    placement_group_config=bad_pg,
+                    concurrency=1,
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "bad_bundle, match",
+    [
+        ({"TPU": 0}, "must be positive"),
+        ({"TPU": -1}, "must be positive"),
+        ({"TPU": 1.5}, "must be an integer"),
+    ],
+)
+def test_batch_rejects_invalid_explicit_tpu_templates(monkeypatch, bad_bundle, match):
+    """Explicit invalid TPU values must not fall back to Serve's TPU:1 default."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+    with pytest.raises(ValueError, match=match):
+        backend.build_batch_scheduling_plan(
+            BatchSchedulingRequest(
+                accelerator_type="TPU-V6E",
+                accelerator_config=TPUConfig(topology="4x4"),
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                placement_group_config={"bundle_per_worker": bad_bundle},
+                concurrency=1,
+            )
+        )
+
+
+def test_batch_cpu_only_template_preserves_tpu1_fallback(monkeypatch):
+    """Omitting TPU still uses Serve-compatible chips-per-VM fill (TPU:1 here)."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="4x4", num_hosts=4, chips_per_host=4
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+    )
+    acquired = TPUAccelerator(TPUConfig(topology="4x4")).build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="4x4"),
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={"bundle_per_worker": {"CPU": 4}},
+            concurrency=1,
+        )
+    )
+    assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
+    assert slice_kwargs[-1]["resources_per_bundle"]["CPU"] == float(
+        PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
+    )
+    acquired.close_handle.shutdown()
+
+
+def test_single_vm_multi_bundle_upgrades_pack_to_strict_pack(monkeypatch):
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="2x4", num_hosts=1, chips_per_host=8, slice_name=None
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+    )
+    acquired = TPUAccelerator(TPUConfig(topology="2x4")).build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="2x4"),
+            tensor_parallel_size=8,
+            executor_backend="ray",
+            placement_group_config={
+                "bundle_per_worker": {"TPU": 1},
+                "strategy": "PACK",
+            },
+            concurrency=1,
+        )
+    )
+    assert fake_handle.num_bundles == 8
+    assert slice_kwargs[-1]["strategy"] == "STRICT_PACK"
+    acquired.close_handle.shutdown()
+
+
+def test_single_vm_multi_bundle_rejects_spread(monkeypatch):
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    backend = TPUAccelerator(TPUConfig(topology="2x4"))
+    with pytest.raises(ValueError, match="PACK/STRICT_PACK"):
+        backend.build_batch_scheduling_plan(
+            BatchSchedulingRequest(
+                accelerator_type="TPU-V6E",
+                accelerator_config=TPUConfig(topology="2x4"),
+                tensor_parallel_size=8,
+                executor_backend="ray",
+                placement_group_config={
+                    "bundle_per_worker": {"TPU": 1},
+                    "strategy": "SPREAD",
+                },
+                concurrency=1,
+            )
+        )
+
+
+def test_multi_vm_rejects_strict_pack_and_impossible_strict_spread(monkeypatch):
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+    with pytest.raises(ValueError, match="STRICT_PACK cannot represent"):
         backend.build_batch_scheduling_plan(
             BatchSchedulingRequest(
                 accelerator_type="TPU-V6E",
@@ -1102,7 +1228,22 @@ def test_batch_cpu_floor_and_gpu_rejection(monkeypatch):
                 tensor_parallel_size=16,
                 executor_backend="ray",
                 placement_group_config={
-                    "bundle_per_worker": {"GPU": 1, "TPU": 1},
+                    "bundle_per_worker": {"TPU": 4},
+                    "strategy": "STRICT_PACK",
+                },
+                concurrency=1,
+            )
+        )
+    with pytest.raises(ValueError, match="STRICT_SPREAD requires one node per bundle"):
+        backend.build_batch_scheduling_plan(
+            BatchSchedulingRequest(
+                accelerator_type="TPU-V6E",
+                accelerator_config=TPUConfig(topology="4x4"),
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                placement_group_config={
+                    "bundle_per_worker": {"TPU": 1},
+                    "strategy": "STRICT_SPREAD",
                 },
                 concurrency=1,
             )
@@ -1524,6 +1665,37 @@ def test_managed_processor_shutdown_exception_retains_handle():
     # Second close attempt retries and succeeds
     proc.close()
     assert proc._close_handle is None
+    assert fake_handle.shutdown_calls == 1
+
+
+def test_batch_owned_tpu_resources_retains_wrapper_until_success():
+    """Production Batch close handle must keep the SlicePG wrapper for retry."""
+    from ray.llm._internal.common.accelerators import _BatchOwnedTPUResources
+
+    fake_handle = FakeSlicePlacementGroupHandle()
+    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+    backend._slice_pg_wrapper = fake_handle
+
+    first_attempt = True
+
+    def failing_shutdown():
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            raise ConnectionError("Transient network failure")
+        fake_handle.shutdown_calls += 1
+
+    fake_handle.shutdown = failing_shutdown
+    close_handle = _BatchOwnedTPUResources(backend=backend, wrapper=fake_handle)
+
+    with pytest.raises(ConnectionError, match="Transient network failure"):
+        close_handle.shutdown()
+    assert close_handle.wrapper is fake_handle
+    assert backend._slice_pg_wrapper is fake_handle
+
+    close_handle.shutdown()
+    assert close_handle.wrapper is None
+    assert backend._slice_pg_wrapper is None
     assert fake_handle.shutdown_calls == 1
 
 

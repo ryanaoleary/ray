@@ -118,15 +118,17 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         default=None,
         description=(
             "Ray placement group configuration for scheduling vLLM engine "
-            "workers. For GPU Batch, this controls worker bundles as before. "
-            "For topology-backed TPU Batch, a homogeneous TPU worker template "
-            "controls executor bundle granularity while the topology still "
-            "selects the physical TPU slice (e.g. "
-            "{'bundle_per_worker': {'TPU': 1}} for per-chip workers). "
-            "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or "
-            "'bundles' (full list of resource dicts). Optionally include 'strategy' "
-            "key ('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
-            "Example with bundle_per_worker: "
+            "workers. For GPU Batch, `bundle_per_worker` is replicated by "
+            "tp*pp and `bundles` specifies the full placement-group bundle "
+            "list. For topology-backed TPU Batch, these fields provide a "
+            "homogeneous worker-resource template; the physical topology and "
+            "TPU resources per bundle determine the actual SlicePG bundle "
+            "count (e.g. {'bundle_per_worker': {'TPU': 1}} for per-chip "
+            "workers on a topology-selected slice). Optionally include "
+            "'strategy' ('PACK', 'STRICT_PACK', 'SPREAD', or "
+            "'STRICT_SPREAD'). Single-VM TPU layouts with multiple worker "
+            "bundles require PACK/STRICT_PACK (Batch upgrades PACK to "
+            "STRICT_PACK). Example with bundle_per_worker: "
             "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
             "Example with bundles: "
             "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
@@ -526,8 +528,8 @@ def build_vllm_engine_processor(
                 )
             )
 
-        # TPU pins concurrency to 1, which yields a single-actor pool through the
-        # same ActorPoolStrategy path as GPU.
+        # Use the configured actor-pool concurrency; accelerator-specific
+        # constraints are validated by the selected backend.
         compute = ray.data.ActorPoolStrategy(
             **config.get_concurrency(autoscaling_enabled=True),
             max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
@@ -594,8 +596,9 @@ def build_vllm_engine_processor(
                 acquired.close_handle.shutdown()
             except Exception:
                 logger.exception(
-                    "Failed to release TPU batch resources after processor construction "
-                    "failed; the slice may remain allocated until the driver exits."
+                    "Failed to release accelerator batch resources after processor "
+                    "construction failed; resources may remain allocated until the "
+                    "driver exits."
                 )
         raise
 

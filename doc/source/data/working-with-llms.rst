@@ -407,12 +407,15 @@ This alpha release runs one model replica on one complete TPU topology:
   Explicit ``chips_per_vm`` overrides for ambiguous topologies are not exposed yet.
 - By default, Ray Data creates one SlicePG bundle per TPU VM (for example v6e
   ``4x4`` → four bundles with ``TPU:4``). Use ``placement_group_config`` with a
-  homogeneous TPU worker template to change executor granularity while keeping the
-  same physical topology — for example
+  homogeneous worker-resource template to change executor granularity while
+  keeping the same physical topology — for example
   ``{"bundle_per_worker": {"TPU": 1}}`` creates one bundle per chip
-  (v6e ``4x4`` → 16 bundles). Ray Data may raise the per-bundle CPU reservation
-  so the engine parent can sit in bundle 0. Topology-backed TPU ``bundles`` must
-  be homogeneous.
+  (v6e ``4x4`` → 16 bundles). The template length is not authoritative for TPU;
+  topology and TPU-per-bundle determine the SlicePG bundle count. Ray Data may
+  raise the per-bundle CPU reservation so the engine parent can sit in bundle 0.
+  Topology-backed TPU templates must be homogeneous. Single-VM layouts with
+  multiple worker bundles require ``PACK``/``STRICT_PACK`` so every bundle stays
+  on the same physical TPU VM.
 - TPU Batch fixes Ray's TPU resource-per-chip setting to ``1`` and rejects conflicting
   driver or runtime-environment values.
 - Ray Data selects vLLM's Ray executor for both single-host and multi-host topologies.

@@ -149,14 +149,15 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             (one per subfolder). If unset and LoRA is used, the ``model`` in a
             LoRA request is interpreted as a HF model ID.
         placement_group_config: Optional placement group config for scheduling
-            vLLM engine workers. For GPU, behavior is unchanged. For
-            topology-backed TPU Batch, a homogeneous TPU worker template controls
-            executor bundle granularity while the topology selects the physical
-            slice (for example ``{"bundle_per_worker": {"TPU": 1}}`` for per-chip
-            workers). Accepts ``bundle_per_worker`` (auto-replicated by
-            ``tp*pp``) or ``bundles`` (full list of resource dicts), plus an
-            optional ``strategy``
-            (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
+            vLLM engine workers. For GPU, ``bundle_per_worker`` is replicated by
+            ``tp*pp`` and ``bundles`` specifies the full placement-group bundle
+            list. For topology-backed TPU Batch, these fields provide a
+            homogeneous worker-resource template; the physical topology and TPU
+            resources per bundle determine the actual SlicePG bundle count (for
+            example ``{"bundle_per_worker": {"TPU": 1}}`` for per-chip workers).
+            Optional ``strategy`` is ``PACK``/``STRICT_PACK``/``SPREAD``/
+            ``STRICT_SPREAD``; single-VM TPU layouts with multiple worker
+            bundles require ``PACK``/``STRICT_PACK``.
         accelerator_config: Optional accelerator configuration for the LLM stage.
             For TPU batch inference, pass a mapping such as
             ``{"kind": "tpu", "topology": "4x4"}``. When omitted with a non-TPU

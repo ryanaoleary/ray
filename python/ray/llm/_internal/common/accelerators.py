@@ -214,15 +214,26 @@ class _BatchOwnedTPUResources:
     Batch construction cleanup needs failures to propagate so the processor
     builder can log them, so Batch returns this thin handle instead of the
     backend instance itself.
+
+    The wrapper is retained until ``shutdown()`` succeeds so
+    ``_ManagedVLLMProcessor.close()`` can retry after a transient failure.
     """
 
     backend: "TPUAccelerator"
+    wrapper: Any
 
     def shutdown(self) -> None:
-        wrapper = self.backend._slice_pg_wrapper
-        self.backend._slice_pg_wrapper = None
-        if wrapper is not None:
-            wrapper.shutdown()
+        if self.wrapper is None:
+            return
+
+        wrapper = self.wrapper
+        wrapper.shutdown()
+
+        # Only clear ownership after a successful shutdown so a retained
+        # close handle can retry the same SlicePG.
+        if self.backend._slice_pg_wrapper is wrapper:
+            self.backend._slice_pg_wrapper = None
+        self.wrapper = None
 
 
 @dataclass
@@ -774,6 +785,58 @@ class TPUAccelerator(AcceleratorBackend):
             )
         return tpu_i
 
+    def _validate_batch_tpu_template_bundles(
+        self,
+        bundles: List[Dict[str, float]],
+        layout: TPUReplicaLayout,
+    ) -> None:
+        """Reject invalid Batch templates before Serve's TPU:1 fallback can mask them.
+
+        Omitting ``TPU`` remains valid (Serve-compatible chips-per-VM default).
+        Explicit ``TPU`` values and any ``GPU`` must fail fast.
+        """
+        for bundle in bundles:
+            gpu = bundle.get("GPU", 0)
+            if gpu > 0:
+                raise ValueError(
+                    "GPU resources are not supported in topology-backed TPU Batch "
+                    f"placement_group_config bundles; got GPU={gpu!r}."
+                )
+            if "TPU" in bundle:
+                self._validate_tpu_per_bundle(bundle["TPU"], layout)
+
+    @staticmethod
+    def _resolve_batch_slice_strategy(
+        *,
+        requested_strategy: str,
+        layout: TPUReplicaLayout,
+        num_bundles: int,
+    ) -> str:
+        """Enforce topology-safe SlicePG strategies for Batch execution layouts."""
+        strategy = requested_strategy
+        if layout.is_single_vm and num_bundles > 1:
+            if strategy not in ("PACK", "STRICT_PACK"):
+                raise ValueError(
+                    "Single-VM TPU topologies with multiple worker bundles require "
+                    "PACK/STRICT_PACK so every bundle remains on the same TPU VM; "
+                    f"got strategy={strategy!r}."
+                )
+            # PACK prefers one node but is not a hard invariant; STRICT_PACK is.
+            return "STRICT_PACK"
+
+        if not layout.is_single_vm:
+            if strategy == "STRICT_PACK":
+                raise ValueError(
+                    "STRICT_PACK cannot represent a multi-VM TPU topology "
+                    f"({layout.num_vms} VMs for topology '{layout.topology}')."
+                )
+            if strategy == "STRICT_SPREAD" and num_bundles > layout.num_vms:
+                raise ValueError(
+                    "STRICT_SPREAD requires one node per bundle, but this topology "
+                    f"has {layout.num_vms} physical TPU VMs and {num_bundles} bundles."
+                )
+        return strategy
+
     def build_batch_scheduling_plan(
         self, request: BatchSchedulingRequest
     ) -> AcquiredBatchResources:
@@ -890,10 +953,11 @@ class TPUAccelerator(AcceleratorBackend):
             template_bundles = self._expand_placement_group_bundles(
                 pg_config, num_devices=request.model_world_size
             )
+            # Validate before Serve's shared helper can fall back to TPU:1 and
+            # hide explicit invalid TPU/GPU templates.
+            self._validate_batch_tpu_template_bundles(template_bundles, layout)
             worker_template = self._resolve_topology_worker_bundle(template_bundles)
             resources_per_bundle = self._apply_batch_cpu_floor(worker_template)
-            if "TPU" in resources_per_bundle:
-                self._validate_tpu_per_bundle(resources_per_bundle["TPU"], layout)
 
         expected_num_bundles, expected_bundle_resources = get_tpu_worker_resources(
             topology=layout.topology,
@@ -901,6 +965,11 @@ class TPUAccelerator(AcceleratorBackend):
             resources_per_worker=resources_per_bundle,
             num_slices=1,
             tpu_resource_per_chip=1,
+        )
+        strategy = self._resolve_batch_slice_strategy(
+            requested_strategy=strategy,
+            layout=layout,
+            num_bundles=expected_num_bundles,
         )
 
         # Single-VM SlicePGs skip Ray's multi-host slice-name reservation, so the
@@ -987,7 +1056,8 @@ class TPUAccelerator(AcceleratorBackend):
 
             success = True
             return AcquiredBatchResources(
-                plan=plan, close_handle=_BatchOwnedTPUResources(self)
+                plan=plan,
+                close_handle=_BatchOwnedTPUResources(backend=self, wrapper=handle),
             )
 
         finally:
