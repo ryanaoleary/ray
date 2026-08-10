@@ -1361,6 +1361,23 @@ def test_derive_layout_v6e_2x4_chips_per_vm_override():
 
 
 @pytest.mark.parametrize(
+    "version, expected",
+    [
+        ("v2", 1),
+        ("v3", 1),
+        ("v4", 1),
+        ("v5p", 1),
+        ("v5litepod", 1),
+        ("v6e", 1),
+        ("v7x", 2),
+    ],
+)
+def test_executor_devices_per_chip(version, expected):
+    """Lock the all-generation framework-device contract (v7x-only = 2)."""
+    assert TPUAccelerator._resolve_executor_devices_per_chip(version) == expected
+
+
+@pytest.mark.parametrize(
     "topology, total_chips, chips_per_vm, num_vms, total_devices",
     [
         ("2x2x1", 4, 4, 1, 8),

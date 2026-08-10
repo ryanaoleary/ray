@@ -799,10 +799,11 @@ class TPUAccelerator(AcceleratorBackend):
     def _resolve_executor_devices_per_chip(accelerator_version: str) -> int:
         """Framework-visible devices per physical chip for vLLM TP sizing.
 
-        Only Ironwood (v7x) is special-cased today: two chiplets → two framework
-        devices per physical chip. All other accepted TPU generations, including
-        dual-core MegaCore families, keep one device per chip until evidence
-        says otherwise. This is independent of ``RAY_TPU_RESOURCE_PER_CHIP``.
+        This is the vLLM/framework execution-device count, not the TPU core
+        count Ray uses for pod-type naming (e.g. v4-8). Among currently
+        accepted generations, only v7x exposes two framework devices per
+        physical chip; every other generation maps one chip to one device.
+        Independent of ``RAY_TPU_RESOURCE_PER_CHIP``.
         """
         if accelerator_version.strip().lower() == "v7x":
             return 2
