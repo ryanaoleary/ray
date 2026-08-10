@@ -1141,7 +1141,10 @@ def test_batch_rejects_invalid_explicit_tpu_templates(monkeypatch, bad_bundle, m
 
 
 def test_batch_cpu_only_template_preserves_tpu1_fallback(monkeypatch):
-    """Omitting TPU still uses Serve-compatible chips-per-VM fill (TPU:1 here)."""
+    """Omitting TPU with an explicit PG config keeps Serve's TPU:1 fallback.
+
+    Chips-per-VM fill is only used when ``placement_group_config`` is ``None``.
+    """
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     slice_kwargs = []
     fake_handle = FakeSlicePlacementGroupHandle(

@@ -792,8 +792,9 @@ class TPUAccelerator(AcceleratorBackend):
     ) -> None:
         """Reject invalid Batch templates before Serve's TPU:1 fallback can mask them.
 
-        Omitting ``TPU`` remains valid (Serve-compatible chips-per-VM default).
-        Explicit ``TPU`` values and any ``GPU`` must fail fast.
+        Omitting ``TPU`` remains valid and keeps Serve's ``{"TPU": 1}`` fallback.
+        Chips-per-VM fill applies only when ``placement_group_config`` is omitted
+        entirely. Explicit ``TPU`` values and any ``GPU`` must fail fast.
         """
         for bundle in bundles:
             gpu = bundle.get("GPU", 0)
