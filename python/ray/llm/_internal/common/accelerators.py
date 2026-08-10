@@ -582,18 +582,36 @@ class TPUAccelerator(AcceleratorBackend):
                 "`accelerator_type` must be specified when `topology` is present "
                 "in order to compute TPU resource requirements."
             )
+        topology = self._config.topology.strip().lower()
         version = get_tpu_version_from_type(accelerator_type_str)
-        chips_per_host = get_chips_per_host(self._config.topology, version)
-
-        if num_devices > chips_per_host and num_devices % chips_per_host != 0:
+        total_chips = get_num_chips_from_topology(topology)
+        chips_per_host = self._resolve_chips_per_vm(
+            self._config.chips_per_vm,
+            topology=topology,
+            accelerator_version=version,
+            total_chips=total_chips,
+            default_chips_per_vm=get_chips_per_host(topology, version),
+        )
+        # Serve passes TP×PP as num_devices (framework devices). Convert to
+        # physical chips before packing hosts so v7x (2 devices/chip) and
+        # chips_per_vm overrides share one physical host model.
+        devices_per_chip = self._resolve_executor_devices_per_chip(version)
+        if num_devices % devices_per_chip != 0:
             raise ValueError(
                 f"num_devices ({num_devices}) must be a multiple of "
+                f"devices_per_chip ({devices_per_chip}) for {version}."
+            )
+        num_chips = num_devices // devices_per_chip
+
+        if num_chips > chips_per_host and num_chips % chips_per_host != 0:
+            raise ValueError(
+                f"Physical chip count ({num_chips}) must be a multiple of "
                 f"chips_per_host ({chips_per_host}) for TPU topologies."
             )
 
-        num_hosts = max(1, num_devices // chips_per_host)
+        num_hosts = max(1, num_chips // chips_per_host)
 
-        tpu_resources = min(num_devices, chips_per_host)
+        tpu_resources = min(num_chips, chips_per_host)
         bundle = {"TPU": tpu_resources}
         bundle[format_ray_accelerator_resource(accelerator_type_str)] = 0.001
 
@@ -781,9 +799,10 @@ class TPUAccelerator(AcceleratorBackend):
     def _resolve_executor_devices_per_chip(accelerator_version: str) -> int:
         """Framework-visible devices per physical chip for vLLM TP sizing.
 
-        v5e/v6e expose one device per chip. Ironwood (v7x) exposes two chiplets
-        per physical chip. This is independent of ``RAY_TPU_RESOURCE_PER_CHIP``,
-        which is left at 1 until Ironwood Ray resource advertising is measured.
+        Only Ironwood (v7x) is special-cased today: two chiplets → two framework
+        devices per physical chip. All other accepted TPU generations, including
+        dual-core MegaCore families, keep one device per chip until evidence
+        says otherwise. This is independent of ``RAY_TPU_RESOURCE_PER_CHIP``.
         """
         if accelerator_version.strip().lower() == "v7x":
             return 2
@@ -1106,9 +1125,18 @@ class TPUAccelerator(AcceleratorBackend):
             )
             # Validate before Serve's shared helper can fall back to TPU:1 and
             # hide explicit invalid TPU/GPU templates. When TPU is omitted, use a
-            # Batch-only fallback that preserves CPU/custom resources.
+            # Batch-only fallback that preserves CPU/custom resources. Mixing
+            # TPU-bearing and non-TPU bundles would silently drop resources via
+            # Serve's TPU-only filter, so reject that for Batch.
             self._validate_batch_tpu_template_bundles(template_bundles, layout)
-            if any(bundle.get("TPU", 0) > 0 for bundle in template_bundles):
+            has_positive_tpu = [bundle.get("TPU", 0) > 0 for bundle in template_bundles]
+            if any(has_positive_tpu) and not all(has_positive_tpu):
+                raise ValueError(
+                    "Topology-backed TPU Batch placement_group_config bundles "
+                    "must be homogeneous; TPU-bearing and non-TPU bundles "
+                    "cannot be mixed."
+                )
+            if all(has_positive_tpu) and has_positive_tpu:
                 worker_template = self._resolve_topology_worker_bundle(template_bundles)
             else:
                 worker_template = self._resolve_batch_tpu1_fallback_template(
@@ -1261,7 +1289,10 @@ def _validate_reserved_layout(
             f"Reserved SlicePlacementGroup reports {handle.chips_per_host} chips per "
             f"host, but layout requires {layout.chips_per_vm}."
         )
-    # While RAY_TPU_RESOURCE_PER_CHIP == 1, logical devices equal physical chips.
+    # SlicePlacementGroup.devices_per_host represents Ray logical TPU
+    # resources per host. With RAY_TPU_RESOURCE_PER_CHIP=1 this equals
+    # the physical chip count; it is independent of framework devices
+    # (TPUReplicaLayout.devices_per_chip / total_devices).
     if getattr(handle, "devices_per_host", None) != layout.chips_per_vm:
         raise RuntimeError(
             f"Reserved SlicePlacementGroup reports {handle.devices_per_host} devices "

@@ -1493,6 +1493,172 @@ def test_serve_create_placement_group_forwards_chips_per_vm(monkeypatch):
     backend.shutdown()
 
 
+def test_serve_default_bundles_respects_chips_per_vm():
+    """Serve default_bundles must pack hosts with the resolved chips_per_vm."""
+    backend = TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4))
+    bundles = backend.default_bundles(
+        num_devices=8,
+        accelerator_type_str="TPU-V6E",
+    )
+    assert bundles == [
+        {"TPU": 4, "accelerator_type:TPU-V6E": 0.001},
+        {"TPU": 4, "accelerator_type:TPU-V6E": 0.001},
+    ]
+
+
+def test_serve_default_bundles_then_create_pg_with_chips_per_vm(monkeypatch):
+    """Serve placement_bundles path: default_bundles + create_placement_group."""
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="2x4", num_hosts=2, chips_per_host=4, slice_name="tpu-slice-0"
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+    )
+    backend = TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4))
+    bundles = backend.default_bundles(
+        num_devices=8,
+        accelerator_type_str="TPU-V6E",
+    )
+    assert len(bundles) == 2
+    assert all(b["TPU"] == 4 for b in bundles)
+
+    pg = backend.create_placement_group(
+        bundles=bundles,
+        strategy="PACK",
+        name="serve-tpu-replica",
+        accelerator_type_str="TPU-V6E",
+    )
+    assert pg is fake_handle.placement_group
+    assert slice_kwargs[0]["chips_per_vm"] == 4
+    assert slice_kwargs[0]["resources_per_bundle"]["TPU"] == 4
+    backend.shutdown()
+
+
+def test_serve_default_bundles_v7x_converts_framework_devices_to_chips():
+    """Serve num_devices is TP (framework devices); pack hosts by physical chips."""
+    backend = TPUAccelerator(TPUConfig(topology="2x2x1"))
+    bundles = backend.default_bundles(
+        num_devices=8,  # framework devices on 4 physical chips
+        accelerator_type_str="TPU-V7X",
+    )
+    assert bundles == [
+        {"TPU": 4, "accelerator_type:TPU-V7X": 0.001},
+    ]
+
+
+def test_batch_rejects_mixed_tpu_and_non_tpu_bundles(monkeypatch):
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+    for bad_bundles in (
+        [{"TPU": 1}, {"CPU": 4}],
+        [{"CPU": 2, "TPU": 1}, {"CPU": 8, "special": 1}],
+    ):
+        with pytest.raises(ValueError, match="cannot be mixed"):
+            backend.build_batch_scheduling_plan(
+                BatchSchedulingRequest(
+                    accelerator_type="TPU-V6E",
+                    accelerator_config=TPUConfig(topology="4x4"),
+                    tensor_parallel_size=16,
+                    executor_backend="ray",
+                    placement_group_config={"bundles": bad_bundles},
+                    concurrency=1,
+                )
+            )
+
+
+def test_batch_accepts_homogeneous_tpu_and_omit_tpu_bundles(monkeypatch):
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="4x4", num_hosts=4, chips_per_host=4
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+    )
+    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+
+    acquired = backend.build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="4x4"),
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={
+                "bundles": [{"CPU": 2, "TPU": 1} for _ in range(16)],
+            },
+            concurrency=1,
+        )
+    )
+    assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
+    assert slice_kwargs[-1]["resources_per_bundle"]["CPU"] == float(
+        PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
+    )
+    acquired.close_handle.shutdown()
+
+    acquired = backend.build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="4x4"),
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={
+                "bundles": [{"CPU": 4, "special": 1} for _ in range(16)],
+            },
+            concurrency=1,
+        )
+    )
+    assert slice_kwargs[-1]["resources_per_bundle"] == {
+        "CPU": 4.0,
+        "special": 1,
+        "TPU": 1,
+    }
+    acquired.close_handle.shutdown()
+
+
+def test_v7x_2x2x1_per_chip_uses_strict_pack(monkeypatch):
+    """Single-VM Ironwood + TPU1 hits devices_per_chip and STRICT_PACK together."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="2x2x1", num_hosts=1, chips_per_host=4, slice_name=None
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+    )
+    acquired = TPUAccelerator(TPUConfig(topology="2x2x1")).build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V7X",
+            accelerator_config=TPUConfig(topology="2x2x1"),
+            tensor_parallel_size=8,
+            executor_backend="ray",
+            placement_group_config={"bundle_per_worker": {"TPU": 1}},
+            concurrency=1,
+        )
+    )
+    assert fake_handle.num_hosts == 1
+    assert fake_handle.num_bundles == 4
+    assert slice_kwargs[-1]["strategy"] == "STRICT_PACK"
+    selectors = slice_kwargs[-1]["bundle_label_selector"]
+    assert selectors is not None
+    assert len(selectors) == 4
+    assert all(
+        s
+        == {
+            "ray.io/tpu-topology": "2x2x1",
+            "ray.io/tpu-pod-type": "v7x-8",
+        }
+        for s in selectors
+    )
+    acquired.close_handle.shutdown()
+
+
 def test_derive_layout_rejects_unsupported_chips_per_vm():
     with pytest.raises(ValueError, match="not a supported override"):
         TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=2)
