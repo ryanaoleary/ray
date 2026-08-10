@@ -18,6 +18,8 @@ import ray
 import ray._raylet as _raylet
 import ray.util.accelerators.accelerators as accelerators
 from ray._private.accelerators.tpu import (
+    TPU_8_CHIPS_PER_HOST_TYPES,
+    TPU_SINGLE_HOST_TOPOLOGIES,
     get_chips_per_host,
     get_num_chips_from_topology,
     infer_tpu_pod_type_from_topology,
@@ -38,6 +40,13 @@ logger = logging.getLogger(__name__)
 PARENT_ACTOR_CPU_RESERVE = 1
 DEFAULT_USER_CPU_PER_HOST = 1
 CPU_ACCELERATOR_TYPE_LITERAL = "CPU"
+
+# Explicit chips_per_vm overrides are only for known ambiguous provision modes.
+# Keyed by (accelerator_version, topology) → allowed chips_per_vm values.
+# v6e/v5e 2x4 can be one 8-chip VM (Ray default) or two 4-chip VMs.
+_AMBIGUOUS_CHIPS_PER_VM_OVERRIDES = {
+    (version, "2x4"): frozenset({4, 8}) for version in TPU_8_CHIPS_PER_HOST_TYPES
+}
 
 # Waiting for a TPU slice can outlast the default when the cluster has to autoscale
 # one. Exposed as an env var (not public API) so operators can wait longer without
@@ -151,7 +160,8 @@ class TPUReplicaLayout:
         total_chips: Total chips across the topology. ``tensor_parallel_size`` must
             equal this.
         chips_per_vm: Physical chips on each resolved TPU VM (Ray's default
-            ``chips_per_host`` / ``chips_per_vm``).
+            ``chips_per_host`` / ``chips_per_vm``, or an explicit
+            ``accelerator_config.chips_per_vm`` override for ambiguous shapes).
         num_vms: Number of physical TPU VMs in the topology. This is independent of
             the SlicePG bundle count when using finer TPU-per-bundle granularity.
     """
@@ -263,7 +273,15 @@ class TPUConfig(AcceleratorConfig):
         description=(
             "Physical TPU topology string (e.g. '4x4', '2x4', '2x2x2'). Required for "
             "topology-backed TPU batch inference. Ambiguous shapes such as v6e '2x4' "
-            "use Ray's default chips-per-VM resolution."
+            "use Ray's default chips-per-VM resolution unless chips_per_vm is set."
+        ),
+    )
+    chips_per_vm: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional override for physical chips per TPU VM. Use for ambiguous "
+            "provisioning such as v6e '2x4' (default 8 chips / 1 VM, or 4 chips / "
+            "2 VMs). When omitted, Ray's default chips-per-host rules apply."
         ),
     )
 
@@ -587,11 +605,21 @@ class TPUAccelerator(AcceleratorBackend):
             )
 
         worker_bundle = self._resolve_topology_worker_bundle(bundles)
+        topology = self._config.topology.strip().lower()
+        version = get_tpu_version_from_type(accelerator_type_str)
+        chips_per_vm = self._resolve_chips_per_vm(
+            self._config.chips_per_vm,
+            topology=topology,
+            accelerator_version=version,
+            total_chips=get_num_chips_from_topology(topology),
+            default_chips_per_vm=get_chips_per_host(topology, version),
+        )
         self._create_slice_pg_handle(
             accelerator_type=accelerator_type_str,
             resources_per_bundle=worker_bundle,
             strategy=strategy,
             name=name,
+            chips_per_vm=chips_per_vm,
         )
         return self._slice_pg_wrapper.placement_group
 
@@ -626,6 +654,7 @@ class TPUAccelerator(AcceleratorBackend):
         name: str = "",
         bundle_label_selector: Optional[List[Dict[str, str]]] = None,
         tpu_resource_per_chip: Optional[int] = None,
+        chips_per_vm: Optional[int] = None,
     ):
         """Create and own a topology-backed SlicePlacementGroup.
 
@@ -654,6 +683,8 @@ class TPUAccelerator(AcceleratorBackend):
             "bundle_label_selector": bundle_label_selector,
             "tpu_resource_per_chip": tpu_resource_per_chip,
         }
+        if chips_per_vm is not None:
+            slice_kwargs["chips_per_vm"] = chips_per_vm
         if name:
             slice_kwargs["name"] = name
         self._slice_pg_wrapper = slice_placement_group(**slice_kwargs)
@@ -695,8 +726,13 @@ class TPUAccelerator(AcceleratorBackend):
         # both the parent actor and every TPU worker, including single-VM shapes.
         return "ray"
 
-    def _derive_layout(self, topology: str, accelerator_type: str) -> TPUReplicaLayout:
-        """Derive the resolved physical VM layout from Ray's default chips-per-host rules."""
+    def _derive_layout(
+        self,
+        topology: str,
+        accelerator_type: str,
+        chips_per_vm: Optional[int] = None,
+    ) -> TPUReplicaLayout:
+        """Derive the resolved physical VM layout from topology + chips-per-VM rules."""
         # Match SlicePlacementGroup / node-label discovery: topology strings are
         # compared as exact node labels, so Batch must store the canonical form.
         if not isinstance(topology, str):
@@ -709,26 +745,80 @@ class TPUAccelerator(AcceleratorBackend):
 
         accel_version = get_tpu_version_from_type(accelerator_type)
         total_chips = get_num_chips_from_topology(canonical_topology)
-        chips_per_vm = get_chips_per_host(canonical_topology, accel_version)
+        default_chips_per_vm = get_chips_per_host(canonical_topology, accel_version)
+        resolved_chips_per_vm = self._resolve_chips_per_vm(
+            chips_per_vm,
+            topology=canonical_topology,
+            accelerator_version=accel_version,
+            total_chips=total_chips,
+            default_chips_per_vm=default_chips_per_vm,
+        )
+        num_vms = total_chips // resolved_chips_per_vm
+        return TPUReplicaLayout(
+            topology=canonical_topology,
+            accelerator_type=accelerator_type,
+            accelerator_version=accel_version,
+            total_chips=total_chips,
+            chips_per_vm=resolved_chips_per_vm,
+            num_vms=num_vms,
+        )
+
+    @staticmethod
+    def _resolve_chips_per_vm(
+        chips_per_vm: Optional[int],
+        *,
+        topology: str,
+        accelerator_version: str,
+        total_chips: int,
+        default_chips_per_vm: int,
+    ) -> int:
+        """Resolve chips-per-VM, allowing overrides only for known ambiguous shapes."""
+        if chips_per_vm is None:
+            chips_per_vm = default_chips_per_vm
+        else:
+            if isinstance(chips_per_vm, bool) or not isinstance(chips_per_vm, int):
+                raise ValueError(
+                    f"chips_per_vm must be a positive integer; got {chips_per_vm!r}."
+                )
+            if chips_per_vm <= 0:
+                raise ValueError(
+                    f"chips_per_vm must be a positive integer; got {chips_per_vm}."
+                )
+            if chips_per_vm != default_chips_per_vm:
+                allowed = _AMBIGUOUS_CHIPS_PER_VM_OVERRIDES.get(
+                    (accelerator_version, topology)
+                )
+                if allowed is None or chips_per_vm not in allowed:
+                    raise ValueError(
+                        f"chips_per_vm={chips_per_vm} is not a supported override for "
+                        f"topology '{topology}' on {accelerator_version}. "
+                        f"Ray's default is {default_chips_per_vm} chips per VM. "
+                        "Explicit overrides are only supported for ambiguous "
+                        "single-host shapes such as v6e '2x4' "
+                        f"(allowed values: {sorted(allowed) if allowed else 'n/a'})."
+                    )
+
         if chips_per_vm <= 0:
             raise ValueError(
                 f"Resolved chips per VM must be positive, got {chips_per_vm}"
             )
         if total_chips % chips_per_vm != 0:
             raise ValueError(
-                f"Topology '{canonical_topology}' on {accelerator_type} resolves to "
+                f"Topology '{topology}' on {accelerator_version} resolves to "
                 f"{total_chips} chips with {chips_per_vm} chips per VM, which does "
                 "not divide evenly."
             )
-        num_vms = total_chips // chips_per_vm
-        return TPUReplicaLayout(
-            topology=canonical_topology,
-            accelerator_type=accelerator_type,
-            accelerator_version=accel_version,
-            total_chips=total_chips,
-            chips_per_vm=chips_per_vm,
-            num_vms=num_vms,
-        )
+        # Defensive: allowlisted ambiguous overrides should already be single-host
+        # topologies with multiple valid host packings.
+        if (
+            chips_per_vm != default_chips_per_vm
+            and topology not in TPU_SINGLE_HOST_TOPOLOGIES
+        ):
+            raise ValueError(
+                f"chips_per_vm overrides are only supported for single-host topologies "
+                f"{TPU_SINGLE_HOST_TOPOLOGIES}; got topology '{topology}'."
+            )
+        return chips_per_vm
 
     @staticmethod
     def _expand_placement_group_bundles(
@@ -895,7 +985,11 @@ class TPUAccelerator(AcceleratorBackend):
         )
         dp = _require_positive_int(request.data_parallel_size, "data_parallel_size")
 
-        layout = self._derive_layout(tpu_config.topology, canonical_accel)
+        layout = self._derive_layout(
+            tpu_config.topology,
+            canonical_accel,
+            chips_per_vm=tpu_config.chips_per_vm,
+        )
 
         if tp != layout.total_chips:
             raise ValueError(
@@ -965,6 +1059,7 @@ class TPUAccelerator(AcceleratorBackend):
             accelerator_type=layout.accelerator_type,
             resources_per_worker=resources_per_bundle,
             num_slices=1,
+            chips_per_vm=layout.chips_per_vm,
             tpu_resource_per_chip=1,
         )
         strategy = self._resolve_batch_slice_strategy(
@@ -1007,6 +1102,7 @@ class TPUAccelerator(AcceleratorBackend):
                 strategy=strategy,
                 bundle_label_selector=bundle_label_selector,
                 tpu_resource_per_chip=1,
+                chips_per_vm=layout.chips_per_vm,
             )
 
             try:

@@ -148,13 +148,19 @@ def _install_tpu_slice_fakes(
         version = kwargs.get("accelerator_version", "v6e")
         resources = kwargs.get("resources_per_bundle") or {}
         tpu_rpc = kwargs.get("tpu_resource_per_chip") or 1
+        chips_per_vm_override = kwargs.get("chips_per_vm")
         num_bundles, bundle_resources = get_tpu_worker_resources(
             topology=topology,
             accelerator_type=f"TPU-{version.upper()}",
             resources_per_worker=resources,
+            chips_per_vm=chips_per_vm_override,
             tpu_resource_per_chip=tpu_rpc,
         )
-        chips_per_vm = get_chips_per_host(topology, version)
+        chips_per_vm = (
+            chips_per_vm_override
+            if chips_per_vm_override is not None
+            else get_chips_per_host(topology, version)
+        )
         total_chips = get_num_chips_from_topology(topology)
         num_vms = total_chips // chips_per_vm
         fake_handle.topology = topology
@@ -972,6 +978,7 @@ def test_single_vm_slice_allocation_uses_topology_pod_type_labels(
             ],
             "strategy": "SPREAD",
             "tpu_resource_per_chip": 1,
+            "chips_per_vm": 8,
         }
     ]
     acquired.close_handle.shutdown()
@@ -1276,6 +1283,126 @@ def test_derive_layout_rejects_whitespace_only_topology():
         TPUAccelerator()._derive_layout("   ", "TPU-V6E")
 
 
+def test_derive_layout_v6e_2x4_chips_per_vm_override():
+    """v6e 2x4 defaults to 1×8; chips_per_vm=4 selects the 2×4 provisioning."""
+    default_layout = TPUAccelerator()._derive_layout("2x4", "TPU-V6E")
+    assert default_layout.chips_per_vm == 8
+    assert default_layout.num_vms == 1
+    assert default_layout.is_single_vm
+
+    dual_vm = TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=4)
+    assert dual_vm.chips_per_vm == 4
+    assert dual_vm.num_vms == 2
+    assert not dual_vm.is_single_vm
+    assert dual_vm.total_chips == 8
+
+    explicit_default = TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=8)
+    assert explicit_default.chips_per_vm == 8
+    assert explicit_default.num_vms == 1
+
+
+def test_derive_layout_rejects_unsupported_chips_per_vm():
+    with pytest.raises(ValueError, match="not a supported override"):
+        TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=2)
+    with pytest.raises(ValueError, match="not a supported override"):
+        TPUAccelerator()._derive_layout("4x4", "TPU-V6E", chips_per_vm=8)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=0)
+
+
+def test_v6e_2x4_chips_per_vm_four_is_multi_vm_layout(monkeypatch):
+    """chips_per_vm=4 makes 2x4 a 2-VM slice with slice-name gang scheduling."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="2x4", num_hosts=2, chips_per_host=4, slice_name="tpu-slice-0"
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+        nodes=_create_mock_v6e_nodes(num_hosts=2, tpu_per_host=4),
+    )
+
+    acquired = TPUAccelerator(
+        TPUConfig(topology="2x4", chips_per_vm=4)
+    ).build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="2x4", chips_per_vm=4),
+            tensor_parallel_size=8,
+            executor_backend="ray",
+            concurrency=1,
+        )
+    )
+
+    assert len(slice_kwargs) == 1
+    assert slice_kwargs[0]["chips_per_vm"] == 4
+    assert fake_handle.num_hosts == 2
+    assert fake_handle.num_bundles == 2
+    assert fake_handle.chips_per_host == 4
+    for bundle in fake_handle.placement_group.bundle_specs:
+        assert bundle["TPU"] == 4.0
+    # Multi-VM path: SlicePG injects slice-name; Batch must not set single-VM selectors.
+    assert slice_kwargs[0]["bundle_label_selector"] is None
+    assert slice_kwargs[0]["strategy"] == "SPREAD"
+    acquired.close_handle.shutdown()
+
+
+def test_v6e_2x4_chips_per_vm_four_per_chip_granularity(monkeypatch):
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    slice_kwargs = []
+    fake_handle = FakeSlicePlacementGroupHandle(
+        topology="2x4", num_hosts=2, chips_per_host=4, slice_name="tpu-slice-0"
+    )
+    _install_tpu_slice_fakes(
+        monkeypatch,
+        fake_handle,
+        on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
+        nodes=_create_mock_v6e_nodes(num_hosts=2, tpu_per_host=4),
+    )
+
+    acquired = TPUAccelerator(
+        TPUConfig(topology="2x4", chips_per_vm=4)
+    ).build_batch_scheduling_plan(
+        BatchSchedulingRequest(
+            accelerator_type="TPU-V6E",
+            accelerator_config=TPUConfig(topology="2x4", chips_per_vm=4),
+            tensor_parallel_size=8,
+            executor_backend="ray",
+            placement_group_config={"bundle_per_worker": {"TPU": 1}},
+            concurrency=1,
+        )
+    )
+
+    assert fake_handle.num_hosts == 2
+    assert fake_handle.num_bundles == 8
+    assert slice_kwargs[0]["chips_per_vm"] == 4
+    assert slice_kwargs[0]["strategy"] == "PACK"
+    assert slice_kwargs[0]["bundle_label_selector"] is None
+    for bundle in fake_handle.placement_group.bundle_specs:
+        assert bundle["TPU"] == 1.0
+    acquired.close_handle.shutdown()
+
+
+def test_processor_config_accepts_chips_per_vm_dict():
+    cfg = vLLMEngineProcessorConfig(
+        model_source="test-model",
+        accelerator_type="TPU-V6E",
+        accelerator_config={
+            "kind": "tpu",
+            "topology": "2x4",
+            "chips_per_vm": 4,
+        },
+        concurrency=1,
+        engine_kwargs={"tensor_parallel_size": 8},
+    )
+    assert isinstance(cfg.accelerator_config, TPUConfig)
+    assert cfg.accelerator_config.chips_per_vm == 4
+
+
 def test_single_vm_v4_pod_type_uses_cores_not_chips(monkeypatch):
     """Pod type is cores-based; v4 has two cores per chip (2x2x1 → v4-8)."""
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
@@ -1365,6 +1492,7 @@ def test_slice_allocation_kwargs_and_head_release_ordering(monkeypatch):
             "bundle_label_selector": None,
             "strategy": "SPREAD",
             "tpu_resource_per_chip": 1,
+            "chips_per_vm": 4,
         }
     ]
     assert call_order == [

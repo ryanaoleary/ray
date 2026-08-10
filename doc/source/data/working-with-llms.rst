@@ -402,9 +402,12 @@ This alpha release runs one model replica on one complete TPU topology:
   ``16`` for a v6e ``4x4`` slice or ``8`` for a v6e ``2x4`` slice.
 - ``pipeline_parallel_size`` and ``data_parallel_size`` must both be ``1``.
 - The topology resolves through Ray's default chips-per-VM rules into one or more
-  TPU VMs. A single-host shape such as v6e ``2x4`` becomes one VM with eight chips;
-  a multi-host shape such as v6e ``4x4`` becomes four VMs with four chips each.
-  Explicit ``chips_per_vm`` overrides for ambiguous topologies are not exposed yet.
+  TPU VMs. A single-host shape such as v6e ``2x4`` becomes one VM with eight chips
+  by default; a multi-host shape such as v6e ``4x4`` becomes four VMs with four
+  chips each. For the ambiguous v6e ``2x4`` provisioning, pass
+  ``chips_per_vm`` in ``accelerator_config`` — for example
+  ``{"kind": "tpu", "topology": "2x4", "chips_per_vm": 4}`` selects two 4-chip
+  VMs instead of one 8-chip VM.
 - By default, Ray Data creates one SlicePG bundle per TPU VM (for example v6e
   ``4x4`` → four bundles with ``TPU:4``). Use ``placement_group_config`` with a
   homogeneous worker-resource template to change executor granularity while

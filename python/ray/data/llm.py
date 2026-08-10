@@ -160,8 +160,10 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             bundles require ``PACK``/``STRICT_PACK``.
         accelerator_config: Optional accelerator configuration for the LLM stage.
             For TPU batch inference, pass a mapping such as
-            ``{"kind": "tpu", "topology": "4x4"}``. When omitted with a non-TPU
-            ``accelerator_type``, GPU batch behavior is preserved.
+            ``{"kind": "tpu", "topology": "4x4"}``. For ambiguous shapes such as
+            v6e ``2x4``, optionally set ``chips_per_vm`` to ``4`` (two 4-chip VMs)
+            or omit it to use Ray's default (one 8-chip VM). When omitted with a
+            non-TPU ``accelerator_type``, GPU batch behavior is preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy
