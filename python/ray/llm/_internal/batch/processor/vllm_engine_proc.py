@@ -140,9 +140,9 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
             "Accelerator configuration for the LLM stage. For TPU batch inference, "
             "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'}. For "
             "ambiguous shapes such as v6e '2x4', optionally set chips_per_vm to 4 "
-            "(two 4-chip VMs) or omit it for Ray's default (one 8-chip VM). An "
-            "omitted accelerator type preserves GPU batch behavior for this "
-            "processor."
+            "to request two 4-chip VMs (must match cluster provisioning; omit for "
+            "Ray's default one 8-chip VM). An omitted accelerator type preserves "
+            "GPU batch behavior for this processor."
         ),
     )
 
