@@ -229,6 +229,24 @@ def get_tpu_worker_resources(
     if tpus_per_worker <= 0:
         raise ValueError("TPU resources must be positive.")
 
+    # Per-host fit checks. ``resolved_chips_per_vm`` already includes the
+    # ``tpu_resource_per_chip`` multiplier, so it is the number of logical TPU
+    # resources on a single VM. A worker must fit on and evenly tile one VM.
+    if float(tpus_per_worker) != int(tpus_per_worker):
+        raise ValueError(
+            f"TPU resources per worker ({tpus_per_worker}) must be an integer."
+        )
+    if tpus_per_worker > resolved_chips_per_vm:
+        raise ValueError(
+            f"TPU resources per worker ({tpus_per_worker}) cannot fit on one VM, "
+            f"which has {resolved_chips_per_vm} logical TPU resources."
+        )
+    if resolved_chips_per_vm % tpus_per_worker != 0:
+        raise ValueError(
+            f"TPU resources per worker ({tpus_per_worker}) must evenly divide the "
+            f"{resolved_chips_per_vm} logical TPU resources available per VM."
+        )
+
     if total_tpus_available % tpus_per_worker != 0:
         raise ValueError(
             f"Total TPU resources ({total_tpus_available}) not divisible by "

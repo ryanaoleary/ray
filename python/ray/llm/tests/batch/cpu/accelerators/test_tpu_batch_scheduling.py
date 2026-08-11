@@ -8,7 +8,7 @@ import logging
 import pickle
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -21,7 +21,6 @@ from ray.data.llm import (
 )
 from ray.llm._internal.batch.processor.base import Processor
 from ray.llm._internal.batch.processor.vllm_engine_proc import _ManagedVLLMProcessor
-from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStageUDF
 from ray.llm._internal.common.accelerators import (
     DEFAULT_PG_READY_TIMEOUT_S,
     DEFAULT_USER_CPU_PER_HOST,
@@ -32,7 +31,6 @@ from ray.llm._internal.common.accelerators import (
     TPU_ENGINE_ENV_VARS,
     AcceleratorBackend,
     AnyAcceleratorConfig,
-    BatchSchedulingRequest,
     CPUAccelerator,
     CPUConfig,
     GPUAccelerator,
@@ -50,6 +48,58 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 # -------------------------------------------------------------------------
 
 _ACCEL = "ray.llm._internal.common.accelerators"
+
+
+def _tpu_options(
+    backend: TPUAccelerator,
+    *,
+    accelerator_type: str,
+    tensor_parallel_size: int,
+    executor_backend: str = "ray",
+    placement_group_config: Optional[Dict[str, Any]] = None,
+    runtime_env: Optional[Dict[str, Any]] = None,
+    concurrency: Any = 1,
+    pipeline_parallel_size: int = 1,
+    data_parallel_size: int = 1,
+) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
+    """Thin wrapper around the Batch scheduling hook used by tests."""
+    return backend.build_batch_scheduling_options(
+        accelerator_type=accelerator_type,
+        engine_kwargs={
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_parallel_size": pipeline_parallel_size,
+            "data_parallel_size": data_parallel_size,
+            "distributed_executor_backend": executor_backend,
+        },
+        placement_group_config=placement_group_config,
+        runtime_env=runtime_env,
+        concurrency=concurrency,
+    )
+
+
+def _gpu_options(
+    *,
+    accelerator_type: Optional[str] = None,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    executor_backend: Optional[str] = None,
+    placement_group_config: Optional[Dict[str, Any]] = None,
+    runtime_env: Optional[Dict[str, Any]] = None,
+    concurrency: Any = 1,
+) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
+    engine_kwargs: Dict[str, Any] = {
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+    }
+    if executor_backend is not None:
+        engine_kwargs["distributed_executor_backend"] = executor_backend
+    return GPUAccelerator().build_batch_scheduling_options(
+        accelerator_type=accelerator_type,
+        engine_kwargs=engine_kwargs,
+        placement_group_config=placement_group_config,
+        runtime_env=runtime_env,
+        concurrency=concurrency,
+    )
 
 
 class FakePlacementGroup:
@@ -106,39 +156,19 @@ class FakeSlicePlacementGroupHandle:
         self.shutdown_calls += 1
 
 
-def _create_mock_v6e_nodes(
-    num_hosts: int = 4, tpu_per_host: int = 4, slice_name: str = "tpu-slice-0"
-) -> List[Dict[str, Any]]:
-    nodes = []
-    for i in range(num_hosts):
-        nodes.append(
-            {
-                "NodeID": f"node-tpu-{i}",
-                "Alive": True,
-                "Labels": {"ray.io/tpu-slice-name": slice_name},
-                "Resources": {"CPU": 32.0, "TPU": float(tpu_per_host)},
-            }
-        )
-    return nodes
-
-
 def _install_tpu_slice_fakes(
     monkeypatch,
     fake_handle: FakeSlicePlacementGroupHandle,
     *,
-    nodes: Optional[List[Dict[str, Any]]] = None,
     on_slice=None,
     on_wait=None,
-    on_nodes=None,
 ):
-    """Patch the public TPU seams used by ``TPUAccelerator.build_batch_scheduling_plan``."""
+    """Patch the public TPU seams used by ``TPUAccelerator.build_batch_scheduling_options``."""
     from ray._private.accelerators.tpu import (
         get_chips_per_host,
         get_num_chips_from_topology,
     )
     from ray.util.tpu import get_tpu_worker_resources
-
-    selected_nodes = nodes
 
     def _slice(*args, **kwargs):
         if on_slice is not None:
@@ -187,19 +217,8 @@ def _install_tpu_slice_fakes(
         if on_wait is not None:
             on_wait(pg, timeout_s)
 
-    def _nodes(slice_name, nodes=None):
-        if on_nodes is not None:
-            return on_nodes(slice_name, nodes)
-        if selected_nodes is not None:
-            return selected_nodes
-        # Prefer currently configured host count / chips after slice creation.
-        return _create_mock_v6e_nodes(
-            num_hosts=fake_handle.num_hosts, tpu_per_host=fake_handle.chips_per_host
-        )
-
     monkeypatch.setattr(f"{_ACCEL}.slice_placement_group", _slice)
     monkeypatch.setattr(f"{_ACCEL}._wait_for_placement_group", _wait)
-    monkeypatch.setattr(f"{_ACCEL}.get_tpu_nodes_for_slice", _nodes)
     return fake_handle
 
 
@@ -418,9 +437,7 @@ def test_builder_to_backend_tpu(mock_tpu_slice_environment):
 
     processor = build_processor(config)
     assert isinstance(processor, _ManagedVLLMProcessor)
-    assert isinstance(processor._close_handle.backend, TPUAccelerator)
-    assert processor._close_handle.wrapper is fake_handle
-    assert processor._close_handle.backend._slice_pg_wrapper is fake_handle
+    assert callable(processor._close_fn)
 
     # Ensure config.engine_kwargs is not mutated
     assert "distributed_executor_backend" not in config.engine_kwargs
@@ -446,20 +463,15 @@ def test_builder_to_backend_tpu(mock_tpu_slice_environment):
     assert strategy.placement_group_capture_child_tasks is True
 
     # The parent actor is scheduled into the SlicePG with child capture so
-    # vLLM from_engine_args can publish the current PG into ParallelConfig;
-    # required_env_vars fail fast if the TPU runtime env did not propagate.
+    # vLLM from_engine_args can publish the current PG into ParallelConfig.
+    # Required TPU env vars are merged into runtime_env (not a separate UDF check).
     fn_kwargs = vllm_stage.fn_constructor_kwargs
     assert "reuse_current_placement_group" not in fn_kwargs
-    assert fn_kwargs["required_env_vars"] == {
-        "TPU_MULTIHOST_BACKEND": "ray",
-        "RAY_TPU_RESOURCE_PER_CHIP": "1",
-    }
+    assert "required_env_vars" not in fn_kwargs
 
-    close_backend = processor._close_handle.backend
     processor.close()
     assert fake_handle.shutdown_calls == 1
-    assert close_backend._slice_pg_wrapper is None
-    assert processor._close_handle is None
+    assert processor._close_fn is None
 
 
 def test_builder_returns_ordinary_processor_for_gpu(monkeypatch):
@@ -655,62 +667,58 @@ def test_direct_backend_validation_failures(monkeypatch):
     with pytest.raises(
         ValueError, match="TPU batch inference requires an explicit `accelerator_config"
     ):
-        TPUAccelerator(TPUConfig()).build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=1,
-            )
+        _tpu_options(
+            TPUAccelerator(TPUConfig()),
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 2. Missing accelerator_type
     with pytest.raises(ValueError, match="`accelerator_type`.*is required"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type=None,
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type=None,
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 3. TP mismatch (15 != 16)
-    with pytest.raises(ValueError, match="tensor_parallel_size must match"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=15,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=1,
-            )
+    with pytest.raises(ValueError, match="tensor_parallel_size must be"):
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=15,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 4. PP != 1
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=2,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=1,
+            pipeline_parallel_size=2,
+            data_parallel_size=1,
         )
 
     # 4b. PP True / 1.0 must not silently pass the == 1 check
@@ -718,30 +726,28 @@ def test_direct_backend_validation_failures(monkeypatch):
         with pytest.raises(
             ValueError, match="pipeline_parallel_size must be a positive integer"
         ):
-            backend.build_batch_scheduling_plan(
-                BatchSchedulingRequest(
-                    accelerator_type="TPU-V6E",
-                    tensor_parallel_size=16,
-                    pipeline_parallel_size=bad_pp,
-                    data_parallel_size=1,
-                    executor_backend="ray",
-                    concurrency=1,
-                )
+            _tpu_options(
+                backend,
+                accelerator_type="TPU-V6E",
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                concurrency=1,
+                pipeline_parallel_size=bad_pp,
+                data_parallel_size=1,
             )
 
     # 5. DP != 1
     with pytest.raises(ValueError, match="data_parallel_size=1"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=2,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=2,
         )
 
     # 5b. DP True / 1.0 must not silently pass the == 1 check
@@ -749,104 +755,97 @@ def test_direct_backend_validation_failures(monkeypatch):
         with pytest.raises(
             ValueError, match="data_parallel_size must be a positive integer"
         ):
-            backend.build_batch_scheduling_plan(
-                BatchSchedulingRequest(
-                    accelerator_type="TPU-V6E",
-                    tensor_parallel_size=16,
-                    pipeline_parallel_size=1,
-                    data_parallel_size=bad_dp,
-                    executor_backend="ray",
-                    concurrency=1,
-                )
+            _tpu_options(
+                backend,
+                accelerator_type="TPU-V6E",
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                concurrency=1,
+                pipeline_parallel_size=1,
+                data_parallel_size=bad_dp,
             )
 
     # 6. Concurrency bool True
     with pytest.raises(ValueError, match="concurrency=1"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=True,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=True,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 7. Concurrency float 1.0
     with pytest.raises(ValueError, match="concurrency=1"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env=None,
-                concurrency=1.0,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env=None,
+            concurrency=1.0,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 8. Invalid TPU-per-bundle granularity (does not divide chips/VM)
     with pytest.raises(ValueError, match="evenly divide"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config={"bundle_per_worker": {"TPU": 3}},
-                runtime_env=None,
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={"bundle_per_worker": {"TPU": 3}},
+            runtime_env=None,
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 9. Runtime env backend conflict
     with pytest.raises(ValueError, match="TPU_MULTIHOST_BACKEND"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env={"env_vars": {"TPU_MULTIHOST_BACKEND": "grpc"}},
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env={"env_vars": {"TPU_MULTIHOST_BACKEND": "grpc"}},
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 10. Runtime env resource-per-chip mismatch (integer 1 or non-string)
     with pytest.raises(ValueError, match="must be the string '1'"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                placement_group_config=None,
-                runtime_env={"env_vars": {"RAY_TPU_RESOURCE_PER_CHIP": 1}},
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config=None,
+            runtime_env={"env_vars": {"RAY_TPU_RESOURCE_PER_CHIP": 1}},
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
     # 11. Driver resource per chip mismatch
     monkeypatch.setenv("RAY_TPU_RESOURCE_PER_CHIP", "2")
     with pytest.raises(ValueError, match="requires RAY_TPU_RESOURCE_PER_CHIP == 1"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
 
@@ -864,7 +863,6 @@ def test_default_topology_layouts(
 ):
     """Ray's default chips-per-VM resolution drives single- and multi-VM layouts."""
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    node_lookups = []
     slice_kwargs = []
     fake_handle = FakeSlicePlacementGroupHandle(
         topology=topology,
@@ -876,24 +874,18 @@ def test_default_topology_layouts(
         monkeypatch,
         fake_handle,
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
-        on_nodes=lambda slice_name, nodes=None: (
-            node_lookups.append(slice_name),
-            _create_mock_v6e_nodes(num_hosts=num_vms, tpu_per_host=chips_per_vm),
-        )[1],
     )
 
-    acquired = TPUAccelerator(TPUConfig(topology=topology)).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type=accelerator_type,
-            tensor_parallel_size=total_chips,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology=topology)),
+        accelerator_type=accelerator_type,
+        tensor_parallel_size=total_chips,
+        executor_backend="ray",
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
 
-    kwargs = acquired.plan.map_batches_kwargs
     assert kwargs["num_cpus"] == PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
     assert kwargs["num_gpus"] == 0
     assert kwargs["resources"] == {}
@@ -905,7 +897,6 @@ def test_default_topology_layouts(
         assert bundle["TPU"] == float(chips_per_vm)
     assert len(slice_kwargs) == 1
     if num_vms == 1:
-        assert node_lookups == []
         # Single-VM SlicePGs skip slice-name reservation; pin generation/topology.
         expected_pod_type = infer_tpu_pod_type_from_topology(topology, accelerator_type)
         assert slice_kwargs[0]["bundle_label_selector"] == [
@@ -915,10 +906,9 @@ def test_default_topology_layouts(
             }
         ]
     else:
-        assert node_lookups == ["tpu-slice-0"]
         # Multi-VM path must not inject caller hardware labels.
         assert slice_kwargs[0]["bundle_label_selector"] is None
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 @pytest.mark.parametrize("topology", ["2x4", "2X4", " 2x4 "])
@@ -937,36 +927,33 @@ def test_single_vm_slice_allocation_uses_topology_pod_type_labels(
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
     )
 
-    acquired = TPUAccelerator(TPUConfig(topology=topology)).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=8,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology=topology)),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=8,
+        executor_backend="ray",
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
 
-    assert slice_kwargs == [
+    assert len(slice_kwargs) == 1
+    assert slice_kwargs[0]["topology"] == "2x4"
+    assert slice_kwargs[0]["accelerator_version"] == "v6e"
+    assert slice_kwargs[0]["resources_per_bundle"] == {
+        "CPU": float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST),
+    }
+    assert slice_kwargs[0]["bundle_label_selector"] == [
         {
-            "topology": "2x4",
-            "accelerator_version": "v6e",
-            "resources_per_bundle": {
-                "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
-            },
-            "bundle_label_selector": [
-                {
-                    "ray.io/tpu-topology": "2x4",
-                    "ray.io/tpu-pod-type": "v6e-8",
-                }
-            ],
-            "strategy": "PACK",
-            "tpu_resource_per_chip": 1,
-            "chips_per_vm": 8,
+            "ray.io/tpu-topology": "2x4",
+            "ray.io/tpu-pod-type": "v6e-8",
         }
     ]
-    acquired.close_handle.shutdown()
+    assert slice_kwargs[0]["strategy"] == "PACK"
+    assert slice_kwargs[0]["tpu_resource_per_chip"] == 1
+    # chips_per_vm omitted so Ray owns the default for this topology.
+    assert "chips_per_vm" not in slice_kwargs[0]
+    close_fn()
 
 
 @pytest.mark.parametrize(
@@ -1011,16 +998,15 @@ def test_bundle_granularity_matrix(
     if tpu_per_bundle is not None:
         pg_config = {"bundle_per_worker": {"TPU": tpu_per_bundle}}
 
-    acquired = TPUAccelerator(TPUConfig(topology=topology)).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=tp,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            placement_group_config=pg_config,
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology=topology)),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=tp,
+        executor_backend="ray",
+        placement_group_config=pg_config,
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
 
     assert len(slice_kwargs) == 1
@@ -1054,7 +1040,7 @@ def test_bundle_granularity_matrix(
     else:
         assert slice_kwargs[0]["bundle_label_selector"] is None
 
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_batch_cpu_floor_and_gpu_rejection(monkeypatch):
@@ -1070,20 +1056,19 @@ def test_batch_cpu_floor_and_gpu_rejection(monkeypatch):
     )
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={"bundle_per_worker": {"CPU": 1, "TPU": 1}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={"bundle_per_worker": {"CPU": 1, "TPU": 1}},
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"]["CPU"] == float(
         PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
     )
     assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
-    acquired.close_handle.shutdown()
+    close_fn()
 
     for bad_pg in (
         {"bundle_per_worker": {"GPU": 1, "TPU": 1}},
@@ -1091,14 +1076,13 @@ def test_batch_cpu_floor_and_gpu_rejection(monkeypatch):
         {"bundle_per_worker": {"GPU": 1, "TPU": 0}},
     ):
         with pytest.raises(ValueError, match="GPU resources are not supported"):
-            backend.build_batch_scheduling_plan(
-                BatchSchedulingRequest(
-                    accelerator_type="TPU-V6E",
-                    tensor_parallel_size=16,
-                    executor_backend="ray",
-                    placement_group_config=bad_pg,
-                    concurrency=1,
-                )
+            _tpu_options(
+                backend,
+                accelerator_type="TPU-V6E",
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                placement_group_config=bad_pg,
+                concurrency=1,
             )
 
 
@@ -1115,14 +1099,13 @@ def test_batch_rejects_invalid_explicit_tpu_templates(monkeypatch, bad_bundle, m
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
     with pytest.raises(ValueError, match=match):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                executor_backend="ray",
-                placement_group_config={"bundle_per_worker": bad_bundle},
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={"bundle_per_worker": bad_bundle},
+            concurrency=1,
         )
 
 
@@ -1143,71 +1126,67 @@ def test_batch_cpu_only_template_preserves_tpu1_fallback(monkeypatch):
     )
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={"bundle_per_worker": {"CPU": 4}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={"bundle_per_worker": {"CPU": 4}},
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
     assert slice_kwargs[-1]["resources_per_bundle"]["CPU"] == 4.0
-    acquired.close_handle.shutdown()
+    close_fn()
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={
-                "bundle_per_worker": {"CPU": 4, "special": 1},
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={
+            "bundle_per_worker": {"CPU": 4, "special": 1},
+        },
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"] == {
         "CPU": 4.0,
         "special": 1,
         "TPU": 1,
     }
-    acquired.close_handle.shutdown()
+    close_fn()
 
     # Explicit bundles list without TPU also preserves homogeneous extras.
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={
-                "bundles": [{"CPU": 3, "custom": 2} for _ in range(16)],
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={
+            "bundles": [{"CPU": 3, "custom": 2} for _ in range(16)],
+        },
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"] == {
         "CPU": 3.0,
         "custom": 2,
         "TPU": 1,
     }
-    acquired.close_handle.shutdown()
+    close_fn()
 
     # CPU below the Batch floor is still raised, never lowered.
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={"bundle_per_worker": {"CPU": 1}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={"bundle_per_worker": {"CPU": 1}},
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"]["CPU"] == float(
         PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
     )
     assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_single_vm_multi_bundle_upgrades_pack_to_strict_pack(monkeypatch):
@@ -1221,38 +1200,36 @@ def test_single_vm_multi_bundle_upgrades_pack_to_strict_pack(monkeypatch):
         fake_handle,
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
     )
-    acquired = TPUAccelerator(TPUConfig(topology="2x4")).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=8,
-            executor_backend="ray",
-            placement_group_config={
-                "bundle_per_worker": {"TPU": 1},
-                "strategy": "PACK",
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="2x4")),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=8,
+        executor_backend="ray",
+        placement_group_config={
+            "bundle_per_worker": {"TPU": 1},
+            "strategy": "PACK",
+        },
+        concurrency=1,
     )
     assert fake_handle.num_bundles == 8
     assert slice_kwargs[-1]["strategy"] == "STRICT_PACK"
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_single_vm_multi_bundle_rejects_spread(monkeypatch):
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     backend = TPUAccelerator(TPUConfig(topology="2x4"))
     with pytest.raises(ValueError, match="PACK/STRICT_PACK"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=8,
-                executor_backend="ray",
-                placement_group_config={
-                    "bundle_per_worker": {"TPU": 1},
-                    "strategy": "SPREAD",
-                },
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=8,
+            executor_backend="ray",
+            placement_group_config={
+                "bundle_per_worker": {"TPU": 1},
+                "strategy": "SPREAD",
+            },
+            concurrency=1,
         )
 
 
@@ -1260,30 +1237,28 @@ def test_multi_vm_rejects_strict_pack_and_impossible_strict_spread(monkeypatch):
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
     with pytest.raises(ValueError, match="STRICT_PACK cannot represent"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                executor_backend="ray",
-                placement_group_config={
-                    "bundle_per_worker": {"TPU": 4},
-                    "strategy": "STRICT_PACK",
-                },
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={
+                "bundle_per_worker": {"TPU": 4},
+                "strategy": "STRICT_PACK",
+            },
+            concurrency=1,
         )
     with pytest.raises(ValueError, match="STRICT_SPREAD requires one node per bundle"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                executor_backend="ray",
-                placement_group_config={
-                    "bundle_per_worker": {"TPU": 1},
-                    "strategy": "STRICT_SPREAD",
-                },
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={
+                "bundle_per_worker": {"TPU": 1},
+                "strategy": "STRICT_SPREAD",
+            },
+            concurrency=1,
         )
 
 
@@ -1291,51 +1266,16 @@ def test_heterogeneous_tpu_bundles_rejected_for_batch(monkeypatch):
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
     with pytest.raises(ValueError, match="Heterogeneous TPU bundles"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                executor_backend="ray",
-                placement_group_config={
-                    "bundles": [{"TPU": 1}, {"TPU": 4}],
-                },
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={
+                "bundles": [{"TPU": 1}, {"TPU": 4}],
+            },
+            concurrency=1,
         )
-
-
-def test_resolve_slice_layout_rejects_whitespace_only_topology():
-    with pytest.raises(ValueError, match="TPU topology must be non-empty"):
-        TPUAccelerator()._resolve_slice_layout(
-            topology="   ", accelerator_version="v6e"
-        )
-
-
-def test_resolve_slice_layout_v6e_2x4_chips_per_vm_override():
-    """v6e 2x4 defaults to 1×8; chips_per_vm=4 selects the 2×4 provisioning."""
-    default_layout = TPUAccelerator()._resolve_slice_layout(
-        topology="2x4", accelerator_version="v6e"
-    )
-    assert default_layout.chips_per_vm == 8
-    assert default_layout.num_vms == 1
-    assert default_layout.is_single_vm
-    assert default_layout.total_chips == 8
-    assert default_layout.total_chips * _vllm_tp_multiplier("v6e") == 8
-
-    dual_vm = TPUAccelerator()._resolve_slice_layout(
-        topology="2x4", accelerator_version="v6e", chips_per_vm=4
-    )
-    assert dual_vm.chips_per_vm == 4
-    assert dual_vm.num_vms == 2
-    assert not dual_vm.is_single_vm
-    assert dual_vm.total_chips == 8
-    assert dual_vm.total_chips * _vllm_tp_multiplier("v6e") == 8
-
-    explicit_default = TPUAccelerator()._resolve_slice_layout(
-        topology="2x4", accelerator_version="v6e", chips_per_vm=8
-    )
-    assert explicit_default.chips_per_vm == 8
-    assert explicit_default.num_vms == 1
 
 
 @pytest.mark.parametrize(
@@ -1355,29 +1295,7 @@ def test_vllm_tp_multiplier_by_tpu_generation(version, expected):
     assert _vllm_tp_multiplier(version) == expected
 
 
-@pytest.mark.parametrize(
-    "topology, total_chips, chips_per_vm, num_vms, total_devices",
-    [
-        ("2x2x1", 4, 4, 1, 8),
-        ("2x2x2", 8, 4, 2, 16),
-        ("2x2x4", 16, 4, 4, 32),
-    ],
-)
-def test_resolve_slice_layout_v7x(
-    topology, total_chips, chips_per_vm, num_vms, total_devices
-):
-    """Ironwood exposes two framework devices per physical chip for TP sizing."""
-    layout = TPUAccelerator()._resolve_slice_layout(
-        topology=topology, accelerator_version="v7x"
-    )
-    assert layout.total_chips == total_chips
-    assert layout.chips_per_vm == chips_per_vm
-    assert layout.num_vms == num_vms
-    assert layout.total_chips * _vllm_tp_multiplier("v7x") == total_devices
-    assert layout.is_single_vm == (num_vms == 1)
-
-
-def test_v7x_batch_requires_tp_equal_to_framework_devices(monkeypatch):
+def test_v7x_batch_requires_tp_equal_to_physical_chips_times_multiplier(monkeypatch):
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     slice_kwargs = []
     fake_handle = FakeSlicePlacementGroupHandle(
@@ -1390,31 +1308,29 @@ def test_v7x_batch_requires_tp_equal_to_framework_devices(monkeypatch):
     )
     backend = TPUAccelerator(TPUConfig(topology="2x2x1"))
 
-    with pytest.raises(ValueError, match="framework devices"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V7X",
-                tensor_parallel_size=4,  # physical chips only — too low for v7x
-                executor_backend="ray",
-                concurrency=1,
-            )
-        )
-
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
+    with pytest.raises(ValueError, match="tensor_parallel_size must be 8"):
+        _tpu_options(
+            backend,
             accelerator_type="TPU-V7X",
-            tensor_parallel_size=8,
-            executor_backend="ray",
+            tensor_parallel_size=4,
             concurrency=1,
         )
+
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V7X",
+        tensor_parallel_size=8,
+        executor_backend="ray",
+        concurrency=1,
     )
     # Bundle layout still follows Ray scheduling resources (rpc=1 → TPU:4 / VM),
     # not framework device count.
     assert fake_handle.num_hosts == 1
     assert fake_handle.num_bundles == 1
     assert fake_handle.placement_group.bundle_specs[0]["TPU"] == 4.0
-    assert slice_kwargs[-1]["chips_per_vm"] == 4
-    acquired.close_handle.shutdown()
+    # chips_per_vm omitted so Ray owns the Ironwood host default.
+    assert "chips_per_vm" not in slice_kwargs[-1]
+    close_fn()
 
 
 def test_v7x_2x2x2_default_and_per_chip_bundle_layout(monkeypatch):
@@ -1427,36 +1343,33 @@ def test_v7x_2x2x2_default_and_per_chip_bundle_layout(monkeypatch):
         monkeypatch,
         fake_handle,
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
-        nodes=_create_mock_v6e_nodes(num_hosts=2, tpu_per_host=4),
     )
     backend = TPUAccelerator(TPUConfig(topology="2x2x2"))
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V7X",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V7X",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        concurrency=1,
     )
     assert fake_handle.num_hosts == 2
     assert fake_handle.num_bundles == 2
     assert slice_kwargs[-1]["strategy"] == "PACK"
-    acquired.close_handle.shutdown()
+    close_fn()
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V7X",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={"bundle_per_worker": {"TPU": 1}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V7X",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={"bundle_per_worker": {"TPU": 1}},
+        concurrency=1,
     )
     assert fake_handle.num_hosts == 2
     assert fake_handle.num_bundles == 8
     assert slice_kwargs[-1]["strategy"] == "PACK"
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_serve_create_placement_group_forwards_chips_per_vm(monkeypatch):
@@ -1548,14 +1461,13 @@ def test_batch_rejects_mixed_tpu_and_non_tpu_bundles(monkeypatch):
         [{"CPU": 2, "TPU": 1}, {"CPU": 8, "special": 1}],
     ):
         with pytest.raises(ValueError, match="cannot mix"):
-            backend.build_batch_scheduling_plan(
-                BatchSchedulingRequest(
-                    accelerator_type="TPU-V6E",
-                    tensor_parallel_size=16,
-                    executor_backend="ray",
-                    placement_group_config={"bundles": bad_bundles},
-                    concurrency=1,
-                )
+            _tpu_options(
+                backend,
+                accelerator_type="TPU-V6E",
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                placement_group_config={"bundles": bad_bundles},
+                concurrency=1,
             )
 
 
@@ -1572,40 +1484,38 @@ def test_batch_accepts_homogeneous_tpu_and_omit_tpu_bundles(monkeypatch):
     )
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={
-                "bundles": [{"CPU": 2, "TPU": 1} for _ in range(16)],
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={
+            "bundles": [{"CPU": 2, "TPU": 1} for _ in range(16)],
+        },
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"]["TPU"] == 1
     assert slice_kwargs[-1]["resources_per_bundle"]["CPU"] == float(
         PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
     )
-    acquired.close_handle.shutdown()
+    close_fn()
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="ray",
-            placement_group_config={
-                "bundles": [{"CPU": 4, "special": 1} for _ in range(16)],
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        placement_group_config={
+            "bundles": [{"CPU": 4, "special": 1} for _ in range(16)],
+        },
+        concurrency=1,
     )
     assert slice_kwargs[-1]["resources_per_bundle"] == {
         "CPU": 4.0,
         "special": 1,
         "TPU": 1,
     }
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_v7x_2x2x1_per_chip_uses_strict_pack(monkeypatch):
@@ -1620,14 +1530,13 @@ def test_v7x_2x2x1_per_chip_uses_strict_pack(monkeypatch):
         fake_handle,
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
     )
-    acquired = TPUAccelerator(TPUConfig(topology="2x2x1")).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V7X",
-            tensor_parallel_size=8,
-            executor_backend="ray",
-            placement_group_config={"bundle_per_worker": {"TPU": 1}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="2x2x1")),
+        accelerator_type="TPU-V7X",
+        tensor_parallel_size=8,
+        executor_backend="ray",
+        placement_group_config={"bundle_per_worker": {"TPU": 1}},
+        concurrency=1,
     )
     assert fake_handle.num_hosts == 1
     assert fake_handle.num_bundles == 4
@@ -1643,26 +1552,7 @@ def test_v7x_2x2x1_per_chip_uses_strict_pack(monkeypatch):
         }
         for s in selectors
     )
-    acquired.close_handle.shutdown()
-
-
-def test_resolve_slice_layout_rejects_unsupported_chips_per_vm():
-    with pytest.raises(ValueError, match="not a supported override"):
-        TPUAccelerator()._resolve_slice_layout(
-            topology="2x4", accelerator_version="v6e", chips_per_vm=2
-        )
-    with pytest.raises(ValueError, match="not a supported override"):
-        TPUAccelerator()._resolve_slice_layout(
-            topology="4x4", accelerator_version="v6e", chips_per_vm=8
-        )
-    with pytest.raises(ValueError, match="must be a positive integer"):
-        TPUAccelerator()._resolve_slice_layout(
-            topology="2x4", accelerator_version="v6e", chips_per_vm=True  # type: ignore[arg-type]
-        )
-    with pytest.raises(ValueError, match="must be a positive integer"):
-        TPUAccelerator()._resolve_slice_layout(
-            topology="2x4", accelerator_version="v6e", chips_per_vm=0
-        )
+    close_fn()
 
 
 def test_v6e_2x4_chips_per_vm_four_is_multi_vm_layout(monkeypatch):
@@ -1676,18 +1566,14 @@ def test_v6e_2x4_chips_per_vm_four_is_multi_vm_layout(monkeypatch):
         monkeypatch,
         fake_handle,
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
-        nodes=_create_mock_v6e_nodes(num_hosts=2, tpu_per_host=4),
     )
 
-    acquired = TPUAccelerator(
-        TPUConfig(topology="2x4", chips_per_vm=4)
-    ).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=8,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4)),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=8,
+        executor_backend="ray",
+        concurrency=1,
     )
 
     assert len(slice_kwargs) == 1
@@ -1700,7 +1586,7 @@ def test_v6e_2x4_chips_per_vm_four_is_multi_vm_layout(monkeypatch):
     # Multi-VM path: SlicePG injects slice-name; Batch must not set single-VM selectors.
     assert slice_kwargs[0]["bundle_label_selector"] is None
     assert slice_kwargs[0]["strategy"] == "PACK"
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_v6e_2x4_chips_per_vm_four_per_chip_granularity(monkeypatch):
@@ -1713,19 +1599,15 @@ def test_v6e_2x4_chips_per_vm_four_per_chip_granularity(monkeypatch):
         monkeypatch,
         fake_handle,
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
-        nodes=_create_mock_v6e_nodes(num_hosts=2, tpu_per_host=4),
     )
 
-    acquired = TPUAccelerator(
-        TPUConfig(topology="2x4", chips_per_vm=4)
-    ).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=8,
-            executor_backend="ray",
-            placement_group_config={"bundle_per_worker": {"TPU": 1}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4)),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=8,
+        executor_backend="ray",
+        placement_group_config={"bundle_per_worker": {"TPU": 1}},
+        concurrency=1,
     )
 
     assert fake_handle.num_hosts == 2
@@ -1735,7 +1617,7 @@ def test_v6e_2x4_chips_per_vm_four_per_chip_granularity(monkeypatch):
     assert slice_kwargs[0]["bundle_label_selector"] is None
     for bundle in fake_handle.placement_group.bundle_specs:
         assert bundle["TPU"] == 1.0
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_processor_config_accepts_chips_per_vm_dict():
@@ -1767,15 +1649,14 @@ def test_single_vm_v4_pod_type_uses_cores_not_chips(monkeypatch):
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
     )
 
-    acquired = TPUAccelerator(TPUConfig(topology="2x2x1")).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V4",
-            tensor_parallel_size=4,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="2x2x1")),
+        accelerator_type="TPU-V4",
+        tensor_parallel_size=4,
+        executor_backend="ray",
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
 
     assert slice_kwargs[0]["topology"] == "2x2x1"
@@ -1786,7 +1667,7 @@ def test_single_vm_v4_pod_type_uses_cores_not_chips(monkeypatch):
             "ray.io/tpu-pod-type": "v4-8",
         }
     ]
-    acquired.close_handle.shutdown()
+    close_fn()
 
 
 def test_slice_allocation_kwargs_and_head_release_ordering(monkeypatch):
@@ -1814,45 +1695,36 @@ def test_slice_allocation_kwargs_and_head_release_ordering(monkeypatch):
             slice_kwargs.append(kwargs),
         ),
         on_wait=lambda pg, timeout_s: call_order.append(("wait", timeout_s)),
-        on_nodes=lambda slice_name, nodes=None: (
-            call_order.append(("nodes", slice_name)),
-            _create_mock_v6e_nodes(num_hosts=4, tpu_per_host=4),
-        )[1],
     )
 
-    acquired = TPUAccelerator(TPUConfig(topology="4x4")).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
 
-    assert slice_kwargs == [
-        {
-            "topology": "4x4",
-            "accelerator_version": "v6e",
-            "resources_per_bundle": {
-                "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
-            },
-            "bundle_label_selector": None,
-            "strategy": "PACK",
-            "tpu_resource_per_chip": 1,
-            "chips_per_vm": 4,
-        }
-    ]
+    assert len(slice_kwargs) == 1
+    assert slice_kwargs[0]["topology"] == "4x4"
+    assert slice_kwargs[0]["accelerator_version"] == "v6e"
+    assert slice_kwargs[0]["resources_per_bundle"] == {
+        "CPU": float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST),
+    }
+    assert slice_kwargs[0]["bundle_label_selector"] is None
+    assert slice_kwargs[0]["strategy"] == "PACK"
+    assert slice_kwargs[0]["tpu_resource_per_chip"] == 1
+    assert "chips_per_vm" not in slice_kwargs[0]
     assert call_order == [
         "slice_pg",
         ("wait", DEFAULT_PG_READY_TIMEOUT_S),
         "release_head",
-        ("nodes", "tpu-slice-0"),
     ]
     assert fake_handle.released_head_pgs == 1
     assert fake_handle.shutdown_calls == 0
-    acquired.close_handle.shutdown()
+    close_fn()
     assert fake_handle.shutdown_calls == 1
 
 
@@ -1863,44 +1735,41 @@ def test_runtime_env_merge_matrix(monkeypatch):
     _install_tpu_slice_fakes(monkeypatch, fake_handle)
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
 
-    acquired = backend.build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            runtime_env={
-                "pip": ["numpy"],
-                "env_vars": {
-                    "USER_VAR": "keep-me",
-                    "TPU_MULTIHOST_BACKEND": "ray",
-                    "RAY_TPU_RESOURCE_PER_CHIP": "1",
-                },
+    kwargs, close_fn = _tpu_options(
+        backend,
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        runtime_env={
+            "pip": ["numpy"],
+            "env_vars": {
+                "USER_VAR": "keep-me",
+                "TPU_MULTIHOST_BACKEND": "ray",
+                "RAY_TPU_RESOURCE_PER_CHIP": "1",
             },
-            concurrency=1,
-        )
+        },
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
-    env_vars = acquired.plan.map_batches_kwargs["runtime_env"]["env_vars"]
+    env_vars = kwargs["runtime_env"]["env_vars"]
     assert env_vars["USER_VAR"] == "keep-me"
     assert env_vars == {
         "USER_VAR": "keep-me",
         **TPU_ENGINE_ENV_VARS,
     }
-    assert acquired.plan.required_engine_env_vars == dict(TPU_ENGINE_ENV_VARS)
-    assert acquired.plan.map_batches_kwargs["runtime_env"]["pip"] == ["numpy"]
+    assert kwargs["runtime_env"]["pip"] == ["numpy"]
 
     with pytest.raises(ValueError, match="runtime_env\\['env_vars'\\] must be"):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                runtime_env={"env_vars": ["not-a-dict"]},
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            runtime_env={"env_vars": ["not-a-dict"]},
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
 
 
@@ -1941,15 +1810,14 @@ def test_slice_ready_timeout_is_configurable(monkeypatch):
 
     _install_tpu_slice_fakes(monkeypatch, fake_handle, on_wait=failing_timeout)
     with pytest.raises(TimeoutError, match="Timed out after 7"):
-        TPUAccelerator(TPUConfig(topology="4x4")).build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                executor_backend="ray",
-                concurrency=1,
-            )
+        _tpu_options(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            concurrency=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
         )
     assert fake_handle.shutdown_calls == 1
     assert fake_handle.released_head_pgs == 0
@@ -1958,16 +1826,6 @@ def test_slice_ready_timeout_is_configurable(monkeypatch):
 def test_ordering_and_cleanup_on_failures(monkeypatch):
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
     backend = TPUAccelerator(TPUConfig(topology="4x4"))
-    request = BatchSchedulingRequest(
-        accelerator_type="TPU-V6E",
-        tensor_parallel_size=16,
-        pipeline_parallel_size=1,
-        data_parallel_size=1,
-        executor_backend="ray",
-        placement_group_config=None,
-        runtime_env=None,
-        concurrency=1,
-    )
 
     # Timeout case -> translates to TimeoutError and cleans up exactly once
     fake_handle = FakeSlicePlacementGroupHandle(
@@ -1979,7 +1837,13 @@ def test_ordering_and_cleanup_on_failures(monkeypatch):
 
     _install_tpu_slice_fakes(monkeypatch, fake_handle, on_wait=failing_timeout)
     with pytest.raises(TimeoutError, match="Timed out after"):
-        backend.build_batch_scheduling_plan(request)
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            concurrency=1,
+        )
     assert fake_handle.shutdown_calls == 1
     assert fake_handle.released_head_pgs == 0
 
@@ -1993,44 +1857,24 @@ def test_ordering_and_cleanup_on_failures(monkeypatch):
 
     _install_tpu_slice_fakes(monkeypatch, fake_handle, on_wait=failing_runtime)
     with pytest.raises(RuntimeError, match="GCS crash"):
-        backend.build_batch_scheduling_plan(request)
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            concurrency=1,
+        )
     assert fake_handle.shutdown_calls == 1
-
-    # Node count mismatch -> raises RuntimeError and cleans up exactly once
-    fake_handle = FakeSlicePlacementGroupHandle(
-        topology="4x4", num_hosts=4, chips_per_host=4
-    )
-    _install_tpu_slice_fakes(
-        monkeypatch,
-        fake_handle,
-        nodes=_create_mock_v6e_nodes(num_hosts=3, tpu_per_host=4),
-    )
-    with pytest.raises(RuntimeError, match="contains 3 alive nodes"):
-        backend.build_batch_scheduling_plan(request)
-    assert fake_handle.shutdown_calls == 1
-    assert fake_handle.released_head_pgs == 1
-
-    # Chip count mismatch -> raises RuntimeError and cleans up exactly once
-    fake_handle = FakeSlicePlacementGroupHandle(
-        topology="4x4", num_hosts=4, chips_per_host=4
-    )
-    _install_tpu_slice_fakes(
-        monkeypatch,
-        fake_handle,
-        nodes=_create_mock_v6e_nodes(num_hosts=4, tpu_per_host=2),
-    )
-    with pytest.raises(RuntimeError, match="advertises 2.0 TPU resources"):
-        backend.build_batch_scheduling_plan(request)
-    assert fake_handle.shutdown_calls == 1
-
-
-# -------------------------------------------------------------------------
-# Base processor and managed processor lifecycle tests
-# -------------------------------------------------------------------------
 
 
 def test_managed_processor_lifecycle_no_finalizer():
     fake_handle = FakeSlicePlacementGroupHandle()
+    close_calls = {"n": 0}
+
+    def close_fn():
+        close_calls["n"] += 1
+        fake_handle.shutdown()
+
     proc_config = vLLMEngineProcessorConfig(
         model_source="test-model",
         accelerator_type="TPU-V6E",
@@ -2039,7 +1883,7 @@ def test_managed_processor_lifecycle_no_finalizer():
     managed_proc = _ManagedVLLMProcessor(
         config=proc_config,
         stages=[],
-        close_handle=fake_handle,
+        close_fn=close_fn,
     )
 
     # Context manager usage
@@ -2047,226 +1891,99 @@ def test_managed_processor_lifecycle_no_finalizer():
         assert p._closed is False
 
     assert managed_proc._closed is True
+    assert close_calls["n"] == 1
     assert fake_handle.shutdown_calls == 1
 
     # Idempotent close
     managed_proc.close()
-    assert fake_handle.shutdown_calls == 1
+    assert close_calls["n"] == 1
 
     # Closed processor rejects execution
-    ds = ray.data.from_items([{"prompt": "test"}])
-    with pytest.raises(RuntimeError, match="Processor is closed"):
-        managed_proc(ds)
+    class _ClosedDataset:
+        pass
 
-    # Deleting processor does NOT trigger handle shutdown (no finalizer)
-    fake_handle_del = FakeSlicePlacementGroupHandle()
+    with pytest.raises(RuntimeError, match="Processor is closed"):
+        managed_proc(_ClosedDataset())  # type: ignore[arg-type]
+
+    # Deleting processor does NOT trigger close (no finalizer)
+    close_calls_del = {"n": 0}
+
+    def close_fn_del():
+        close_calls_del["n"] += 1
+
     proc_to_del = _ManagedVLLMProcessor(
         config=proc_config,
         stages=[],
-        close_handle=fake_handle_del,
+        close_fn=close_fn_del,
     )
     del proc_to_del
     gc.collect()
-    assert fake_handle_del.shutdown_calls == 0
+    assert close_calls_del["n"] == 0
 
 
-def test_managed_processor_shutdown_exception_retains_handle():
-    """If a custom handle's shutdown raises, close keeps the handle for another try.
+def test_managed_processor_close_exception_retains_callable():
+    """If close_fn raises, close keeps the callable for another try."""
+    first_attempt = True
+    calls = {"n": 0}
 
-    Production SlicePlacementGroup.shutdown() typically logs PG removal failures and
-    returns successfully, so this exercises defensive handle retention rather than
-    guaranteed retry of Ray core PG removal.
-    """
-    fake_handle = FakeSlicePlacementGroupHandle()
+    def failing_close():
+        nonlocal first_attempt
+        calls["n"] += 1
+        if first_attempt:
+            first_attempt = False
+            raise ConnectionError("Transient network failure")
+
     proc_config = vLLMEngineProcessorConfig(
         model_source="test-model",
         accelerator_type="TPU-V6E",
         accelerator_config=TPUConfig(topology="4x4"),
     )
-
-    # Simulate shutdown failure on first attempt
-    first_attempt = True
-
-    def failing_shutdown():
-        nonlocal first_attempt
-        if first_attempt:
-            first_attempt = False
-            raise ConnectionError("Transient network failure")
-        fake_handle.shutdown_calls += 1
-
-    fake_handle.shutdown = failing_shutdown
-
     proc = _ManagedVLLMProcessor(
         config=proc_config,
         stages=[],
-        close_handle=fake_handle,
+        close_fn=failing_close,
     )
 
-    # First close attempt fails and leaves handle present
     with pytest.raises(ConnectionError, match="Transient network failure"):
         proc.close()
-    assert proc._close_handle is not None
+    assert proc._close_fn is not None
 
-    # Second close attempt retries and succeeds
     proc.close()
-    assert proc._close_handle is None
-    assert fake_handle.shutdown_calls == 1
+    assert proc._close_fn is None
+    assert calls["n"] == 2
 
 
-def test_batch_owned_tpu_resources_retains_wrapper_until_success():
-    """Production Batch close handle must keep the SlicePG wrapper for retry."""
-    from ray.llm._internal.common.accelerators import _BatchOwnedTPUResources
+def test_production_kwargs_round_trips_through_pickle(mock_tpu_slice_environment):
+    """map_batches kwargs must survive embedding in the lazy Dataset graph.
 
-    fake_handle = FakeSlicePlacementGroupHandle()
-    backend = TPUAccelerator(TPUConfig(topology="4x4"))
-    backend._slice_pg_wrapper = fake_handle
-
-    first_attempt = True
-
-    def failing_shutdown():
-        nonlocal first_attempt
-        if first_attempt:
-            first_attempt = False
-            raise ConnectionError("Transient network failure")
-        fake_handle.shutdown_calls += 1
-
-    fake_handle.shutdown = failing_shutdown
-    close_handle = _BatchOwnedTPUResources(backend=backend, wrapper=fake_handle)
-
-    with pytest.raises(ConnectionError, match="Transient network failure"):
-        close_handle.shutdown()
-    assert close_handle.wrapper is fake_handle
-    assert backend._slice_pg_wrapper is fake_handle
-
-    close_handle.shutdown()
-    assert close_handle.wrapper is None
-    assert backend._slice_pg_wrapper is None
-    assert fake_handle.shutdown_calls == 1
-
-
-# -------------------------------------------------------------------------
-# UDF runtime diagnostic tests
-# -------------------------------------------------------------------------
-
-
-@pytest.fixture
-def recording_engine_wrapper(monkeypatch):
-    """Replace the vLLM engine wrapper so UDF construction needs no vLLM install."""
-    monkeypatch.setattr(
-        "ray.llm._internal.batch.stages.vllm_engine_stage.download_model_files",
-        lambda *args, **kwargs: "/tmp/mock-model",
-    )
-    calls = []
-
-    class DummySchedulerConfig:
-        max_num_seqs = 16
-
-    class DummyWrapper:
-        def __init__(self, *args, **kwargs):
-            calls.append(kwargs)
-            self.max_pending_requests = 16
-
-        def get_scheduler_config(self):
-            return DummySchedulerConfig()
-
-    monkeypatch.setattr(
-        "ray.llm._internal.batch.stages.vllm_engine_stage.vLLMEngineWrapper",
-        DummyWrapper,
-    )
-    return calls
-
-
-def _build_udf(**kwargs):
-    return vLLMEngineStageUDF(
-        data_column="__data",
-        expected_input_keys=["prompt"],
-        batch_size=1,
-        max_concurrent_batches=1,
-        model="test-model",
-        engine_kwargs={},
-        **kwargs,
-    )
-
-
-def test_udf_rejects_missing_required_env_vars(monkeypatch, recording_engine_wrapper):
-    """A required environment variable that did not propagate fails before engine init."""
-    monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
-
-    with pytest.raises(RuntimeError, match="TPU_MULTIHOST_BACKEND='ray'"):
-        _build_udf(required_env_vars={"TPU_MULTIHOST_BACKEND": "ray"})
-    assert recording_engine_wrapper == []
-
-    # A wrong value is rejected the same way as a missing one.
-    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "grpc")
-    with pytest.raises(RuntimeError, match="TPU_MULTIHOST_BACKEND='ray'"):
-        _build_udf(required_env_vars={"TPU_MULTIHOST_BACKEND": "ray"})
-    assert recording_engine_wrapper == []
-
-
-def test_udf_accepts_satisfied_required_env_vars(monkeypatch, recording_engine_wrapper):
-    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
-    monkeypatch.setenv("RAY_TPU_RESOURCE_PER_CHIP", "1")
-
-    _build_udf(
-        required_env_vars={
-            "TPU_MULTIHOST_BACKEND": "ray",
-            "RAY_TPU_RESOURCE_PER_CHIP": "1",
-        },
-    )
-
-    assert len(recording_engine_wrapper) == 1
-    assert "reuse_current_placement_group" not in recording_engine_wrapper[0]
-
-
-def test_udf_gpu_path_checks_no_env_vars(monkeypatch, recording_engine_wrapper):
-    """The GPU path carries no requirements and must not inspect the environment."""
-    monkeypatch.delenv("TPU_MULTIHOST_BACKEND", raising=False)
-    monkeypatch.delenv("RAY_TPU_RESOURCE_PER_CHIP", raising=False)
-
-    _build_udf(required_env_vars=None)
-
-    assert len(recording_engine_wrapper) == 1
-    assert "reuse_current_placement_group" not in recording_engine_wrapper[0]
-
-
-# -------------------------------------------------------------------------
-# Transport, factory, and compatibility export tests
-# -------------------------------------------------------------------------
-
-
-def test_production_plan_round_trips_through_pickle(mock_tpu_slice_environment):
-    """The real backend plan must survive embedding in the lazy Dataset graph.
-
-    Only ``AcquiredBatchResources.plan`` is serialized. The driver-owned close
-    handle stays out of the plan so the slice cannot be released from a worker.
+    The driver-owned close callable stays on the processor, not in the kwargs.
     """
-    acquired = TPUAccelerator(TPUConfig(topology="4x4")).build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _tpu_options(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=16,
+        executor_backend="ray",
+        concurrency=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
 
-    loaded = pickle.loads(pickle.dumps(acquired.plan))
+    strategy = kwargs.pop("scheduling_strategy")
+    assert isinstance(strategy, PlacementGroupSchedulingStrategy)
+    assert strategy.placement_group_bundle_index == 0
+    assert strategy.placement_group_capture_child_tasks is True
 
-    kwargs = loaded.map_batches_kwargs
-    assert kwargs["num_cpus"] == PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
-    assert kwargs["num_gpus"] == 0
-    assert kwargs["resources"] == {}
-    assert kwargs["runtime_env"]["env_vars"] == {
+    # Pickle the plain DAG-safe fields (strategy holds a live PG handle).
+    loaded = pickle.loads(pickle.dumps(kwargs))
+    assert loaded["num_cpus"] == PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
+    assert loaded["num_gpus"] == 0
+    assert loaded["resources"] == {}
+    assert loaded["runtime_env"]["env_vars"] == {
         "TPU_MULTIHOST_BACKEND": "ray",
         "RAY_TPU_RESOURCE_PER_CHIP": "1",
     }
-    strategy = kwargs["scheduling_strategy"]
-    assert strategy.placement_group_bundle_index == 0
-    assert strategy.placement_group_capture_child_tasks is True
-    assert loaded.required_engine_env_vars == kwargs["runtime_env"]["env_vars"]
-    assert not hasattr(loaded, "close_handle")
-    assert not hasattr(loaded, "reuse_current_placement_group")
+    assert callable(close_fn)
+    close_fn()
 
 
 def test_fresh_interpreter_imports():
@@ -2312,21 +2029,17 @@ def test_serve_shares_the_accelerator_definitions():
 
 def test_gpu_build_batch_scheduling_plan_uni():
     """Single-replica GPU plans pin GPUs directly and never reuse a driver PG."""
-    acquired = GPUAccelerator().build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="A100",
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="uni",
-            runtime_env={"env_vars": {"USER_VAR": "gpu"}},
-            concurrency=1,
-        )
+    kwargs, close_fn = _gpu_options(
+        accelerator_type="A100",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        executor_backend="uni",
+        runtime_env={"env_vars": {"USER_VAR": "gpu"}},
+        concurrency=1,
     )
 
-    assert acquired.close_handle is None
-    assert acquired.plan.required_engine_env_vars is None
-    kwargs = acquired.plan.map_batches_kwargs
+    assert close_fn is None
+    kwargs = kwargs
     assert kwargs["accelerator_type"] == "A100"
     assert kwargs["num_gpus"] == 1
     assert "ray_remote_args_fn" not in kwargs
@@ -2351,20 +2064,16 @@ def test_gpu_build_batch_scheduling_plan_ray_executor(monkeypatch):
 
     monkeypatch.setattr(GPUAccelerator, "create_placement_group", fake_create)
 
-    acquired = GPUAccelerator().build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="A100",
-            tensor_parallel_size=2,
-            pipeline_parallel_size=2,
-            data_parallel_size=1,
-            executor_backend="ray",
-            concurrency=1,
-        )
+    kwargs, close_fn = _gpu_options(
+        accelerator_type="A100",
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        executor_backend="ray",
+        concurrency=1,
     )
 
-    assert acquired.close_handle is None
-    assert acquired.plan.required_engine_env_vars is None
-    kwargs = acquired.plan.map_batches_kwargs
+    assert close_fn is None
+    kwargs = kwargs
     assert kwargs["accelerator_type"] == "A100"
     assert kwargs["num_gpus"] == 0
     ray_remote_args_fn = kwargs["ray_remote_args_fn"]
@@ -2384,21 +2093,18 @@ def test_gpu_build_batch_scheduling_plan_ray_executor(monkeypatch):
 
 def test_gpu_build_batch_scheduling_plan_custom_placement_group_uni():
     """Custom GPU placement bundles collapse into actor resource requests for uni."""
-    acquired = GPUAccelerator().build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="A100",
-            tensor_parallel_size=2,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="uni",
-            placement_group_config={
-                "bundle_per_worker": {"GPU": 1, "CPU": 2, "custom": 1},
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _gpu_options(
+        accelerator_type="A100",
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        executor_backend="uni",
+        placement_group_config={
+            "bundle_per_worker": {"GPU": 1, "CPU": 2, "custom": 1},
+        },
+        concurrency=1,
     )
 
-    kwargs = acquired.plan.map_batches_kwargs
+    kwargs = kwargs
     assert kwargs["num_gpus"] == 2
     assert kwargs["num_cpus"] == 4
     assert kwargs["resources"] == {"custom": 2}
@@ -2423,22 +2129,19 @@ def test_gpu_ray_callback_custom_bundles_inject_accelerator_token(monkeypatch):
 
     monkeypatch.setattr(GPUAccelerator, "create_placement_group", fake_create)
 
-    acquired = GPUAccelerator().build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="A100",
-            tensor_parallel_size=2,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            placement_group_config={
-                "bundle_per_worker": {"GPU": 1, "CPU": 2},
-                "strategy": "STRICT_PACK",
-            },
-            concurrency=1,
-        )
+    kwargs, close_fn = _gpu_options(
+        accelerator_type="A100",
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        executor_backend="ray",
+        placement_group_config={
+            "bundle_per_worker": {"GPU": 1, "CPU": 2},
+            "strategy": "STRICT_PACK",
+        },
+        concurrency=1,
     )
 
-    remote_args = acquired.plan.map_batches_kwargs["ray_remote_args_fn"]()
+    remote_args = kwargs["ray_remote_args_fn"]()
     assert isinstance(
         remote_args["scheduling_strategy"], PlacementGroupSchedulingStrategy
     )
@@ -2467,18 +2170,15 @@ def test_gpu_ray_callback_treats_null_bundles_as_empty(monkeypatch):
 
     monkeypatch.setattr(GPUAccelerator, "create_placement_group", fake_create)
 
-    acquired = GPUAccelerator().build_batch_scheduling_plan(
-        BatchSchedulingRequest(
-            accelerator_type="A100",
-            tensor_parallel_size=2,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-            executor_backend="ray",
-            placement_group_config={"bundles": None, "strategy": "PACK"},
-            concurrency=1,
-        )
+    kwargs, close_fn = _gpu_options(
+        accelerator_type="A100",
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        executor_backend="ray",
+        placement_group_config={"bundles": None, "strategy": "PACK"},
+        concurrency=1,
     )
-    acquired.plan.map_batches_kwargs["ray_remote_args_fn"]()
+    kwargs["ray_remote_args_fn"]()
     assert captured["bundles"] == []
 
 
@@ -2489,14 +2189,13 @@ def test_tpu_batch_rejects_strategy_only_placement_group_config():
         ValueError,
         match="placement_group_config must specify bundle_per_worker or bundles",
     ):
-        backend.build_batch_scheduling_plan(
-            BatchSchedulingRequest(
-                accelerator_type="TPU-V6E",
-                tensor_parallel_size=16,
-                executor_backend="ray",
-                placement_group_config={"strategy": "PACK"},
-                concurrency=1,
-            )
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=16,
+            executor_backend="ray",
+            placement_group_config={"strategy": "PACK"},
+            concurrency=1,
         )
 
 

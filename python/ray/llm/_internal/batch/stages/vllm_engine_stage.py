@@ -627,7 +627,6 @@ class vLLMEngineStageUDF(StatefulStageUDF):
         dynamic_lora_loading_path: Optional[str] = None,
         should_continue_on_error: bool = False,
         log_engine_metrics: bool = True,
-        required_env_vars: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the vLLMEngineStageUDF.
@@ -652,20 +651,7 @@ class vLLMEngineStageUDF(StatefulStageUDF):
                 set to the error message.
             log_engine_metrics: If True, export vLLM engine metrics (prefix cache hit rate,
                 TTFT, TPOT, KV cache utilization, etc.) to Ray's Prometheus endpoint.
-            required_env_vars: Environment variables that must already hold these exact
-                values in this actor. The accelerator backend sets them through the
-                actor's runtime environment; checking them here fails fast with an
-                actionable message if they did not propagate.
         """
-        for name, required in (required_env_vars or {}).items():
-            actual = os.environ.get(name)
-            if actual != required:
-                raise RuntimeError(
-                    f"This accelerator requires {name}={required!r} in the engine "
-                    f"actor environment; got {actual!r}. The runtime environment did "
-                    "not propagate to this actor."
-                )
-
         super().__init__(data_column, expected_input_keys)
         self.model = model
         self.should_continue_on_error = should_continue_on_error

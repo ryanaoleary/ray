@@ -3,7 +3,7 @@
 import hashlib
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import transformers
 from pydantic import Field, field_validator, model_validator
@@ -46,8 +46,6 @@ from ray.llm._internal.common.accelerators import (
     CPU_ACCELERATOR_TYPE_LITERAL,
     TPU_ACCELERATOR_VALUES,
     AnyAcceleratorConfig,
-    BatchResourceHandle,
-    BatchSchedulingRequest,
     CPUConfig,
     GPUConfig,
     TPUConfig,
@@ -264,7 +262,7 @@ class _ManagedVLLMProcessor(Processor):
         postprocess: Optional[UserDefinedFunction] = None,
         preprocess_map_kwargs: Optional[Dict[str, Any]] = None,
         postprocess_map_kwargs: Optional[Dict[str, Any]] = None,
-        close_handle: Optional[BatchResourceHandle] = None,
+        close_fn: Optional[Callable[[], None]] = None,
     ):
         super().__init__(
             config=config,
@@ -274,26 +272,26 @@ class _ManagedVLLMProcessor(Processor):
             preprocess_map_kwargs=preprocess_map_kwargs,
             postprocess_map_kwargs=postprocess_map_kwargs,
         )
-        self._close_handle = close_handle
+        self._close_fn = close_fn
         self._closed = False
         self._lock = threading.Lock()
 
     def close(self) -> None:
         """Idempotently release driver-owned batch resources.
 
-        Marks the processor closed, then requests release of any owned handle.
-        If a custom handle's ``shutdown()`` raises, the handle is retained so a
-        later ``close()`` can retry. Production ``SlicePlacementGroup.shutdown()``
-        typically logs placement-group removal failures and returns successfully,
-        so driver exit remains the fallback fate-sharing boundary for those cases.
+        Marks the processor closed, then invokes the driver-local close callable.
+        If the callable raises, it is retained so a later ``close()`` can retry.
+        Production ``SlicePlacementGroup.shutdown()`` typically logs placement-group
+        removal failures and returns successfully, so driver exit remains the
+        fallback fate-sharing boundary for those cases.
         """
         with self._lock:
             self._closed = True
-            if self._close_handle is None:
+            if self._close_fn is None:
                 return
 
-            self._close_handle.shutdown()
-            self._close_handle = None
+            self._close_fn()
+            self._close_fn = None
 
     def __enter__(self) -> "_ManagedVLLMProcessor":
         return self
@@ -420,17 +418,6 @@ def build_vllm_engine_processor(
         )
     )
 
-    request = BatchSchedulingRequest(
-        accelerator_type=config.accelerator_type,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        data_parallel_size=dp_size,
-        executor_backend=executor_backend,
-        placement_group_config=config.placement_group_config,
-        runtime_env=config.runtime_env,
-        concurrency=config.concurrency,
-    )
-
     # Resolve all stage configs before acquiring expensive accelerator resources
     # (e.g. a TPU slice) so invalid stage configuration fails cheaply.
     processor_defaults = {
@@ -460,7 +447,13 @@ def build_vllm_engine_processor(
         processor_defaults,
     )
 
-    acquired = backend.build_batch_scheduling_plan(request)
+    map_batches_kwargs, close_fn = backend.build_batch_scheduling_options(
+        accelerator_type=config.accelerator_type,
+        engine_kwargs=engine_kwargs,
+        placement_group_config=config.placement_group_config,
+        runtime_env=config.runtime_env,
+        concurrency=config.concurrency,
+    )
 
     stages: List[StatefulStage] = []
     try:
@@ -527,7 +520,7 @@ def build_vllm_engine_processor(
             zero_copy_batch=True,
             compute=compute,
             max_concurrency=config.max_concurrent_batches,
-            **acquired.plan.map_batches_kwargs,
+            **map_batches_kwargs,
         )
 
         stages.append(
@@ -542,7 +535,6 @@ def build_vllm_engine_processor(
                     dynamic_lora_loading_path=config.dynamic_lora_loading_path,
                     should_continue_on_error=config.should_continue_on_error,
                     log_engine_metrics=config.log_engine_metrics,
-                    required_env_vars=acquired.plan.required_engine_env_vars,
                 ),
                 map_batches_kwargs=vllm_map_batches_kwargs,
             )
@@ -559,7 +551,7 @@ def build_vllm_engine_processor(
                 )
             )
 
-        if acquired.close_handle is None:
+        if close_fn is None:
             return Processor(
                 config=config,
                 stages=stages,
@@ -576,12 +568,12 @@ def build_vllm_engine_processor(
             postprocess=postprocess,
             preprocess_map_kwargs=preprocess_map_kwargs,
             postprocess_map_kwargs=postprocess_map_kwargs,
-            close_handle=acquired.close_handle,
+            close_fn=close_fn,
         )
     except Exception:
-        if acquired.close_handle is not None:
+        if close_fn is not None:
             try:
-                acquired.close_handle.shutdown()
+                close_fn()
             except Exception:
                 logger.exception(
                     "Failed to release accelerator batch resources after processor "

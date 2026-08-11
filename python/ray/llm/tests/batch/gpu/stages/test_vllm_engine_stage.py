@@ -72,7 +72,7 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
     """Stage construction stays accelerator-neutral; GPU PG bundles are owned by the backend.
 
     Accelerator token injection and bundle shape (F-8) are covered by
-    ``GPUAccelerator.build_batch_scheduling_plan`` tests that invoke ``ray_remote_args_fn``.
+    ``GPUAccelerator.build_batch_scheduling_options`` tests that invoke ``ray_remote_args_fn``.
     """
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
