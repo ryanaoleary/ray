@@ -35,14 +35,10 @@ CPU_ACCELERATOR_TYPE_LITERAL = "CPU"
 # Bound driver-side wait for an eagerly acquired TPU SlicePG.
 DEFAULT_PG_READY_TIMEOUT_S = 180.0
 
-# Read by tpu_inference's TPU platform to select its Ray executor. See
-# tpu_inference/platforms/tpu_jax.py.
+# Required env for the TPU distributed executor backend.
 TPU_MULTIHOST_BACKEND_ENV_VAR = "TPU_MULTIHOST_BACKEND"
-TPU_MULTIHOST_BACKEND_RAY = "ray"
-
-# Environment that the TPU engine actor and its child workers must observe.
 TPU_ENGINE_ENV_VARS = {
-    TPU_MULTIHOST_BACKEND_ENV_VAR: TPU_MULTIHOST_BACKEND_RAY,
+    TPU_MULTIHOST_BACKEND_ENV_VAR: "ray",
     RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR: "1",
 }
 
@@ -380,18 +376,7 @@ def _gpu_ray_scheduling_strategy_fn(
 
 
 class TPUAccelerator(AcceleratorBackend):
-    """TPU backend for Ray Serve deployments and Ray Data batch inference.
-
-    For batch inference, the backend reserves one ``SlicePlacementGroup`` on the driver
-    while the processor is built, waits for it under a bounded timeout, releases the
-    head reservation markers, and returns a static scheduling strategy that pins one
-    Ray Data engine actor to bundle 0.
-
-    The slice handle is driver-local and never enters the lazy Dataset graph, so the
-    processor owns the slice for its explicit lifetime. There is no finalizer: the
-    Dataset graph can outlive the ``Processor`` object, and driver exit is the fallback
-    boundary. Callers must finish every derived Dataset before closing the processor.
-    """
+    """TPU backend shared by Ray Serve and Ray Data batch inference."""
 
     def __init__(self, config: Optional[TPUConfig] = None):
         self._config = config or TPUConfig()
@@ -436,11 +421,9 @@ class TPUAccelerator(AcceleratorBackend):
             )
 
         num_hosts = max(1, num_chips // chips_per_host)
-
         tpu_resources = min(num_chips, chips_per_host)
         bundle = {"TPU": tpu_resources}
         bundle[format_ray_accelerator_resource(accelerator_type_str)] = 0.001
-
         return [bundle.copy() for _ in range(num_hosts)]
 
     def create_placement_group(
@@ -459,7 +442,22 @@ class TPUAccelerator(AcceleratorBackend):
                 "accelerator_type must be provided for TPU slice provisioning."
             )
 
-        worker_bundle = self._resolve_topology_worker_bundle(bundles)
+        # Serve semantics: homogeneous positive-TPU bundles, else TPU:1.
+        if bundles:
+            tpu_bundles = [b for b in bundles if b.get("TPU", 0) > 0]
+            if not tpu_bundles:
+                worker_bundle = {"TPU": 1}
+            else:
+                worker_bundle = tpu_bundles[0]
+                if any(b != worker_bundle for b in tpu_bundles):
+                    raise ValueError(
+                        "Heterogeneous TPU bundles are not supported when `topology` is set. "
+                        "A multi-host TPU slice requires homogeneous resource bundles across all workers. "
+                        "Please use `bundle_per_worker` in `placement_group_config` to define uniform worker resources."
+                    )
+        else:
+            worker_bundle = {"TPU": 1}
+
         self._create_slice_pg_handle(
             accelerator_type=accelerator_type_str,
             resources_per_bundle=worker_bundle,
@@ -468,41 +466,6 @@ class TPUAccelerator(AcceleratorBackend):
         )
         return self._slice_pg_wrapper.placement_group
 
-    def _resolve_topology_worker_bundle(
-        self, bundles: List[Dict[str, float]]
-    ) -> Dict[str, float]:
-        """Resolve a homogeneous TPU worker-bundle template from Serve/Data PG bundles.
-
-        Preserves existing Serve semantics for positive-TPU bundles while ensuring
-        no-TPU templates preserve CPU/custom resources with a ``{"TPU": 1}`` fallback.
-        """
-        if not bundles:
-            return {"TPU": 1}
-
-        tpu_bundles = [b for b in bundles if b.get("TPU", 0) > 0]
-        if tpu_bundles:
-            worker_bundle = tpu_bundles[0]
-            if any(b != worker_bundle for b in tpu_bundles):
-                raise ValueError(
-                    "Heterogeneous TPU bundles are not supported when `topology` is set. "
-                    "A multi-host TPU slice requires homogeneous resource bundles across all workers. "
-                    "Please use `bundle_per_worker` in `placement_group_config` to define uniform worker resources."
-                )
-            return dict(worker_bundle)
-
-        # No positive-TPU bundles: preserve CPU/custom resources and add TPU: 1.
-        cleaned_bundles = [
-            {k: v for k, v in b.items() if v != 0 and v != 0.0} for b in bundles
-        ]
-        template = cleaned_bundles[0]
-        if any(b != template for b in cleaned_bundles):
-            raise ValueError(
-                "Heterogeneous placement_group_config bundles are not supported "
-                "when `topology` is set; got "
-                f"{bundles!r}."
-            )
-        return {**template, "TPU": 1}
-
     def _create_slice_pg_handle(
         self,
         *,
@@ -510,14 +473,8 @@ class TPUAccelerator(AcceleratorBackend):
         resources_per_bundle: Dict[str, float],
         strategy: str,
         name: str = "",
-        tpu_resource_per_chip: Optional[int] = None,
     ):
-        """Create and own a topology-backed SlicePlacementGroup.
-
-        Both Serve (deferred replica PG) and Data (eager driver PG) call this
-        private primitive so ``slice_placement_group`` stays encapsulated here.
-        ``chips_per_vm`` is taken from this backend's ``TPUConfig``.
-        """
+        """Create and own a topology-backed SlicePlacementGroup."""
         if not self._config.topology:
             raise ValueError(
                 "TPU slice placement requires accelerator_config.topology to be set."
@@ -528,24 +485,27 @@ class TPUAccelerator(AcceleratorBackend):
             )
             self.shutdown()
 
-        topology = self._config.topology.strip().lower()
-        version = get_tpu_version_from_type(accelerator_type)
+        # chips_per_vm is the only SlicePG kwarg beyond master's Serve call shape.
         slice_kwargs: Dict[str, Any] = {
-            "topology": topology,
-            "accelerator_version": version,
+            "topology": self._config.topology.strip().lower(),
+            "accelerator_version": get_tpu_version_from_type(accelerator_type),
             "resources_per_bundle": resources_per_bundle,
             "strategy": strategy,
-            "tpu_resource_per_chip": tpu_resource_per_chip,
+            "name": name,
         }
         if self._config.chips_per_vm is not None:
             slice_kwargs["chips_per_vm"] = self._config.chips_per_vm
-        if name:
-            slice_kwargs["name"] = name
         self._slice_pg_wrapper = slice_placement_group(**slice_kwargs)
         return self._slice_pg_wrapper
 
     @property
     def requires_deferred_placement_group(self) -> bool:
+        """
+        If a TPU topology is specified, we defer PG creation so the replica can
+        provision a `SlicePlacementGroup` at runtime. This ensures multi-host
+        TPU slices are gang-scheduled atomically according to their physical
+        topology rather than fragmented across the cluster.
+        """
         return bool(self._config.topology)
 
     @property
@@ -553,8 +513,12 @@ class TPUAccelerator(AcceleratorBackend):
         return True
 
     def get_remote_options(self, accelerator_type_str: str = None):
+        # The PlacementGroupSchedulingStrategy natively handles routing the task to
+        # the correct hardware. We omit TPU resource requests to avoid consuming
+        # chips that the model engine workers must use.
         options: Dict[str, Any] = {"resources": {}}
         if accelerator_type_str:
+            # Pin the task to the TPU accelerator to avoid scheduling on a CPU bundle.
             options["label_selector"] = {
                 "ray.io/accelerator-type": accelerator_type_str
             }
@@ -563,46 +527,26 @@ class TPUAccelerator(AcceleratorBackend):
     def shutdown(self):
         if self._slice_pg_wrapper is not None:
             try:
-                logger.info("Shutting down TPU slice placement group.")
+                logger.info("Shutting down TPU slice PG for server replica.")
                 self._slice_pg_wrapper.shutdown()
             except Exception as e:
                 logger.warning(f"Failed to shut down TPU slice PG: {e}")
             finally:
                 self._slice_pg_wrapper = None
 
-    @staticmethod
-    def _apply_batch_cpu_floor(bundle: Dict[str, float]) -> Dict[str, float]:
-        """Preserve user resources while ensuring Batch parent CPU admission."""
-        out: Dict[str, float] = {}
-        for key, value in bundle.items():
-            if value == 0 or value == 0.0:
-                continue
-            out[key] = value
-        if out.get("GPU", 0) > 0:
-            raise ValueError(
-                "GPU resources are not supported in topology-backed TPU Batch "
-                f"placement_group_config bundles; got GPU={out['GPU']!r}."
-            )
-        floor = float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST)
-        out["CPU"] = max(float(out.get("CPU", 0.0)), floor)
-        return out
-
     def _resolve_batch_worker_bundle(
         self,
         placement_group_config: Optional[Dict[str, Any]],
     ) -> Dict[str, float]:
-        """Resolve the homogeneous TPU worker-resource template for Batch.
+        """Resolve the Batch worker-resource template for one SlicePG bundle.
 
-        Default (no placement_group_config) intentionally omits TPU so Ray fills
-        chips-per-VM. Explicit placement_group_config supplies a single template
-        (via bundle_per_worker or bundles) that sets worker granularity (e.g. TPU:1)
-        with Batch parent CPU floor applied. Positive TPU-per-VM fit is enforced by
-        Ray in ``get_tpu_worker_resources``.
+        Default omits TPU so Ray fills chips-per-VM. Explicit configs supply a
+        homogeneous template. Always apply the parent-actor CPU floor so the
+        Ray Data engine actor and user map work can admit onto bundle 0.
         """
+        cpu_floor = float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST)
         if placement_group_config is None:
-            return {
-                "CPU": float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST),
-            }
+            return {"CPU": cpu_floor}
 
         bundle_per_worker = placement_group_config.get("bundle_per_worker")
         if bundle_per_worker is not None:
@@ -618,36 +562,23 @@ class TPUAccelerator(AcceleratorBackend):
             raise ValueError(
                 "placement_group_config must specify bundle_per_worker or bundles."
             )
-
-        self._validate_batch_tpu_template_bundles(source_bundles)
+        if not source_bundles:
+            raise ValueError(
+                "placement_group_config bundles must be non-empty when provided."
+            )
 
         has_positive_tpu = [bundle.get("TPU", 0) > 0 for bundle in source_bundles]
         if any(has_positive_tpu) and not all(has_positive_tpu):
             raise ValueError(
-                "Topology-backed TPU Batch placement_group_config bundles "
-                "cannot mix TPU-bearing and non-TPU bundles."
+                "TPU Batch placement_group_config bundles cannot mix TPU-bearing "
+                "and non-TPU bundles."
             )
 
-        worker_bundle = self._resolve_topology_worker_bundle(source_bundles)
-        return self._apply_batch_cpu_floor(worker_bundle)
-
-    @staticmethod
-    def _validate_batch_tpu_template_bundles(
-        bundles: List[Dict[str, float]],
-    ) -> None:
-        """Reject GPU / invalid explicit TPU values before shared fallback can mask them.
-
-        Positive TPU-per-VM fit (fits on a VM, divides evenly) is validated by Ray
-        in ``get_tpu_worker_resources``. Explicit ``TPU`` keys that are non-positive
-        or non-integer are rejected here so the omit-TPU ``TPU:1`` fallback cannot
-        hide them.
-        """
-        for bundle in bundles:
-            gpu = bundle.get("GPU", 0)
-            if gpu > 0:
+        for bundle in source_bundles:
+            if bundle.get("GPU", 0) > 0:
                 raise ValueError(
-                    "GPU resources are not supported in topology-backed TPU Batch "
-                    f"placement_group_config bundles; got GPU={gpu!r}."
+                    "GPU resources are not supported in TPU Batch "
+                    f"placement_group_config bundles; got GPU={bundle['GPU']!r}."
                 )
             if "TPU" not in bundle:
                 continue
@@ -656,14 +587,34 @@ class TPUAccelerator(AcceleratorBackend):
                 raise ValueError(
                     f"TPU resources per bundle must be a positive number; got {tpu!r}."
                 )
-            if float(tpu) != int(tpu):
+            if float(tpu) != int(tpu) or int(tpu) <= 0:
                 raise ValueError(
-                    f"TPU resources per bundle must be an integer; got {tpu!r}."
+                    f"TPU resources per bundle must be a positive integer; got {tpu!r}."
                 )
-            if int(tpu) <= 0:
+
+        if any(has_positive_tpu):
+            worker_bundle = dict(source_bundles[0])
+            if any(b != source_bundles[0] for b in source_bundles):
                 raise ValueError(
-                    f"TPU resources per bundle must be positive; got {int(tpu)}."
+                    "Heterogeneous TPU bundles are not supported when `topology` is set."
                 )
+        else:
+            # No positive TPU: preserve CPU/custom resources and add TPU:1 so
+            # SlicePG still materializes chip-bearing bundles.
+            cleaned = [
+                {k: v for k, v in b.items() if v != 0 and v != 0.0}
+                for b in source_bundles
+            ]
+            if any(b != cleaned[0] for b in cleaned):
+                raise ValueError(
+                    "Heterogeneous placement_group_config bundles are not supported "
+                    f"when `topology` is set; got {source_bundles!r}."
+                )
+            worker_bundle = {**cleaned[0], "TPU": 1}
+
+        out = {k: v for k, v in worker_bundle.items() if v != 0 and v != 0.0}
+        out["CPU"] = max(float(out.get("CPU", 0.0)), cpu_floor)
+        return out
 
     @staticmethod
     def _resolve_batch_slice_strategy(
@@ -674,28 +625,27 @@ class TPUAccelerator(AcceleratorBackend):
         num_bundles: int,
     ) -> str:
         """Validate PG strategies permitted by topology-backed TPU Batch."""
-        strategy = requested_strategy
         if num_hosts == 1 and num_bundles > 1:
-            if strategy not in ("PACK", "STRICT_PACK"):
+            if requested_strategy not in ("PACK", "STRICT_PACK"):
                 raise ValueError(
                     "Single-VM TPU topologies with multiple worker bundles require "
                     "PACK/STRICT_PACK so every bundle remains on the same TPU VM; "
-                    f"got strategy={strategy!r}."
+                    f"got strategy={requested_strategy!r}."
                 )
             return "STRICT_PACK"
 
         if num_hosts > 1:
-            if strategy == "STRICT_PACK":
+            if requested_strategy == "STRICT_PACK":
                 raise ValueError(
                     "STRICT_PACK cannot represent a multi-VM TPU topology "
                     f"({num_hosts} VMs for topology '{topology}')."
                 )
-            if strategy == "STRICT_SPREAD" and num_bundles > num_hosts:
+            if requested_strategy == "STRICT_SPREAD" and num_bundles > num_hosts:
                 raise ValueError(
                     "STRICT_SPREAD requires one node per bundle, but this topology "
                     f"has {num_hosts} physical TPU VMs and {num_bundles} bundles."
                 )
-        return strategy
+        return requested_strategy
 
     def build_batch_scheduling_options(
         self,
@@ -705,24 +655,15 @@ class TPUAccelerator(AcceleratorBackend):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Reserve a TPU slice and return ``(map_batches_kwargs, close_fn)``.
-
-        The driver reserves one ``SlicePlacementGroup`` while the processor is
-        built, waits under a bounded timeout, and releases head reservation
-        markers. SlicePG owns physical packing and single-host labels; Batch
-        validates which PG strategies this execution model permits. ``close_fn``
-        is the SlicePG shutdown callable.
-        """
+        """Eagerly reserve one TPU slice and return map_batches kwargs + close_fn."""
         tpu_config = self._config
         if not isinstance(tpu_config, TPUConfig) or not tpu_config.topology:
             raise ValueError(
                 "TPU slice placement requires accelerator_config.topology "
-                "(e.g. {'kind': 'tpu', 'topology': '4x4'}). Topology is required "
-                "to size and reserve a multi-host TPU slice; got "
-                f"config: {tpu_config}"
+                "(e.g. {'kind': 'tpu', 'topology': '4x4'}); "
+                f"got config: {tpu_config}"
             )
 
-        # The bundle layout below assumes one Ray TPU resource per physical chip.
         raw_driver_rpc = os.environ.get(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
         try:
             driver_rpc = int(raw_driver_rpc)
@@ -731,19 +672,16 @@ class TPUAccelerator(AcceleratorBackend):
                 f"Invalid integer for {RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} in "
                 f"driver environment: {raw_driver_rpc!r}."
             ) from exc
-
         if driver_rpc != 1:
             raise ValueError(
                 f"TPU batch inference currently requires "
-                f"{RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} == 1; got {driver_rpc}. "
-                "Multi-PJRT-device-per-chip configurations are not yet validated."
+                f"{RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} == 1; got {driver_rpc}."
             )
 
         if not accelerator_type:
             raise ValueError(
                 "`accelerator_type` (e.g. 'TPU-V6E') is required for TPU batch inference."
             )
-
         canonical_accel = normalize_tpu_accelerator_type(accelerator_type)
         if canonical_accel not in TPU_ACCELERATOR_VALUES:
             raise ValueError(
@@ -753,15 +691,12 @@ class TPUAccelerator(AcceleratorBackend):
         version = get_tpu_version_from_type(canonical_accel)
 
         engine_kwargs.setdefault("distributed_executor_backend", "ray")
-        executor_backend = engine_kwargs["distributed_executor_backend"]
-        if executor_backend != "ray":
+        if engine_kwargs["distributed_executor_backend"] != "ray":
             raise ValueError(
                 "TPU batch inference requires distributed_executor_backend='ray'; "
-                f"got {executor_backend!r}."
+                f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
 
-        # engine_kwargs are free-form, so bool/float spellings of 1 (True, 1.0)
-        # must be rejected before the == 1 checks.
         tp = _require_positive_int(
             engine_kwargs.get("tensor_parallel_size", 1), "tensor_parallel_size"
         )
@@ -776,7 +711,6 @@ class TPUAccelerator(AcceleratorBackend):
         chips_per_vm = resolve_chips_per_vm(topology, version, tpu_config.chips_per_vm)
         total_chips = get_num_chips_from_topology(topology)
         num_hosts = max(1, total_chips // chips_per_vm)
-
         tp_multiplier = _vllm_tp_multiplier(version)
         expected_tp = total_chips * tp_multiplier
         if tp != expected_tp:
@@ -794,13 +728,10 @@ class TPUAccelerator(AcceleratorBackend):
                 f"TPU batch inference currently supports data_parallel_size=1; got {dp}."
             )
 
-        # Declarative runtime_env merge. Preserve unrelated user variables while
-        # forcing the values the TPU engine and its child workers require.
         merged_runtime_env = copy.deepcopy(runtime_env or {})
         env_vars = merged_runtime_env.setdefault("env_vars", {})
         if not isinstance(env_vars, dict):
             raise ValueError("runtime_env['env_vars'] must be a dictionary.")
-
         for name, required in TPU_ENGINE_ENV_VARS.items():
             supplied = env_vars.get(name)
             if supplied is not None and supplied != required:
@@ -810,9 +741,7 @@ class TPUAccelerator(AcceleratorBackend):
                 )
         env_vars.update(TPU_ENGINE_ENV_VARS)
 
-        resources_per_bundle = self._resolve_batch_worker_bundle(
-            placement_group_config,
-        )
+        resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
         requested_strategy = (
             placement_group_config.get("strategy") if placement_group_config else None
         ) or "PACK"
@@ -838,9 +767,7 @@ class TPUAccelerator(AcceleratorBackend):
                 accelerator_type=canonical_accel,
                 resources_per_bundle=resources_per_bundle,
                 strategy=strategy,
-                tpu_resource_per_chip=1,
             )
-
             try:
                 _wait_for_placement_group(
                     handle.placement_group, DEFAULT_PG_READY_TIMEOUT_S
@@ -850,28 +777,23 @@ class TPUAccelerator(AcceleratorBackend):
                     f"Timed out after {DEFAULT_PG_READY_TIMEOUT_S}s waiting for TPU "
                     f"slice placement group readiness. Requested {canonical_accel} "
                     f"topology={topology} ({handle.num_hosts} hosts, "
-                    f"{handle.num_bundles} bundles). This usually means the cluster "
-                    "has no intact topology of that shape available."
+                    f"{handle.num_bundles} bundles)."
                 ) from exc
 
             handle.release_head_pgs()
-
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=handle.placement_group,
-                placement_group_bundle_index=0,
-                placement_group_capture_child_tasks=True,
-            )
-
             map_batches_kwargs = {
                 "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
                 "num_gpus": 0,
                 "resources": {},
-                "scheduling_strategy": scheduling_strategy,
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                    placement_group=handle.placement_group,
+                    placement_group_bundle_index=0,
+                    placement_group_capture_child_tasks=True,
+                ),
                 "runtime_env": merged_runtime_env,
             }
             success = True
             return map_batches_kwargs, handle.shutdown
-
         finally:
             if handle is not None and not success:
                 try:
@@ -888,12 +810,7 @@ class TPUAccelerator(AcceleratorBackend):
 def get_accelerator_backend(
     accelerator_config: AcceleratorConfig,
 ) -> AcceleratorBackend:
-    """Instantiate an AcceleratorBackend for a fully resolved accelerator config.
-
-    Callers (e.g. vLLM Batch processor config validation) must finish defaulting and
-    compatibility checks before invoking this helper. This function only dispatches
-    on the typed config.
-    """
+    """Return the backend implementation for a resolved accelerator config."""
     if isinstance(accelerator_config, TPUConfig):
         return TPUAccelerator(accelerator_config)
     if isinstance(accelerator_config, GPUConfig):
