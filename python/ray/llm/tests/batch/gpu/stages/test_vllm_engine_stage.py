@@ -69,7 +69,8 @@ def mock_vllm_wrapper():
 
 
 def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
-    """Stage stays accelerator-neutral; GPU scheduling lives on GPUAccelerator."""
+    # Stage construction is accelerator-neutral; GPU scheduling
+    # (ray_remote_args_fn / num_gpus) is owned by GPUAccelerator.
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
             model=model_llama_3_2_216M,
@@ -99,16 +100,16 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
             "distributed_executor_backend": "ray",
         },
     }
-    compute = stage.map_batches_kwargs.get("compute")
+    compute = stage.map_batches_kwargs.pop("compute")
     assert isinstance(compute, ActorPoolStrategy)
     assert compute.min_size == 1
     assert compute.max_size == 1
-    assert stage.map_batches_kwargs["zero_copy_batch"] is True
-    assert stage.map_batches_kwargs["max_concurrency"] == 4
-    assert stage.map_batches_kwargs["accelerator_type"] == gpu_type
-    # ray_remote_args_fn / num_gpus come from GPUAccelerator.build_batch_scheduling_options.
-    assert "ray_remote_args_fn" not in stage.map_batches_kwargs
-    assert "num_gpus" not in stage.map_batches_kwargs
+
+    assert stage.map_batches_kwargs == {
+        "zero_copy_batch": True,
+        "max_concurrency": 4,
+        "accelerator_type": gpu_type,
+    }
 
 
 @pytest.mark.asyncio
