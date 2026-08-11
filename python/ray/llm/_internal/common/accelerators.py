@@ -9,7 +9,7 @@ from enum import Enum
 from functools import partial
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Annotated
 
 import ray
@@ -125,13 +125,22 @@ class TPUConfig(AcceleratorConfig):
     topology: Optional[str] = None
     chips_per_vm: Optional[int] = None
 
+    @field_validator("chips_per_vm", mode="before")
+    @classmethod
+    def _reject_bool_chips_per_vm(cls, value):
+        # bool is a subclass of int; reject before Pydantic coerces True→1.
+        if isinstance(value, bool):
+            raise ValueError(f"chips_per_vm must be a positive integer; got {value!r}.")
+        return value
+
     @model_validator(mode="after")
     def _validate_chips_per_vm(self) -> "TPUConfig":
         if self.chips_per_vm is not None and not self.topology:
             raise ValueError("chips_per_vm requires topology to be specified.")
         if self.chips_per_vm is not None and self.chips_per_vm <= 0:
             raise ValueError(
-                f"chips_per_vm must be a positive integer; got {self.chips_per_vm!r}."
+                "chips_per_vm must be a positive integer; "
+                f"got {self.chips_per_vm!r}."
             )
         return self
 

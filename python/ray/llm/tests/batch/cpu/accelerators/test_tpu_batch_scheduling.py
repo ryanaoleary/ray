@@ -135,6 +135,12 @@ def test_chips_per_vm_requires_topology():
         TPUConfig(chips_per_vm=4)
 
 
+@pytest.mark.parametrize("bad", [0, -1, True])
+def test_chips_per_vm_rejects_invalid_values(bad):
+    with pytest.raises(ValueError, match="chips_per_vm must be a positive integer"):
+        TPUConfig(topology="2x4", chips_per_vm=bad)
+
+
 @pytest.mark.parametrize(
     "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, strategy, "
     "expect_strategy, expect_labels",

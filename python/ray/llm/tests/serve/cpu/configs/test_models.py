@@ -536,6 +536,10 @@ class TestAcceleratorConfigLogic:
         with pytest.raises(ValueError, match="chips_per_vm requires topology"):
             TPUConfig(kind="tpu", chips_per_vm=4)
 
+    def test_chips_per_vm_rejects_bool(self):
+        with pytest.raises(ValueError, match="chips_per_vm must be a positive integer"):
+            TPUConfig(kind="tpu", topology="2x4", chips_per_vm=True)
+
     def test_default_bundles_and_create_pg_forward_chips_per_vm(self, monkeypatch):
         """TPUConfig.chips_per_vm reaches SlicePG from Serve default_bundles/create_pg."""
         import ray.llm._internal.common.accelerators as accelerators_mod
