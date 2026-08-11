@@ -490,7 +490,7 @@ class TestAcceleratorConfigLogic:
         "topology,num_devices,accelerator_type_str,expected_bundles_count,expected_chips_per_host",
         [
             ("1x1", 1, "TPU-V6E", 1, 1),
-            ("1x1", 1, "TPU-V7X", 1, 1),
+            ("2x2x1", 8, "TPU-V7X", 1, 4),
             ("4x4", 16, "TPU-V6E", 4, 4),
             ("2x2x2", 8, "TPU-V5P", 2, 4),
             ("2x2", 4, "TPU-V5LITEPOD", 1, 4),

@@ -152,7 +152,7 @@ class TPUReplicaLayout:
     Separates physical SlicePG topology from vLLM/framework executor devices.
     Placement-group bundle count is derived separately from the optional worker
     template via ``get_tpu_worker_resources`` (Ray scheduling resources), not
-    from ``total_devices``.
+    from ``total_framework_devices``.
 
     Attributes:
         topology: Canonical topology string, such as ``"4x4"`` or ``"2x2x1"``.
@@ -164,21 +164,27 @@ class TPUReplicaLayout:
             ``accelerator_config.chips_per_vm`` override for ambiguous shapes).
         num_vms: Number of physical TPU VMs in the topology. This is independent of
             the SlicePG bundle count when using finer TPU-per-bundle granularity.
-        devices_per_chip: Framework-visible devices per physical chip (1 for
-            v5e/v6e; 2 for Ironwood/v7x chiplets). Independent of
-            ``RAY_TPU_RESOURCE_PER_CHIP``, which remains a Ray scheduling concern.
-        total_devices: ``total_chips * devices_per_chip``. ``tensor_parallel_size``
-            must equal this for topology-backed Batch.
+        framework_devices_per_chip: Framework-visible devices per physical chip (1 for
+            all current generations except v7x; 2 for Ironwood/v7x chiplets).
+            Independent of ``RAY_TPU_RESOURCE_PER_CHIP``, which remains a Ray
+            scheduling concern.
     """
 
     topology: str
     accelerator_type: str
     accelerator_version: str
+
+    # Physical slice
     total_chips: int
     chips_per_vm: int
     num_vms: int
-    devices_per_chip: int
-    total_devices: int
+
+    # Framework execution
+    framework_devices_per_chip: int
+
+    @property
+    def total_framework_devices(self) -> int:
+        return self.total_chips * self.framework_devices_per_chip
 
     @property
     def is_single_vm(self) -> bool:
@@ -595,13 +601,13 @@ class TPUAccelerator(AcceleratorBackend):
         # Serve passes TP×PP as num_devices (framework devices). Convert to
         # physical chips before packing hosts so v7x (2 devices/chip) and
         # chips_per_vm overrides share one physical host model.
-        devices_per_chip = self._resolve_executor_devices_per_chip(version)
-        if num_devices % devices_per_chip != 0:
+        framework_devices_per_chip = self._resolve_framework_devices_per_chip(version)
+        if num_devices % framework_devices_per_chip != 0:
             raise ValueError(
                 f"num_devices ({num_devices}) must be a multiple of "
-                f"devices_per_chip ({devices_per_chip}) for {version}."
+                f"framework_devices_per_chip ({framework_devices_per_chip}) for {version}."
             )
-        num_chips = num_devices // devices_per_chip
+        num_chips = num_devices // framework_devices_per_chip
 
         if num_chips > chips_per_host and num_chips % chips_per_host != 0:
             raise ValueError(
@@ -657,13 +663,14 @@ class TPUAccelerator(AcceleratorBackend):
     ) -> Dict[str, float]:
         """Resolve a homogeneous TPU worker-bundle template from Serve/Data PG bundles.
 
-        Preserves existing Serve semantics: TPU-bearing bundles must be identical;
-        if none are present, fall back to ``{"TPU": 1}``.
+        Preserves existing Serve semantics for positive-TPU bundles while ensuring
+        no-TPU templates preserve CPU/custom resources with a ``{"TPU": 1}`` fallback.
         """
-        if bundles:
-            tpu_bundles = [b for b in bundles if b.get("TPU", 0) > 0]
-            if not tpu_bundles:
-                return {"TPU": 1}
+        if not bundles:
+            return {"TPU": 1}
+
+        tpu_bundles = [b for b in bundles if b.get("TPU", 0) > 0]
+        if tpu_bundles:
             worker_bundle = tpu_bundles[0]
             if any(b != worker_bundle for b in tpu_bundles):
                 raise ValueError(
@@ -672,7 +679,19 @@ class TPUAccelerator(AcceleratorBackend):
                     "Please use `bundle_per_worker` in `placement_group_config` to define uniform worker resources."
                 )
             return dict(worker_bundle)
-        return {"TPU": 1}
+
+        # No positive-TPU bundles: preserve CPU/custom resources and add TPU: 1.
+        cleaned_bundles = [
+            {k: v for k, v in b.items() if v != 0 and v != 0.0} for b in bundles
+        ]
+        template = cleaned_bundles[0]
+        if any(b != template for b in cleaned_bundles):
+            raise ValueError(
+                "Heterogeneous placement_group_config bundles are not supported "
+                "when `topology` is set; got "
+                f"{bundles!r}."
+            )
+        return {**template, "TPU": 1}
 
     def _create_slice_pg_handle(
         self,
@@ -783,7 +802,9 @@ class TPUAccelerator(AcceleratorBackend):
             default_chips_per_vm=default_chips_per_vm,
         )
         num_vms = total_chips // resolved_chips_per_vm
-        devices_per_chip = self._resolve_executor_devices_per_chip(accel_version)
+        framework_devices_per_chip = self._resolve_framework_devices_per_chip(
+            accel_version
+        )
         return TPUReplicaLayout(
             topology=canonical_topology,
             accelerator_type=accelerator_type,
@@ -791,12 +812,11 @@ class TPUAccelerator(AcceleratorBackend):
             total_chips=total_chips,
             chips_per_vm=resolved_chips_per_vm,
             num_vms=num_vms,
-            devices_per_chip=devices_per_chip,
-            total_devices=total_chips * devices_per_chip,
+            framework_devices_per_chip=framework_devices_per_chip,
         )
 
     @staticmethod
-    def _resolve_executor_devices_per_chip(accelerator_version: str) -> int:
+    def _resolve_framework_devices_per_chip(accelerator_version: str) -> int:
         """Framework-visible devices per physical chip for vLLM TP sizing.
 
         This is the vLLM/framework execution-device count, not the TPU core
@@ -867,16 +887,6 @@ class TPUAccelerator(AcceleratorBackend):
         return chips_per_vm
 
     @staticmethod
-    def _expand_placement_group_bundles(
-        pg_config: Dict[str, Any], *, num_devices: int
-    ) -> List[Dict[str, float]]:
-        """Expand a Serve-compatible placement_group_config into bundle dicts."""
-        bundle_per_worker = pg_config.get("bundle_per_worker")
-        if bundle_per_worker is not None:
-            return [dict(bundle_per_worker) for _ in range(max(1, num_devices))]
-        return [dict(b) for b in (pg_config.get("bundles") or [])]
-
-    @staticmethod
     def _apply_batch_cpu_floor(bundle: Dict[str, float]) -> Dict[str, float]:
         """Preserve user resources while ensuring Batch parent CPU admission."""
         out: Dict[str, float] = {}
@@ -893,32 +903,49 @@ class TPUAccelerator(AcceleratorBackend):
         out["CPU"] = max(float(out.get("CPU", 0.0)), floor)
         return out
 
-    @staticmethod
-    def _resolve_batch_tpu1_fallback_template(
-        bundles: List[Dict[str, float]],
+    def _resolve_batch_worker_bundle(
+        self,
+        placement_group_config: Optional[Dict[str, Any]],
+        layout: TPUReplicaLayout,
     ) -> Dict[str, float]:
-        """Batch-only omit-TPU fallback that preserves CPU/custom resources.
+        """Resolve the homogeneous TPU worker-resource template for Batch.
 
-        Serve's shared helper returns ``{"TPU": 1}`` alone when no positive TPU
-        is present. Batch instead copies the homogeneous template and adds
-        ``TPU: 1`` so user CPU/custom requirements are not silently dropped.
+        Default (no placement_group_config) intentionally omits TPU so Ray fills
+        chips-per-VM. Explicit placement_group_config supplies a single template
+        (via bundle_per_worker or bundles) that sets worker granularity (e.g. TPU:1)
+        with Batch parent CPU floor applied.
         """
-        if not bundles:
-            return {"TPU": 1}
-        template = dict(bundles[0])
-        if any(b != template for b in bundles):
+        if placement_group_config is None:
+            return {
+                "CPU": float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST),
+            }
+
+        bundle_per_worker = placement_group_config.get("bundle_per_worker")
+        if bundle_per_worker is not None:
+            source_bundles = [dict(bundle_per_worker)]
+        elif (
+            "bundles" in placement_group_config
+            and placement_group_config["bundles"] is not None
+        ):
+            source_bundles = [
+                dict(bundle) for bundle in placement_group_config["bundles"]
+            ]
+        else:
             raise ValueError(
-                "Heterogeneous placement_group_config bundles are not supported "
-                "for topology-backed TPU Batch when TPU is omitted; got "
-                f"{bundles!r}."
+                "placement_group_config must specify bundle_per_worker or bundles."
             )
-        out: Dict[str, float] = {}
-        for key, value in template.items():
-            if value == 0 or value == 0.0:
-                continue
-            out[key] = value
-        out["TPU"] = 1
-        return out
+
+        self._validate_batch_tpu_template_bundles(source_bundles, layout)
+
+        has_positive_tpu = [bundle.get("TPU", 0) > 0 for bundle in source_bundles]
+        if any(has_positive_tpu) and not all(has_positive_tpu):
+            raise ValueError(
+                "Topology-backed TPU Batch placement_group_config bundles "
+                "cannot mix TPU-bearing and non-TPU bundles."
+            )
+
+        worker_bundle = self._resolve_topology_worker_bundle(source_bundles)
+        return self._apply_batch_cpu_floor(worker_bundle)
 
     @staticmethod
     def _validate_tpu_per_bundle(tpu_per_bundle: Any, layout: TPUReplicaLayout) -> int:
@@ -953,13 +980,7 @@ class TPUAccelerator(AcceleratorBackend):
         bundles: List[Dict[str, float]],
         layout: TPUReplicaLayout,
     ) -> None:
-        """Reject invalid Batch templates before Serve's TPU:1 fallback can mask them.
-
-        Omitting ``TPU`` remains valid; Batch then preserves CPU/custom fields while
-        adding ``TPU: 1``. Chips-per-VM fill applies only when
-        ``placement_group_config`` is omitted entirely. Explicit ``TPU`` values and
-        any ``GPU`` must fail fast.
-        """
+        """Reject invalid Batch templates before shared fallback can mask them."""
         for bundle in bundles:
             gpu = bundle.get("GPU", 0)
             if gpu > 0:
@@ -1065,11 +1086,11 @@ class TPUAccelerator(AcceleratorBackend):
             chips_per_vm=tpu_config.chips_per_vm,
         )
 
-        if tp != layout.total_devices:
+        if tp != layout.total_framework_devices:
             raise ValueError(
                 f"tensor_parallel_size must match the total number of framework "
-                f"devices ({layout.total_devices} = {layout.total_chips} physical "
-                f"chips × {layout.devices_per_chip} device(s)/chip) for topology "
+                f"devices ({layout.total_framework_devices} = {layout.total_chips} physical "
+                f"chips × {layout.framework_devices_per_chip} device(s)/chip) for topology "
                 f"'{layout.topology}' on {layout.accelerator_version}; got {tp}."
             )
         if pp != 1:
@@ -1109,41 +1130,17 @@ class TPUAccelerator(AcceleratorBackend):
                 )
         env_vars.update(TPU_ENGINE_ENV_VARS)
 
-        # Resolve execution-layout worker template. Default (no PG config) omits
-        # TPU so Ray fills chips-per-VM. Explicit Serve-compatible templates set
-        # TPU-per-bundle granularity (e.g. TPU:1) while Batch applies a CPU floor
-        # for the Ray Data parent actor in bundle 0.
-        if request.placement_group_config is None:
-            resources_per_bundle = {
-                "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
-            }
-            strategy = "SPREAD"
-        else:
-            pg_config = copy.deepcopy(request.placement_group_config)
-            strategy = pg_config.get("strategy") or "PACK"
-            template_bundles = self._expand_placement_group_bundles(
-                pg_config, num_devices=request.model_world_size
-            )
-            # Validate before Serve's shared helper can fall back to TPU:1 and
-            # hide explicit invalid TPU/GPU templates. When TPU is omitted, use a
-            # Batch-only fallback that preserves CPU/custom resources. Mixing
-            # TPU-bearing and non-TPU bundles would silently drop resources via
-            # Serve's TPU-only filter, so reject that for Batch.
-            self._validate_batch_tpu_template_bundles(template_bundles, layout)
-            has_positive_tpu = [bundle.get("TPU", 0) > 0 for bundle in template_bundles]
-            if any(has_positive_tpu) and not all(has_positive_tpu):
-                raise ValueError(
-                    "Topology-backed TPU Batch placement_group_config bundles "
-                    "must be homogeneous; TPU-bearing and non-TPU bundles "
-                    "cannot be mixed."
-                )
-            if all(has_positive_tpu) and has_positive_tpu:
-                worker_template = self._resolve_topology_worker_bundle(template_bundles)
-            else:
-                worker_template = self._resolve_batch_tpu1_fallback_template(
-                    template_bundles
-                )
-            resources_per_bundle = self._apply_batch_cpu_floor(worker_template)
+        # Resolve execution-layout worker template and placement strategy.
+        resources_per_bundle = self._resolve_batch_worker_bundle(
+            request.placement_group_config,
+            layout,
+        )
+
+        requested_strategy = (
+            request.placement_group_config.get("strategy")
+            if request.placement_group_config
+            else None
+        ) or "PACK"
 
         expected_num_bundles, expected_bundle_resources = get_tpu_worker_resources(
             topology=layout.topology,
@@ -1154,7 +1151,7 @@ class TPUAccelerator(AcceleratorBackend):
             tpu_resource_per_chip=1,
         )
         strategy = self._resolve_batch_slice_strategy(
-            requested_strategy=strategy,
+            requested_strategy=requested_strategy,
             layout=layout,
             num_bundles=expected_num_bundles,
         )
@@ -1293,7 +1290,7 @@ def _validate_reserved_layout(
     # SlicePlacementGroup.devices_per_host represents Ray logical TPU
     # resources per host. With RAY_TPU_RESOURCE_PER_CHIP=1 this equals
     # the physical chip count; it is independent of framework devices
-    # (TPUReplicaLayout.devices_per_chip / total_devices).
+    # (TPUReplicaLayout.framework_devices_per_chip / total_framework_devices).
     if getattr(handle, "devices_per_host", None) != layout.chips_per_vm:
         raise RuntimeError(
             f"Reserved SlicePlacementGroup reports {handle.devices_per_host} devices "

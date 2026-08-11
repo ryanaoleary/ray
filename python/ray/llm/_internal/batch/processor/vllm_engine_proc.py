@@ -263,7 +263,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         if value is None:
             return None
         validated = PlacementGroupConfig(**value)
-        return validated.model_dump()
+        return validated.model_dump(exclude_unset=True)
 
 
 class _ManagedVLLMProcessor(Processor):

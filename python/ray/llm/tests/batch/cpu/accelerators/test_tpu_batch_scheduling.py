@@ -153,6 +153,7 @@ def _install_tpu_slice_fakes(
             topology=topology,
             accelerator_type=f"TPU-{version.upper()}",
             resources_per_worker=resources,
+            num_slices=1,
             chips_per_vm=chips_per_vm_override,
             tpu_resource_per_chip=tpu_rpc,
         )
@@ -976,7 +977,7 @@ def test_single_vm_slice_allocation_uses_topology_pod_type_labels(
                     "ray.io/tpu-pod-type": "v6e-8",
                 }
             ],
-            "strategy": "SPREAD",
+            "strategy": "PACK",
             "tpu_resource_per_chip": 1,
             "chips_per_vm": 8,
         }
@@ -1065,9 +1066,7 @@ def test_bundle_granularity_matrix(
             for s in selectors
         )
         assert slice_kwargs[0]["strategy"] == (
-            "SPREAD"
-            if tpu_per_bundle is None
-            else ("STRICT_PACK" if expected_bundles > 1 else "PACK")
+            "STRICT_PACK" if expected_bundles > 1 else "PACK"
         )
     else:
         assert slice_kwargs[0]["bundle_label_selector"] is None
@@ -1345,15 +1344,15 @@ def test_derive_layout_v6e_2x4_chips_per_vm_override():
     assert default_layout.chips_per_vm == 8
     assert default_layout.num_vms == 1
     assert default_layout.is_single_vm
-    assert default_layout.devices_per_chip == 1
-    assert default_layout.total_devices == 8
+    assert default_layout.framework_devices_per_chip == 1
+    assert default_layout.total_framework_devices == 8
 
     dual_vm = TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=4)
     assert dual_vm.chips_per_vm == 4
     assert dual_vm.num_vms == 2
     assert not dual_vm.is_single_vm
     assert dual_vm.total_chips == 8
-    assert dual_vm.total_devices == 8
+    assert dual_vm.total_framework_devices == 8
 
     explicit_default = TPUAccelerator()._derive_layout("2x4", "TPU-V6E", chips_per_vm=8)
     assert explicit_default.chips_per_vm == 8
@@ -1372,9 +1371,9 @@ def test_derive_layout_v6e_2x4_chips_per_vm_override():
         ("v7x", 2),
     ],
 )
-def test_executor_devices_per_chip(version, expected):
+def test_framework_devices_per_chip(version, expected):
     """Lock the all-generation framework-device contract (v7x-only = 2)."""
-    assert TPUAccelerator._resolve_executor_devices_per_chip(version) == expected
+    assert TPUAccelerator._resolve_framework_devices_per_chip(version) == expected
 
 
 @pytest.mark.parametrize(
@@ -1394,8 +1393,8 @@ def test_derive_layout_v7x_devices_per_chip(
     assert layout.total_chips == total_chips
     assert layout.chips_per_vm == chips_per_vm
     assert layout.num_vms == num_vms
-    assert layout.devices_per_chip == 2
-    assert layout.total_devices == total_devices
+    assert layout.framework_devices_per_chip == 2
+    assert layout.total_framework_devices == total_devices
     assert layout.is_single_vm == (num_vms == 1)
 
 
@@ -1466,7 +1465,7 @@ def test_v7x_2x2x2_default_and_per_chip_bundle_layout(monkeypatch):
     )
     assert fake_handle.num_hosts == 2
     assert fake_handle.num_bundles == 2
-    assert slice_kwargs[-1]["strategy"] == "SPREAD"
+    assert slice_kwargs[-1]["strategy"] == "PACK"
     acquired.close_handle.shutdown()
 
     acquired = backend.build_batch_scheduling_plan(
@@ -1722,7 +1721,7 @@ def test_v6e_2x4_chips_per_vm_four_is_multi_vm_layout(monkeypatch):
         assert bundle["TPU"] == 4.0
     # Multi-VM path: SlicePG injects slice-name; Batch must not set single-VM selectors.
     assert slice_kwargs[0]["bundle_label_selector"] is None
-    assert slice_kwargs[0]["strategy"] == "SPREAD"
+    assert slice_kwargs[0]["strategy"] == "PACK"
     acquired.close_handle.shutdown()
 
 
@@ -1865,7 +1864,7 @@ def test_slice_allocation_kwargs_and_head_release_ordering(monkeypatch):
                 "CPU": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
             },
             "bundle_label_selector": None,
-            "strategy": "SPREAD",
+            "strategy": "PACK",
             "tpu_resource_per_chip": 1,
             "chips_per_vm": 4,
         }
@@ -2547,3 +2546,49 @@ def test_gpu_ray_callback_treats_null_bundles_as_empty(monkeypatch):
     )
     acquired.plan.map_batches_kwargs["ray_remote_args_fn"]()
     assert captured["bundles"] == []
+
+
+def test_tpu_batch_rejects_strategy_only_placement_group_config():
+    """Internal direct callers passing only strategy must fail closed."""
+    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+    with pytest.raises(
+        ValueError,
+        match="placement_group_config must specify bundle_per_worker or bundles",
+    ):
+        backend.build_batch_scheduling_plan(
+            BatchSchedulingRequest(
+                accelerator_type="TPU-V6E",
+                accelerator_config=TPUConfig(topology="4x4"),
+                tensor_parallel_size=16,
+                executor_backend="ray",
+                placement_group_config={"strategy": "PACK"},
+                concurrency=1,
+            )
+        )
+
+
+def test_resolve_topology_worker_bundle_preserves_custom_resources_on_tpu_fallback():
+    """Shared _resolve_topology_worker_bundle helper preserves CPU/custom and adds TPU:1."""
+    backend = TPUAccelerator()
+
+    # Empty bundles list -> TPU: 1
+    assert backend._resolve_topology_worker_bundle([]) == {"TPU": 1}
+
+    # Positive TPU bundle -> preserves bundle
+    assert backend._resolve_topology_worker_bundle([{"CPU": 2, "TPU": 1}]) == {
+        "CPU": 2,
+        "TPU": 1,
+    }
+
+    # No TPU present -> preserves CPU/custom resources and adds TPU: 1
+    assert backend._resolve_topology_worker_bundle(
+        [{"CPU": 4, "accelerator_type:TPU-V6E": 0.001}]
+    ) == {
+        "CPU": 4,
+        "accelerator_type:TPU-V6E": 0.001,
+        "TPU": 1,
+    }
+
+    # Heterogeneous no-TPU bundles -> raises ValueError
+    with pytest.raises(ValueError, match="Heterogeneous"):
+        backend._resolve_topology_worker_bundle([{"CPU": 2}, {"CPU": 4}])

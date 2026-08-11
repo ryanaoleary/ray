@@ -401,7 +401,7 @@ This alpha release runs one model replica on one complete TPU topology:
 - ``tensor_parallel_size`` must equal the topology's framework device count.
   For v6e that equals the physical chip count (``16`` for ``4x4``, ``8`` for
   ``2x4``). Generations with multiple devices per chip (for example Ironwood
-  v7x) require ``tensor_parallel_size = chips × devices_per_chip``.
+  v7x) require ``tensor_parallel_size = chips × framework_devices_per_chip``.
 - ``pipeline_parallel_size`` and ``data_parallel_size`` must both be ``1``.
 - The topology resolves through Ray's default chips-per-VM rules into one or more
   TPU VMs. A single-host shape such as v6e ``2x4`` becomes one VM with eight chips
@@ -421,8 +421,9 @@ This alpha release runs one model replica on one complete TPU topology:
   topology and TPU-per-bundle determine the SlicePG bundle count. Ray Data may
   raise the per-bundle CPU reservation so the engine parent can sit in bundle 0,
   but never lowers an explicit CPU request. Topology-backed TPU templates must
-  be homogeneous. Single-VM layouts with multiple worker bundles require
-  ``PACK``/``STRICT_PACK`` so every bundle stays on the same physical TPU VM.
+  be homogeneous. PACK is the default TPU placement strategy; single-VM
+  multi-bundle layouts are strengthened to STRICT_PACK so every bundle stays on
+  the same physical TPU VM.
 - TPU Batch currently fixes Ray's TPU resource-per-chip setting to ``1`` and
   rejects conflicting driver or runtime-environment values. Ironwood (v7x)
   hardware qualification must still measure whether Ray advertises one or two
