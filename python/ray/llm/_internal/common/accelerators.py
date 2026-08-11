@@ -14,14 +14,15 @@ from typing_extensions import Annotated
 
 import ray
 import ray.util.accelerators.accelerators as accelerators
-from ray._private.accelerators.tpu import get_num_chips_from_topology
+from ray._private.accelerators.tpu import (
+    get_chips_per_host,
+    get_num_chips_from_topology,
+)
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.tpu import (
     RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR,
     get_tpu_version_from_type,
-    get_tpu_worker_resources,
-    resolve_chips_per_vm,
     slice_placement_group,
 )
 
@@ -395,9 +396,15 @@ class TPUAccelerator(AcceleratorBackend):
             )
         topology = self._config.topology.strip().lower()
         version = get_tpu_version_from_type(accelerator_type_str)
-        chips_per_host = resolve_chips_per_vm(
-            topology, version, self._config.chips_per_vm
+        chips_per_host = (
+            self._config.chips_per_vm
+            if self._config.chips_per_vm is not None
+            else get_chips_per_host(topology, version)
         )
+        if chips_per_host <= 0:
+            raise ValueError(
+                f"Resolved chips per host must be positive, got {chips_per_host}"
+            )
         # Serve passes TP×PP as num_devices. Convert to physical chips before
         # packing hosts so v7x (TP multiplier 2) and chips_per_vm overrides
         # share one physical host model.
@@ -611,37 +618,6 @@ class TPUAccelerator(AcceleratorBackend):
         out["CPU"] = max(float(out.get("CPU", 0.0)), cpu_floor)
         return out
 
-    @staticmethod
-    def _resolve_batch_slice_strategy(
-        *,
-        requested_strategy: str,
-        topology: str,
-        num_hosts: int,
-        num_bundles: int,
-    ) -> str:
-        """Validate PG strategies permitted by topology-backed TPU Batch."""
-        if num_hosts == 1 and num_bundles > 1:
-            if requested_strategy not in ("PACK", "STRICT_PACK"):
-                raise ValueError(
-                    "Single-VM TPU topologies with multiple worker bundles require "
-                    "PACK/STRICT_PACK so every bundle remains on the same TPU VM; "
-                    f"got strategy={requested_strategy!r}."
-                )
-            return "STRICT_PACK"
-
-        if num_hosts > 1:
-            if requested_strategy == "STRICT_PACK":
-                raise ValueError(
-                    "STRICT_PACK cannot represent a multi-VM TPU topology "
-                    f"({num_hosts} VMs for topology '{topology}')."
-                )
-            if requested_strategy == "STRICT_SPREAD" and num_bundles > num_hosts:
-                raise ValueError(
-                    "STRICT_SPREAD requires one node per bundle, but this topology "
-                    f"has {num_hosts} physical TPU VMs and {num_bundles} bundles."
-                )
-        return requested_strategy
-
     def build_batch_scheduling_options(
         self,
         *,
@@ -703,9 +679,7 @@ class TPUAccelerator(AcceleratorBackend):
         )
 
         topology = tpu_config.topology.strip().lower()
-        chips_per_vm = resolve_chips_per_vm(topology, version, tpu_config.chips_per_vm)
         total_chips = get_num_chips_from_topology(topology)
-        num_hosts = max(1, total_chips // chips_per_vm)
         tp_multiplier = _vllm_tp_multiplier(version)
         expected_tp = total_chips * tp_multiplier
         if tp != expected_tp:
@@ -737,23 +711,10 @@ class TPUAccelerator(AcceleratorBackend):
         env_vars.update(TPU_ENGINE_ENV_VARS)
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
-        requested_strategy = (
+        # Same default as Serve / GPU Batch PGs: PACK. Pass user strategy through.
+        strategy = (
             placement_group_config.get("strategy") if placement_group_config else None
         ) or "PACK"
-        expected_num_bundles, _ = get_tpu_worker_resources(
-            topology=topology,
-            accelerator_type=canonical_accel,
-            resources_per_worker=resources_per_bundle,
-            num_slices=1,
-            chips_per_vm=tpu_config.chips_per_vm,
-            tpu_resource_per_chip=1,
-        )
-        strategy = self._resolve_batch_slice_strategy(
-            requested_strategy=requested_strategy,
-            topology=topology,
-            num_hosts=num_hosts,
-            num_bundles=expected_num_bundles,
-        )
 
         handle = None
         success = False

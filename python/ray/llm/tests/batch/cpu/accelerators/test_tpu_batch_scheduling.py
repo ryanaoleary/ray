@@ -142,17 +142,17 @@ def test_builder_gpu_path_needs_no_slice(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, expected_strategy",
+    "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, strategy",
     [
-        ("4x4", "TPU-V6E", 16, None, None, "PACK"),
-        ("4x4", "TPU-V6E", 16, None, 1, "PACK"),
-        ("2x4", "TPU-V6E", 8, None, None, "PACK"),
-        ("2x4", "TPU-V6E", 8, None, 1, "STRICT_PACK"),
-        ("2x4", "TPU-V6E", 8, 4, None, "PACK"),
-        ("2x4", "TPU-V6E", 8, 4, 1, "PACK"),
-        ("2x2x2", "TPU-V7X", 16, None, None, "PACK"),
-        ("2x2x2", "TPU-V7X", 16, None, 1, "PACK"),
-        ("2x2x1", "TPU-V7X", 8, None, 1, "STRICT_PACK"),
+        ("4x4", "TPU-V6E", 16, None, None, None),
+        ("4x4", "TPU-V6E", 16, None, 1, None),
+        ("2x4", "TPU-V6E", 8, None, None, None),
+        ("2x4", "TPU-V6E", 8, None, 1, None),
+        ("2x4", "TPU-V6E", 8, 4, None, None),
+        ("2x4", "TPU-V6E", 8, 4, 1, "SPREAD"),
+        ("2x2x2", "TPU-V7X", 16, None, None, None),
+        ("2x2x2", "TPU-V7X", 16, None, 1, None),
+        ("2x2x1", "TPU-V7X", 8, None, 1, None),
     ],
 )
 def test_topology_bundle_and_strategy_forwarding(
@@ -162,14 +162,16 @@ def test_topology_bundle_and_strategy_forwarding(
     tp,
     chips_per_vm,
     tpu_per_bundle,
-    expected_strategy,
+    strategy,
 ):
     handle, create = stub_slice_pg
-    pg_config = (
-        {"bundle_per_worker": {"TPU": tpu_per_bundle}}
-        if tpu_per_bundle is not None
-        else None
-    )
+    pg_config = None
+    if tpu_per_bundle is not None or strategy is not None:
+        pg_config = {}
+        if tpu_per_bundle is not None:
+            pg_config["bundle_per_worker"] = {"TPU": tpu_per_bundle}
+        if strategy is not None:
+            pg_config["strategy"] = strategy
     kwargs, close_fn = _options(
         TPUAccelerator(TPUConfig(topology=topology, chips_per_vm=chips_per_vm)),
         accelerator_type=accelerator_type,
@@ -181,7 +183,7 @@ def test_topology_bundle_and_strategy_forwarding(
     assert kwargs["num_cpus"] == PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
 
     slice_kwargs = create.call_args.kwargs
-    assert slice_kwargs["strategy"] == expected_strategy
+    assert slice_kwargs["strategy"] == (strategy or "PACK")
     assert slice_kwargs["topology"] == topology
     resources = slice_kwargs["resources_per_bundle"]
     if tpu_per_bundle is None:
@@ -195,35 +197,6 @@ def test_topology_bundle_and_strategy_forwarding(
 
     close_fn()
     handle.shutdown.assert_called_once()
-
-
-@pytest.mark.parametrize(
-    "topology, tp, placement_group_config, match",
-    [
-        (
-            "2x4",
-            8,
-            {"bundle_per_worker": {"TPU": 1}, "strategy": "SPREAD"},
-            "PACK/STRICT_PACK",
-        ),
-        (
-            "4x4",
-            16,
-            {"bundle_per_worker": {"TPU": 4}, "strategy": "STRICT_PACK"},
-            "STRICT_PACK cannot represent",
-        ),
-    ],
-)
-def test_batch_strategy_rejects_invalid_layouts(
-    stub_slice_pg, topology, tp, placement_group_config, match
-):
-    with pytest.raises(ValueError, match=match):
-        _options(
-            TPUAccelerator(TPUConfig(topology=topology)),
-            tensor_parallel_size=tp,
-            placement_group_config=placement_group_config,
-        )
-    stub_slice_pg[1].assert_not_called()
 
 
 def test_eager_timeout_cleans_up_before_head_release(stub_slice_pg, monkeypatch):
