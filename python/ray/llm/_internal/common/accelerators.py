@@ -194,7 +194,8 @@ class AcceleratorBackend(ABC):
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
         """Return ``(map_batches_kwargs, optional close_fn)`` for batch inference.
 
-        May set defaults on the caller's private ``engine_kwargs`` copy. Backends
+        Implementations may populate accelerator-specific defaults in
+        ``engine_kwargs``; callers should pass a private mutable copy. Backends
         without Batch support raise ``NotImplementedError``.
         """
         raise NotImplementedError(

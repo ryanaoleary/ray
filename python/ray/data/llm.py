@@ -149,18 +149,16 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             (one per subfolder). If unset and LoRA is used, the ``model`` in a
             LoRA request is interpreted as a HF model ID.
         placement_group_config: Optional placement group config for scheduling
-            vLLM engine workers. For GPU, ``bundle_per_worker`` is replicated by
-            ``tp*pp`` and ``bundles`` specifies the full placement-group bundle
-            list. For topology-backed TPU Batch, these fields provide a
-            homogeneous worker-resource template (for example
-            ``{"bundle_per_worker": {"TPU": 1}}``) while the topology and
-            TPU-per-bundle determine the SlicePG bundle count. Optional
-            ``strategy`` is ``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``.
+            vLLM engine workers. Specify ``bundle_per_worker`` (replicated by
+            ``tp*pp`` on GPU) or ``bundles``, and optionally ``strategy``
+            (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). Defaults
+            to ``PACK`` when omitted. For topology-backed TPU Batch, these
+            fields supply a homogeneous worker-resource template for SlicePG.
         accelerator_config: Optional accelerator configuration for the LLM stage.
-            For TPU batch inference, pass a mapping such as
-            ``{"kind": "tpu", "topology": "4x4"}`` (optionally ``chips_per_vm``
-            for ambiguous topologies). When omitted with a non-TPU
-            ``accelerator_type``, GPU batch behavior is preserved.
+            For TPU batch inference, pass
+            ``{"kind": "tpu", "topology": "4x4"}`` (optional ``chips_per_vm``).
+            When omitted with a non-TPU ``accelerator_type``, GPU behavior is
+            preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

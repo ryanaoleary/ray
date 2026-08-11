@@ -1,8 +1,8 @@
 """CPU-CI tests for topology-backed TPU Batch scheduling.
 
-SlicePG packing / labels are covered in ``python/ray/tests/test_tpu.py``.
-These tests stub only ``slice_placement_group`` (needs TPU hardware); config,
-validation, and processor wiring go through the real Batch APIs.
+Stub only ``slice_placement_group`` (needs TPU hardware). Config validation,
+strategy/resource forwarding, and processor lifecycle use the real Batch APIs.
+Physical SlicePG packing is covered by existing ``python/ray/tests/test_tpu.py``.
 """
 
 from typing import Any, Dict, Optional
