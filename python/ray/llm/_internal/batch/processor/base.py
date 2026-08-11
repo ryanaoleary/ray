@@ -320,8 +320,8 @@ class Processor:
             preprocess stage (e.g., num_cpus, memory, concurrency).
         postprocess_map_kwargs: Optional kwargs to pass to Dataset.map() for the
             postprocess stage (e.g., num_cpus, memory, concurrency).
-        close_fn: Optional callable that releases driver-owned resources. Invoked
-            by ``close()``; typically supplied by the processor builder.
+        close_fn: Optional callable invoked by ``close()`` to release driver-owned
+            resources.
     """
 
     # The internal used data column name ("__data"). Your input
@@ -372,11 +372,7 @@ class Processor:
             self._append_stage(stage)
 
     def close(self) -> None:
-        """Release any driver-owned resources held by this processor.
-
-        No-op unless the builder supplied a ``close_fn``. Finish every derived
-        Dataset before calling ``close()``.
-        """
+        """Release any driver-owned resources held by this processor."""
         self._closed = True
         if self._close_fn is None:
             return

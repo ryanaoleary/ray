@@ -99,24 +99,16 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     # Custom placement group config for TP/PP.
     placement_group_config: Optional[Dict[str, Any]] = Field(
         default=None,
-        description=(
-            "Ray placement group configuration for scheduling vLLM engine workers. "
-            "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or "
-            "'bundles' (full list of resource dicts). Optionally include 'strategy' "
-            "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
-            "Example with bundle_per_worker: "
-            "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
-            "Example with bundles: "
-            "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
-        ),
+        description="Ray placement group configuration for scheduling vLLM engine workers. "
+        "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or 'bundles' "
+        "(full list of resource dicts). Optionally include 'strategy' key "
+        "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
+        "Example with bundle_per_worker: {'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
+        "Example with bundles: {'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}.",
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
-        description=(
-            "Optional accelerator backend configuration (discriminated by "
-            "'kind'). When omitted, the backend is inferred from "
-            "accelerator_type (GPU by default)."
-        ),
+        description="Optional accelerator backend configuration.",
     )
 
     @model_validator(mode="before")
@@ -193,7 +185,6 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
                     "TPU accelerator_type requires a TPU accelerator_config "
                     f"(or omit it for single-host); got {self.accelerator_config!r}."
                 )
-            # Topology-backed SlicePG owns one complete slice per processor.
             if (
                 isinstance(self.accelerator_config, TPUConfig)
                 and self.accelerator_config.topology
@@ -223,12 +214,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
 def _resolve_batch_accelerator_backend(
     config: "vLLMEngineProcessorConfig",
 ) -> AcceleratorBackend:
-    """Select the Batch accelerator backend.
-
-    - Explicit TPUConfig (with or without topology) → TPUAccelerator
-    - TPU accelerator_type with no accelerator_config → single-host TPUAccelerator
-    - Otherwise → GPU (default) / configured non-TPU backend
-    """
+    """Select the Batch accelerator backend from config / accelerator_type."""
     if isinstance(config.accelerator_config, TPUConfig):
         return TPUAccelerator(config.accelerator_config)
     if config.accelerator_type and config.accelerator_type.startswith("TPU"):
@@ -304,7 +290,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Resolve and build ChatTemplateStage if enabled.
+    # Resolve and build ChatTemplateStage if enabled
     chat_template_stage_cfg = resolve_stage_config(
         getattr(config, "chat_template_stage", config.apply_chat_template),
         ChatTemplateStageConfig,
@@ -328,7 +314,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Resolve and build TokenizeStage if enabled.
+    # Resolve and build TokenizeStage if enabled
     tokenize_stage_cfg = resolve_stage_config(
         getattr(config, "tokenize_stage", config.tokenize),
         TokenizerStageConfig,
@@ -345,7 +331,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Download config files for telemetry before acquiring accelerator resources.
+    # Download config for telemetry before acquiring accelerator resources.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
     # since custom model architectures require Python config files to be downloaded.
     if config.engine_kwargs.get(
@@ -369,6 +355,8 @@ def build_vllm_engine_processor(
     except Exception:
         # Failed to retrieve HuggingFace config for telemetry purposes.
         # This is non-fatal: we fall back to DEFAULT_MODEL_ARCHITECTURE for telemetry.
+        # The actual model loading happens later in vLLM, which may support models
+        # that aren't available via HuggingFace's AutoConfig.
         logger.warning(
             f"Failed to retrieve HuggingFace config for {config.model_source}"
         )
@@ -377,7 +365,7 @@ def build_vllm_engine_processor(
     architectures = getattr(hf_config, "architectures", [])
     architecture = architectures[0] if architectures else DEFAULT_MODEL_ARCHITECTURE
 
-    # Copy engine_kwargs so accelerator defaults do not mutate the caller's config.
+    # Copy so accelerator defaults do not mutate the caller's config.
     engine_kwargs = dict(config.engine_kwargs)
     tp_size = engine_kwargs.get("tensor_parallel_size", 1)
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)

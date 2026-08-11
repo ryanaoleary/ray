@@ -317,9 +317,7 @@ class vLLMEngineWrapper:
                 "Metrics will be available at Ray's Prometheus endpoint."
             )
 
-        # If this actor is already inside a placement group, from_engine_args /
-        # create_engine_config copies get_current_placement_group() into
-        # ParallelConfig.placement_group for the distributed executor to reuse.
+        # Reuse the actor's current placement group in the distributed executor.
         self.engine = vllm.AsyncLLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )

@@ -149,13 +149,11 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             (one per subfolder). If unset and LoRA is used, the ``model`` in a
             LoRA request is interpreted as a HF model ID.
         placement_group_config: Optional placement group config for scheduling
-            vLLM engine workers. Specify ``bundle_per_worker`` (replicated by
-            ``tp*pp``) or ``bundles``, and optionally ``strategy``
-            (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). Defaults
-            to ``PACK`` when omitted.
-        accelerator_config: Optional accelerator backend configuration
-            (discriminated by ``kind``). When omitted, the backend is inferred
-            from ``accelerator_type`` (GPU by default).
+            vLLM engine workers. Accepts ``bundle_per_worker`` (auto-replicated by
+            ``tp*pp``) or ``bundles`` (full list of resource dicts), plus an
+            optional ``strategy``
+            (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
+        accelerator_config: Optional accelerator backend configuration.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

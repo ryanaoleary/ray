@@ -120,17 +120,8 @@ class GPUConfig(AcceleratorConfig):
 
 class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
-    topology: Optional[str] = Field(
-        default=None,
-        description="Physical TPU topology string (e.g. '4x4').",
-    )
-    chips_per_vm: Optional[int] = Field(
-        default=None,
-        description=(
-            "Optional physical chips-per-VM override for TPU topologies with "
-            "multiple supported VM packings. Must match cluster provisioning."
-        ),
-    )
+    topology: Optional[str] = None
+    chips_per_vm: Optional[int] = None
 
 
 AnyAcceleratorConfig = Annotated[
@@ -488,7 +479,6 @@ class TPUAccelerator(AcceleratorBackend):
             )
             self.shutdown()
 
-        # chips_per_vm is the only SlicePG kwarg beyond master's Serve call shape.
         slice_kwargs: Dict[str, Any] = {
             "topology": self._config.topology.strip().lower(),
             "accelerator_version": get_tpu_version_from_type(accelerator_type),
