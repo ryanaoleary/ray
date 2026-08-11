@@ -158,7 +158,8 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             ``strategy`` is ``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``.
         accelerator_config: Optional accelerator configuration for the LLM stage.
             For TPU batch inference, pass a mapping such as
-            ``{"kind": "tpu", "topology": "4x4"}``. When omitted with a non-TPU
+            ``{"kind": "tpu", "topology": "4x4"}`` (optionally ``chips_per_vm``
+            for ambiguous topologies). When omitted with a non-TPU
             ``accelerator_type``, GPU batch behavior is preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,

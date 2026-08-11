@@ -128,8 +128,9 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         default=None,
         description=(
             "Accelerator configuration for the LLM stage. For TPU batch inference, "
-            "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'}. An omitted "
-            "accelerator type preserves GPU batch behavior for this processor."
+            "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'} (optionally "
+            "chips_per_vm for ambiguous topologies). An omitted accelerator type "
+            "preserves GPU batch behavior for this processor."
         ),
     )
 

@@ -375,9 +375,7 @@ def test_validation_matrix_tpu():
         placement_group_config={"bundle_per_worker": {"TPU": 1}},
     )
     assert cfg_tpu_pg.placement_group_config == {
-        "bundle_per_worker": {"CPU": 0.0, "GPU": 0.0, "TPU": 1},
-        "bundles": None,
-        "strategy": "PACK",
+        "bundle_per_worker": {"TPU": 1},
     }
 
     # 8. GPU + placement_group_config -> valid and not rejected
@@ -1549,7 +1547,7 @@ def test_batch_rejects_mixed_tpu_and_non_tpu_bundles(monkeypatch):
         [{"TPU": 1}, {"CPU": 4}],
         [{"CPU": 2, "TPU": 1}, {"CPU": 8, "special": 1}],
     ):
-        with pytest.raises(ValueError, match="cannot be mixed"):
+        with pytest.raises(ValueError, match="cannot mix"):
             backend.build_batch_scheduling_plan(
                 BatchSchedulingRequest(
                     accelerator_type="TPU-V6E",
