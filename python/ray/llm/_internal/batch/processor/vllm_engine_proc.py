@@ -113,12 +113,11 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Optional accelerator backend configuration. For topology-backed TPU "
-            "Batch (multi-host / SlicePG), pass topology, e.g. "
-            '{"topology": "4x4"} or {"kind": "tpu", "topology": "4x4"}. '
-            "When omitted with a TPU accelerator_type, single-host TPU resource "
-            "scheduling is used. When omitted with a non-TPU accelerator_type, "
-            "GPU batch scheduling is used."
+            "Optional accelerator backend configuration. For TPU with a "
+            'topology, pass e.g. {"topology": "4x4"}. When omitted with a TPU '
+            "accelerator_type, single-host TPU resource scheduling is used. "
+            "When omitted with a non-TPU accelerator_type, GPU batch scheduling "
+            "is used."
         ),
     )
 

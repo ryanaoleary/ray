@@ -150,16 +150,14 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             LoRA request is interpreted as a HF model ID.
         placement_group_config: Optional placement group config for scheduling
             vLLM engine workers. Specify ``bundle_per_worker`` (replicated by
-            ``tp*pp`` on GPU) or ``bundles``, and optionally ``strategy``
+            ``tp*pp``) or ``bundles``, and optionally ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). Defaults
-            to ``PACK`` when omitted. For topology-backed TPU Batch, these
-            fields supply a homogeneous worker-resource template for SlicePG.
+            to ``PACK`` when omitted.
         accelerator_config: Optional accelerator configuration for the LLM stage.
-            For topology-backed TPU Batch (SlicePG / multi-host), pass
-            ``{"topology": "4x4"}`` (optional ``chips_per_vm``). A TPU
-            ``accelerator_type`` alone uses single-host TPU resource scheduling.
-            When omitted with a non-TPU ``accelerator_type``, GPU behavior is
-            preserved.
+            For TPU with a topology, pass ``{"topology": "4x4"}`` (optional
+            ``chips_per_vm``). A TPU ``accelerator_type`` alone uses single-host
+            TPU resource scheduling. When omitted with a non-TPU
+            ``accelerator_type``, GPU behavior is preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy
