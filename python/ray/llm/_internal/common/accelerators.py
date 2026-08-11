@@ -191,15 +191,10 @@ class AcceleratorBackend(ABC):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Return ``(map_batches_kwargs, optional driver close_fn)``.
+        """Return ``(map_batches_kwargs, optional close_fn)`` for batch inference.
 
-        ``map_batches_kwargs`` is a plain, picklable dict safe to embed in the
-        lazy Ray Data dataset DAG. ``close_fn`` (when not ``None``) is a
-        driver-local callable that releases any resources acquired here; it must
-        never enter the dataset graph. Implementations may populate
-        accelerator-specific defaults in ``engine_kwargs``; callers should pass
-        a private mutable copy. Backends that do not support Batch raise
-        ``NotImplementedError`` so Serve-only accelerators need not implement it.
+        May set defaults on the caller's private ``engine_kwargs`` copy. Backends
+        without Batch support raise ``NotImplementedError``.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement Batch scheduling options."
@@ -655,7 +650,7 @@ class TPUAccelerator(AcceleratorBackend):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Eagerly reserve one TPU slice and return map_batches kwargs + close_fn."""
+        """Reserve one TPU slice and return map_batches kwargs plus close_fn."""
         tpu_config = self._config
         if not isinstance(tpu_config, TPUConfig) or not tpu_config.topology:
             raise ValueError(
