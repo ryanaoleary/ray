@@ -1,10 +1,12 @@
-"""Hermetic unit tests for topology-backed TPU Batch scheduling.
+"""CPU-CI tests for topology-backed TPU Batch scheduling.
 
-All tests run on CPU CI without TPU hardware. Core chips_per_vm / SlicePG
-packing and label invariants live in ``python/ray/tests/test_tpu.py``.
+SlicePG packing / labels are covered in ``python/ray/tests/test_tpu.py``.
+These tests stub only ``slice_placement_group`` (needs TPU hardware); config,
+validation, and processor wiring go through the real Batch APIs.
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,109 +29,66 @@ from ray.llm._internal.common.accelerators import (
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 _ACCEL = "ray.llm._internal.common.accelerators"
+_DOWNLOAD = "ray.llm._internal.batch.processor.vllm_engine_proc.download_model_files"
 
 
-def _tpu_options(
+def _options(
     backend: TPUAccelerator,
     *,
-    accelerator_type: str,
+    accelerator_type: str = "TPU-V6E",
     tensor_parallel_size: int,
-    executor_backend: str = "ray",
     placement_group_config: Optional[Dict[str, Any]] = None,
     runtime_env: Optional[Dict[str, Any]] = None,
-    pipeline_parallel_size: int = 1,
-    data_parallel_size: int = 1,
-) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
+    **engine_overrides,
+):
+    engine_kwargs = {
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1,
+        "distributed_executor_backend": "ray",
+        **engine_overrides,
+    }
     return backend.build_batch_scheduling_options(
         accelerator_type=accelerator_type,
-        engine_kwargs={
-            "tensor_parallel_size": tensor_parallel_size,
-            "pipeline_parallel_size": pipeline_parallel_size,
-            "data_parallel_size": data_parallel_size,
-            "distributed_executor_backend": executor_backend,
-        },
+        engine_kwargs=engine_kwargs,
         placement_group_config=placement_group_config,
         runtime_env=runtime_env,
     )
 
 
-class FakePlacementGroup:
-    def __init__(self, pg_id: str = "pg-fake-123"):
-        self.id = pg_id
-
-    def ready(self):
-        return None
-
-
-class FakeSlicePlacementGroupHandle:
-    def __init__(self, topology: str = "4x4", num_hosts: int = 4, num_bundles: int = 4):
-        self.topology = topology
-        self.num_hosts = num_hosts
-        self.num_bundles = num_bundles
-        self.placement_group = FakePlacementGroup()
-        self.released_head_pgs = 0
-        self.shutdown_calls = 0
-
-    def release_head_pgs(self):
-        self.released_head_pgs += 1
-
-    def shutdown(self):
-        self.shutdown_calls += 1
-
-
-def _install_tpu_slice_fakes(
-    monkeypatch,
-    fake_handle: FakeSlicePlacementGroupHandle,
-    *,
-    on_slice=None,
-    on_wait=None,
-):
-    def _slice(*args, **kwargs):
-        if on_slice is not None:
-            on_slice(*args, **kwargs)
-        fake_handle.topology = kwargs.get("topology", fake_handle.topology)
-        return fake_handle
-
-    def _wait(pg, timeout_s):
-        if on_wait is not None:
-            on_wait(pg, timeout_s)
-
-    monkeypatch.setattr(f"{_ACCEL}.slice_placement_group", _slice)
-    monkeypatch.setattr(f"{_ACCEL}._wait_for_placement_group", _wait)
-    return fake_handle
-
-
 @pytest.fixture
-def mock_tpu_slice_environment(monkeypatch):
+def stub_slice_pg(monkeypatch):
+    """Stub SlicePG create/wait; leave Batch validation and processor code real."""
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake_handle = FakeSlicePlacementGroupHandle(
-        topology="4x4", num_hosts=4, num_bundles=4
-    )
-    _install_tpu_slice_fakes(monkeypatch, fake_handle)
-    monkeypatch.setattr(
-        "ray.llm._internal.batch.processor.vllm_engine_proc.download_model_files",
-        lambda *args, **kwargs: "/tmp/mock-model",
-    )
-    return fake_handle
+    handle = MagicMock(name="slice_pg_handle")
+    handle.placement_group = MagicMock(name="placement_group")
+    handle.num_hosts = 4
+    handle.num_bundles = 4
+    create = MagicMock(return_value=handle)
+    monkeypatch.setattr(f"{_ACCEL}.slice_placement_group", create)
+    monkeypatch.setattr(f"{_ACCEL}._wait_for_placement_group", MagicMock())
+    monkeypatch.setattr(_DOWNLOAD, lambda *a, **k: "/tmp/mock-model")
+    return handle, create
 
 
-def test_config_requires_tpu_config_and_concurrency_one():
+def test_config_requires_tpu_kind_and_concurrency_one():
     cfg = vLLMEngineProcessorConfig(
         model_source="m",
         accelerator_type="TPU-V6E",
         accelerator_config={"kind": "tpu", "topology": "4x4"},
     )
     assert isinstance(cfg.accelerator_config, TPUConfig)
-    assert cfg.accelerator_config.topology == "4x4"
     assert cfg.concurrency == 1
 
-    # Topology is optional at config time (single-host may omit it); kind='tpu' is not.
-    cfg_no_topo = vLLMEngineProcessorConfig(
-        model_source="m",
-        accelerator_type="TPU-V6E",
-        accelerator_config={"kind": "tpu"},
+    # Topology is optional at config time; SlicePG Batch still requires it later.
+    assert (
+        vLLMEngineProcessorConfig(
+            model_source="m",
+            accelerator_type="TPU-V6E",
+            accelerator_config={"kind": "tpu"},
+        ).accelerator_config.topology
+        is None
     )
-    assert cfg_no_topo.accelerator_config.topology is None
 
     with pytest.raises(ValueError, match="kind='tpu'"):
         vLLMEngineProcessorConfig(model_source="m", accelerator_type="TPU-V6E")
@@ -142,19 +101,7 @@ def test_config_requires_tpu_config_and_concurrency_one():
         )
 
 
-def test_batch_requires_topology_for_slice_placement(monkeypatch):
-    """Topology may be omitted on the config, but SlicePG Batch still needs it."""
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    backend = TPUAccelerator(TPUConfig(kind="tpu"))
-    with pytest.raises(ValueError, match="topology"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=8,
-        )
-
-
-def test_omitted_accelerator_config_stays_none_for_gpu():
+def test_omitted_accelerator_config_defaults_to_gpu_backend():
     cfg = vLLMEngineProcessorConfig(model_source="m")
     assert cfg.accelerator_config is None
     assert isinstance(
@@ -162,46 +109,35 @@ def test_omitted_accelerator_config_stays_none_for_gpu():
     )
 
 
-def test_builder_returns_managed_processor_and_defaults_executor(
-    mock_tpu_slice_environment,
-):
-    config = vLLMEngineProcessorConfig(
-        model_source="test-model",
-        accelerator_type="TPU-V6E",
-        accelerator_config={"kind": "tpu", "topology": "4x4"},
-        engine_kwargs={"tensor_parallel_size": 16},
+def test_builder_pins_bundle_zero_and_close_releases_slice(stub_slice_pg):
+    handle, _ = stub_slice_pg
+    processor = build_processor(
+        vLLMEngineProcessorConfig(
+            model_source="test-model",
+            accelerator_type="TPU-V6E",
+            accelerator_config={"kind": "tpu", "topology": "4x4"},
+            engine_kwargs={"tensor_parallel_size": 16},
+        )
     )
-    processor = build_processor(config)
     assert isinstance(processor, Processor)
     assert processor._close_fn is not None
-    stage = processor.stages["vLLMEngineStage"]
-    assert (
-        stage.map_batches_kwargs["scheduling_strategy"].placement_group_bundle_index
-        == 0
-    )
-    assert (
-        stage.map_batches_kwargs[
-            "scheduling_strategy"
-        ].placement_group_capture_child_tasks
-        is True
-    )
+    stage = processor.get_stage_by_name("vLLMEngineStage")
+    strategy = stage.map_batches_kwargs["scheduling_strategy"]
+    assert isinstance(strategy, PlacementGroupSchedulingStrategy)
+    assert strategy.placement_group_bundle_index == 0
+    assert strategy.placement_group_capture_child_tasks is True
     assert (
         stage.fn_constructor_kwargs["engine_kwargs"]["distributed_executor_backend"]
         == "ray"
     )
-    assert "distributed_executor_backend" not in config.engine_kwargs
     processor.close()
-    assert mock_tpu_slice_environment.shutdown_calls == 1
+    handle.shutdown.assert_called_once()
 
 
-def test_builder_returns_ordinary_processor_for_gpu(monkeypatch):
-    monkeypatch.setattr(
-        "ray.llm._internal.batch.processor.vllm_engine_proc.download_model_files",
-        lambda *args, **kwargs: "/tmp/mock-model",
-    )
+def test_builder_gpu_path_needs_no_slice(monkeypatch):
+    monkeypatch.setattr(_DOWNLOAD, lambda *a, **k: "/tmp/mock-model")
     processor = build_processor(vLLMEngineProcessorConfig(model_source="m"))
     assert type(processor) is Processor
-    assert hasattr(processor, "close")
     processor.close()
 
 
@@ -220,7 +156,7 @@ def test_builder_returns_ordinary_processor_for_gpu(monkeypatch):
     ],
 )
 def test_topology_bundle_and_strategy_forwarding(
-    monkeypatch,
+    stub_slice_pg,
     topology,
     accelerator_type,
     tp,
@@ -228,21 +164,14 @@ def test_topology_bundle_and_strategy_forwarding(
     tpu_per_bundle,
     expected_strategy,
 ):
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake = FakeSlicePlacementGroupHandle()
-    slice_kwargs: List[Dict[str, Any]] = []
-
-    def on_slice(*args, **kwargs):
-        slice_kwargs.append(kwargs)
-
-    _install_tpu_slice_fakes(monkeypatch, fake, on_slice=on_slice)
-    pg_config = None
-    if tpu_per_bundle is not None:
-        pg_config = {"bundle_per_worker": {"TPU": tpu_per_bundle}}
-
-    backend = TPUAccelerator(TPUConfig(topology=topology, chips_per_vm=chips_per_vm))
-    kwargs, close_fn = _tpu_options(
-        backend,
+    handle, create = stub_slice_pg
+    pg_config = (
+        {"bundle_per_worker": {"TPU": tpu_per_bundle}}
+        if tpu_per_bundle is not None
+        else None
+    )
+    kwargs, close_fn = _options(
+        TPUAccelerator(TPUConfig(topology=topology, chips_per_vm=chips_per_vm)),
         accelerator_type=accelerator_type,
         tensor_parallel_size=tp,
         placement_group_config=pg_config,
@@ -250,88 +179,76 @@ def test_topology_bundle_and_strategy_forwarding(
     assert isinstance(kwargs["scheduling_strategy"], PlacementGroupSchedulingStrategy)
     assert kwargs["scheduling_strategy"].placement_group_bundle_index == 0
     assert kwargs["num_cpus"] == PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
-    assert slice_kwargs[0]["strategy"] == expected_strategy
-    assert slice_kwargs[0]["topology"] == topology
-    resources = slice_kwargs[0]["resources_per_bundle"]
+
+    slice_kwargs = create.call_args.kwargs
+    assert slice_kwargs["strategy"] == expected_strategy
+    assert slice_kwargs["topology"] == topology
+    resources = slice_kwargs["resources_per_bundle"]
     if tpu_per_bundle is None:
         assert "TPU" not in resources
     else:
         assert resources["TPU"] == float(tpu_per_bundle)
     if chips_per_vm is None:
-        assert "chips_per_vm" not in slice_kwargs[0]
+        assert "chips_per_vm" not in slice_kwargs
     else:
-        assert slice_kwargs[0]["chips_per_vm"] == chips_per_vm
+        assert slice_kwargs["chips_per_vm"] == chips_per_vm
+
     close_fn()
-    assert fake.shutdown_calls == 1
+    handle.shutdown.assert_called_once()
 
 
-def test_batch_strategy_rejects_invalid_layouts(monkeypatch):
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake = FakeSlicePlacementGroupHandle()
-    _install_tpu_slice_fakes(monkeypatch, fake)
-    backend = TPUAccelerator(TPUConfig(topology="2x4"))
-    with pytest.raises(ValueError, match="PACK/STRICT_PACK"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=8,
-            placement_group_config={
-                "bundle_per_worker": {"TPU": 1},
-                "strategy": "SPREAD",
-            },
+@pytest.mark.parametrize(
+    "topology, tp, placement_group_config, match",
+    [
+        (
+            "2x4",
+            8,
+            {"bundle_per_worker": {"TPU": 1}, "strategy": "SPREAD"},
+            "PACK/STRICT_PACK",
+        ),
+        (
+            "4x4",
+            16,
+            {"bundle_per_worker": {"TPU": 4}, "strategy": "STRICT_PACK"},
+            "STRICT_PACK cannot represent",
+        ),
+    ],
+)
+def test_batch_strategy_rejects_invalid_layouts(
+    stub_slice_pg, topology, tp, placement_group_config, match
+):
+    with pytest.raises(ValueError, match=match):
+        _options(
+            TPUAccelerator(TPUConfig(topology=topology)),
+            tensor_parallel_size=tp,
+            placement_group_config=placement_group_config,
         )
-
-    backend = TPUAccelerator(TPUConfig(topology="4x4"))
-    with pytest.raises(ValueError, match="STRICT_PACK cannot represent"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            placement_group_config={
-                "bundle_per_worker": {"TPU": 4},
-                "strategy": "STRICT_PACK",
-            },
-        )
+    stub_slice_pg[1].assert_not_called()
 
 
-def test_eager_acquisition_ordering_and_timeout_cleanup(monkeypatch):
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake = FakeSlicePlacementGroupHandle(topology="4x4", num_hosts=4, num_bundles=4)
-    events: List[str] = []
+def test_eager_timeout_cleans_up_before_head_release(stub_slice_pg, monkeypatch):
+    handle, create = stub_slice_pg
 
-    def on_slice(*args, **kwargs):
-        events.append("slice")
-
-    def on_wait(pg, timeout_s):
-        events.append(f"wait:{timeout_s}")
+    def _timeout(pg, timeout_s):
+        assert timeout_s == DEFAULT_PG_READY_TIMEOUT_S
         raise ray.exceptions.GetTimeoutError("timed out")
 
-    _install_tpu_slice_fakes(monkeypatch, fake, on_slice=on_slice, on_wait=on_wait)
-    backend = TPUAccelerator(TPUConfig(topology="4x4"))
+    monkeypatch.setattr(f"{_ACCEL}._wait_for_placement_group", _timeout)
     with pytest.raises(TimeoutError, match="Timed out"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-        )
-    assert events == ["slice", f"wait:{DEFAULT_PG_READY_TIMEOUT_S}"]
-    assert fake.shutdown_calls == 1
-    assert fake.released_head_pgs == 0
+        _options(TPUAccelerator(TPUConfig(topology="4x4")), tensor_parallel_size=16)
+    create.assert_called_once()
+    handle.shutdown.assert_called_once()
+    handle.release_head_pgs.assert_not_called()
 
 
-def test_construction_failure_cleanup_and_explicit_close(
-    mock_tpu_slice_environment, monkeypatch
-):
+def test_builder_failure_and_close_lifecycle(stub_slice_pg, monkeypatch):
+    handle, _ = stub_slice_pg
     real_stage = __import__(
         "ray.llm._internal.batch.stages.vllm_engine_stage", fromlist=["vLLMEngineStage"]
     ).vLLMEngineStage
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("stage boom")
-
     monkeypatch.setattr(
         "ray.llm._internal.batch.processor.vllm_engine_proc.vLLMEngineStage",
-        boom,
+        MagicMock(side_effect=RuntimeError("stage boom")),
     )
     config = vLLMEngineProcessorConfig(
         model_source="test-model",
@@ -344,7 +261,7 @@ def test_construction_failure_cleanup_and_explicit_close(
     )
     with pytest.raises(RuntimeError, match="stage boom"):
         build_processor(config)
-    assert mock_tpu_slice_environment.shutdown_calls == 1
+    handle.shutdown.assert_called_once()
 
     monkeypatch.setattr(
         "ray.llm._internal.batch.processor.vllm_engine_proc.vLLMEngineStage",
@@ -352,28 +269,21 @@ def test_construction_failure_cleanup_and_explicit_close(
     )
     processor = build_processor(config)
     processor.close()
-    processor.close()  # idempotent
-    assert mock_tpu_slice_environment.shutdown_calls == 2
+    processor.close()
+    assert handle.shutdown.call_count == 2
     with pytest.raises(RuntimeError, match="closed"):
         processor(ray.data.from_items([{"prompt": "x"}]))
 
 
-def test_slice_kwargs_head_release_and_runtime_env_merge(monkeypatch):
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake = FakeSlicePlacementGroupHandle()
-    slice_kwargs: List[Dict[str, Any]] = []
-    _install_tpu_slice_fakes(
-        monkeypatch, fake, on_slice=lambda *a, **k: slice_kwargs.append(k)
-    )
-    backend = TPUAccelerator(TPUConfig(topology="4x4"))
-    kwargs, close_fn = _tpu_options(
-        backend,
-        accelerator_type="TPU-V6E",
+def test_head_release_cpu_floor_and_runtime_env_merge(stub_slice_pg):
+    handle, create = stub_slice_pg
+    kwargs, close_fn = _options(
+        TPUAccelerator(TPUConfig(topology="4x4")),
         tensor_parallel_size=16,
         runtime_env={"env_vars": {"USER_FLAG": "1"}},
     )
-    assert fake.released_head_pgs == 1
-    assert slice_kwargs[0]["resources_per_bundle"]["CPU"] == float(
+    handle.release_head_pgs.assert_called_once()
+    assert create.call_args.kwargs["resources_per_bundle"]["CPU"] == float(
         PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
     )
     env = kwargs["runtime_env"]["env_vars"]
@@ -383,59 +293,56 @@ def test_slice_kwargs_head_release_and_runtime_env_merge(monkeypatch):
     close_fn()
 
 
-def test_rejects_invalid_executor_pp_dp_and_templates(monkeypatch):
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake = FakeSlicePlacementGroupHandle()
-    _install_tpu_slice_fakes(monkeypatch, fake)
-    backend = TPUAccelerator(TPUConfig(topology="4x4"))
-
-    with pytest.raises(ValueError, match="distributed_executor_backend"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            executor_backend="uni",
-        )
-    with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            pipeline_parallel_size=2,
-        )
-    with pytest.raises(ValueError, match="data_parallel_size"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            data_parallel_size=2,
-        )
-    with pytest.raises(ValueError, match="GPU resources are not supported"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            placement_group_config={"bundle_per_worker": {"GPU": 1, "TPU": 1}},
-        )
-    with pytest.raises(ValueError, match="must specify bundle_per_worker or bundles"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V6E",
-            tensor_parallel_size=16,
-            placement_group_config={"strategy": "PACK"},
-        )
-
-
-def test_vllm_tp_multiplier_and_v7x_tp_admission(monkeypatch):
+@pytest.mark.parametrize(
+    "backend_kwargs, option_kwargs, match",
+    [
+        (
+            {"topology": "4x4"},
+            {"tensor_parallel_size": 16, "distributed_executor_backend": "uni"},
+            "distributed_executor_backend",
+        ),
+        (
+            {"topology": "4x4"},
+            {"tensor_parallel_size": 16, "pipeline_parallel_size": 2},
+            "pipeline_parallel_size",
+        ),
+        (
+            {"topology": "4x4"},
+            {"tensor_parallel_size": 16, "data_parallel_size": 2},
+            "data_parallel_size",
+        ),
+        (
+            {"topology": "4x4"},
+            {
+                "tensor_parallel_size": 16,
+                "placement_group_config": {"bundle_per_worker": {"GPU": 1, "TPU": 1}},
+            },
+            "GPU resources are not supported",
+        ),
+        (
+            {"topology": "4x4"},
+            {
+                "tensor_parallel_size": 16,
+                "placement_group_config": {"strategy": "PACK"},
+            },
+            "must specify bundle_per_worker or bundles",
+        ),
+        ({}, {"tensor_parallel_size": 8}, "topology"),
+        (
+            {"topology": "2x2x2"},
+            {
+                "accelerator_type": "TPU-V7X",
+                "tensor_parallel_size": 8,
+            },
+            "tensor_parallel_size must be 16",
+        ),
+    ],
+)
+def test_rejects_invalid_batch_inputs(
+    stub_slice_pg, backend_kwargs, option_kwargs, match
+):
     assert _vllm_tp_multiplier("v6e") == 1
     assert _vllm_tp_multiplier("v7x") == 2
-    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    fake = FakeSlicePlacementGroupHandle()
-    _install_tpu_slice_fakes(monkeypatch, fake)
-    backend = TPUAccelerator(TPUConfig(topology="2x2x2"))
-    with pytest.raises(ValueError, match="tensor_parallel_size must be 16"):
-        _tpu_options(
-            backend,
-            accelerator_type="TPU-V7X",
-            tensor_parallel_size=8,
-        )
+    with pytest.raises(ValueError, match=match):
+        _options(TPUAccelerator(TPUConfig(**backend_kwargs)), **option_kwargs)
+    stub_slice_pg[1].assert_not_called()

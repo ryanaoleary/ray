@@ -69,11 +69,7 @@ def mock_vllm_wrapper():
 
 
 def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
-    """Stage construction stays accelerator-neutral; GPU PG bundles are owned by the backend.
-
-    Accelerator token injection and bundle shape (F-8) are covered by
-    ``GPUAccelerator.build_batch_scheduling_options`` tests that invoke ``ray_remote_args_fn``.
-    """
+    """Stage stays accelerator-neutral; GPU scheduling lives on GPUAccelerator."""
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
             model=model_llama_3_2_216M,
@@ -110,8 +106,7 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
     assert stage.map_batches_kwargs["zero_copy_batch"] is True
     assert stage.map_batches_kwargs["max_concurrency"] == 4
     assert stage.map_batches_kwargs["accelerator_type"] == gpu_type
-    # Scheduling strategy / ray_remote_args_fn is supplied by the processor backend,
-    # not by stage.post_init.
+    # ray_remote_args_fn / num_gpus come from GPUAccelerator.build_batch_scheduling_options.
     assert "ray_remote_args_fn" not in stage.map_batches_kwargs
     assert "num_gpus" not in stage.map_batches_kwargs
 
