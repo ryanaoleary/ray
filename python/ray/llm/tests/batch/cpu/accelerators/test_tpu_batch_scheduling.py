@@ -14,8 +14,8 @@ import pytest
 import ray
 import ray.llm._internal.common.accelerators as accelerators
 from ray.data.llm import build_processor, vLLMEngineProcessorConfig
-from ray.llm._internal.batch.processor.base import Processor
 from ray.llm._internal.batch.processor import vllm_engine_proc
+from ray.llm._internal.batch.processor.base import Processor
 from ray.llm._internal.common.accelerators import (
     DEFAULT_PG_READY_TIMEOUT_S,
     DEFAULT_USER_CPU_PER_HOST,

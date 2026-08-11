@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pydantic
 import pytest
 
+from ray.llm._internal.common.utils.download_utils import NodeModelDownloadable
 from ray.llm._internal.serve.core.configs.accelerators import (
     CPUAccelerator,
     CPUConfig,
@@ -13,7 +14,6 @@ from ray.llm._internal.serve.core.configs.accelerators import (
     TPUAccelerator,
     TPUConfig,
 )
-from ray.llm._internal.common.utils.download_utils import NodeModelDownloadable
 from ray.llm._internal.serve.core.configs.llm_config import (
     LLMConfig,
     LoraConfig,
