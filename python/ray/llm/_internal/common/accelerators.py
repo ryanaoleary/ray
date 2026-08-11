@@ -627,14 +627,123 @@ class TPUAccelerator(AcceleratorBackend):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Reserve one TPU slice and return map_batches kwargs plus close_fn."""
-        tpu_config = self._config
-        if not isinstance(tpu_config, TPUConfig) or not tpu_config.topology:
-            raise ValueError(
-                "TPU slice placement requires accelerator_config.topology "
-                "(e.g. {'kind': 'tpu', 'topology': '4x4'}); "
-                f"got config: {tpu_config}"
+        """Return Batch map_batches kwargs; SlicePG only when topology is set."""
+        if self._config.topology:
+            return self._build_topology_batch_scheduling_options(
+                accelerator_type=accelerator_type,
+                engine_kwargs=engine_kwargs,
+                placement_group_config=placement_group_config,
+                runtime_env=runtime_env,
             )
+        return self._build_single_host_batch_scheduling_options(
+            accelerator_type=accelerator_type,
+            engine_kwargs=engine_kwargs,
+            placement_group_config=placement_group_config,
+            runtime_env=runtime_env,
+        )
+
+    def _build_single_host_batch_scheduling_options(
+        self,
+        *,
+        accelerator_type: Optional[str],
+        engine_kwargs: Dict[str, Any],
+        placement_group_config: Optional[Dict[str, Any]],
+        runtime_env: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
+        """Schedule via TPU resource requests (no SlicePG).
+
+        The caller is responsible for sizing ``tensor_parallel_size`` /
+        ``placement_group_config`` to match available single-host TPU chips.
+        For multi-host topologies, set ``accelerator_config.topology`` instead.
+        """
+        if not accelerator_type:
+            raise ValueError(
+                "`accelerator_type` (e.g. 'TPU-V6E') is required for TPU batch inference."
+            )
+        canonical_accel = normalize_tpu_accelerator_type(accelerator_type)
+        if canonical_accel not in TPU_ACCELERATOR_VALUES:
+            raise ValueError(
+                f"Unknown or unsupported TPU accelerator type: {accelerator_type!r}. "
+                f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
+            )
+
+        tp = _require_positive_int(
+            engine_kwargs.get("tensor_parallel_size", 1), "tensor_parallel_size"
+        )
+        pp = _require_positive_int(
+            engine_kwargs.get("pipeline_parallel_size", 1), "pipeline_parallel_size"
+        )
+        num_bundles = tp * pp
+        pg_config = (
+            copy.deepcopy(placement_group_config) if placement_group_config else None
+        )
+        if pg_config is not None:
+            bundle_per_worker = pg_config.pop("bundle_per_worker", None)
+            if bundle_per_worker is not None:
+                pg_config["bundles"] = [
+                    bundle_per_worker.copy() for _ in range(num_bundles)
+                ]
+
+        engine_kwargs.setdefault(
+            "distributed_executor_backend",
+            "uni" if num_bundles == 1 else "ray",
+        )
+        executor_backend = engine_kwargs["distributed_executor_backend"]
+
+        merged_runtime_env = copy.deepcopy(runtime_env or {})
+        env_vars = merged_runtime_env.setdefault("env_vars", {})
+        if not isinstance(env_vars, dict):
+            raise ValueError("runtime_env['env_vars'] must be a dictionary.")
+        for name, required in TPU_ENGINE_ENV_VARS.items():
+            supplied = env_vars.get(name)
+            if supplied is not None and supplied != required:
+                raise ValueError(
+                    f"runtime_env['env_vars']['{name}'] must be the string "
+                    f"{required!r}; got {supplied!r}."
+                )
+        env_vars.update(TPU_ENGINE_ENV_VARS)
+
+        map_batches_kwargs: Dict[str, Any] = {
+            "runtime_env": merged_runtime_env,
+            "accelerator_type": canonical_accel,
+            "num_gpus": 0,
+        }
+        if executor_backend == "ray":
+            map_batches_kwargs["ray_remote_args_fn"] = partial(
+                _tpu_ray_scheduling_strategy_fn,
+                num_bundles,
+                canonical_accel,
+                pg_config,
+                self,
+            )
+            map_batches_kwargs["resources"] = {}
+        elif not pg_config:
+            map_batches_kwargs["resources"] = {"TPU": float(num_bundles)}
+        else:
+            resource_counter = Counter()
+            for bundle in pg_config["bundles"]:
+                resource_counter.update(bundle)
+            total_cpus = resource_counter.pop("CPU", 0)
+            resource_counter.pop("GPU", None)
+            if total_cpus:
+                map_batches_kwargs["num_cpus"] = total_cpus
+            if resource_counter:
+                map_batches_kwargs["resources"] = dict(resource_counter)
+            else:
+                map_batches_kwargs["resources"] = {}
+        return map_batches_kwargs, None
+
+    def _build_topology_batch_scheduling_options(
+        self,
+        *,
+        accelerator_type: Optional[str],
+        engine_kwargs: Dict[str, Any],
+        placement_group_config: Optional[Dict[str, Any]],
+        runtime_env: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
+        """Eagerly reserve one topology-backed SlicePG for Batch."""
+        tpu_config = self._config
+        assert tpu_config.topology is not None
 
         raw_driver_rpc = os.environ.get(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
         try:
@@ -646,7 +755,7 @@ class TPUAccelerator(AcceleratorBackend):
             ) from exc
         if driver_rpc != 1:
             raise ValueError(
-                f"TPU batch inference currently requires "
+                f"Topology-backed TPU batch inference requires "
                 f"{RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} == 1; got {driver_rpc}."
             )
 
@@ -665,7 +774,8 @@ class TPUAccelerator(AcceleratorBackend):
         engine_kwargs.setdefault("distributed_executor_backend", "ray")
         if engine_kwargs["distributed_executor_backend"] != "ray":
             raise ValueError(
-                "TPU batch inference requires distributed_executor_backend='ray'; "
+                "Topology-backed TPU batch inference requires "
+                "distributed_executor_backend='ray'; "
                 f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
 
@@ -691,11 +801,13 @@ class TPUAccelerator(AcceleratorBackend):
             )
         if pp != 1:
             raise ValueError(
-                f"TPU batch inference currently supports pipeline_parallel_size=1; got {pp}."
+                "Topology-backed TPU batch inference currently supports "
+                f"pipeline_parallel_size=1; got {pp}."
             )
         if dp != 1:
             raise ValueError(
-                f"TPU batch inference currently supports data_parallel_size=1; got {dp}."
+                "Topology-backed TPU batch inference currently supports "
+                f"data_parallel_size=1; got {dp}."
             )
 
         merged_runtime_env = copy.deepcopy(runtime_env or {})
@@ -712,7 +824,6 @@ class TPUAccelerator(AcceleratorBackend):
         env_vars.update(TPU_ENGINE_ENV_VARS)
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
-        # Same default as Serve / GPU Batch PGs: PACK. Pass user strategy through.
         strategy = (
             placement_group_config.get("strategy") if placement_group_config else None
         ) or "PACK"
@@ -762,6 +873,55 @@ class TPUAccelerator(AcceleratorBackend):
                     )
                 finally:
                     self._slice_pg_wrapper = None
+
+
+def _tpu_ray_scheduling_strategy_fn(
+    num_bundles_per_replica: int,
+    accelerator_type: Optional[str] = None,
+    placement_group_config: Optional[Dict[str, Any]] = None,
+    backend: Optional["TPUAccelerator"] = None,
+) -> Dict[str, Any]:
+    """Dynamic PG creation for single-host TPU Batch (no topology / SlicePG)."""
+
+    def _get_bundle() -> Dict[str, float]:
+        bundle: Dict[str, float] = {"TPU": 1, "CPU": 1}
+        if accelerator_type:
+            bundle[f"accelerator_type:{accelerator_type}"] = 0.001
+        return bundle
+
+    if placement_group_config:
+        placement_group_config = copy.deepcopy(placement_group_config)
+        bundles = placement_group_config.get("bundles") or []
+        if accelerator_type:
+            for bundle in bundles:
+                bundle[f"accelerator_type:{accelerator_type}"] = 0.001
+        strategy = placement_group_config.get("strategy") or "PACK"
+        if backend is not None:
+            pg = backend.create_placement_group(
+                bundles=bundles,
+                strategy=strategy,
+                name="",
+                accelerator_type_str=accelerator_type,
+            )
+        else:
+            placement_group_config["bundles"] = bundles
+            pg = ray.util.placement_group(**placement_group_config)
+    else:
+        bundles = [_get_bundle()] * num_bundles_per_replica
+        if backend is not None:
+            pg = backend.create_placement_group(
+                bundles=bundles,
+                strategy="PACK",
+                name="",
+                accelerator_type_str=accelerator_type,
+            )
+        else:
+            pg = ray.util.placement_group(bundles, strategy="PACK")
+    return dict(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            pg, placement_group_capture_child_tasks=True
+        )
+    )
 
 
 def get_accelerator_backend(

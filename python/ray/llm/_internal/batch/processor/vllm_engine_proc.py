@@ -42,9 +42,12 @@ from ray.llm._internal.batch.stages.configs import (
 from ray.llm._internal.common.accelerators import (
     CPU_ACCELERATOR_TYPE_LITERAL,
     TPU_ACCELERATOR_VALUES,
+    AcceleratorBackend,
     AnyAcceleratorConfig,
     CPUConfig,
+    GPUAccelerator,
     GPUConfig,
+    TPUAccelerator,
     TPUConfig,
     get_accelerator_backend,
     normalize_tpu_accelerator_type,
@@ -110,8 +113,12 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Optional accelerator backend configuration for the LLM stage. "
-            "When omitted, GPU batch scheduling is used."
+            "Optional accelerator backend configuration. For topology-backed TPU "
+            "Batch (multi-host / SlicePG), pass topology, e.g. "
+            '{"topology": "4x4"} or {"kind": "tpu", "topology": "4x4"}. '
+            "When omitted with a TPU accelerator_type, single-host TPU resource "
+            "scheduling is used. When omitted with a non-TPU accelerator_type, "
+            "GPU batch scheduling is used."
         ),
     )
 
@@ -136,6 +143,15 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
             engine_kwargs["task_type"] = task_type
         values["engine_kwargs"] = engine_kwargs
         return values
+
+    @field_validator("accelerator_config", mode="before")
+    @classmethod
+    def _coerce_tpu_accelerator_config(cls, value):
+        # Allow {"topology": "4x4"} without an explicit kind discriminator.
+        if isinstance(value, dict) and "kind" not in value:
+            if "topology" in value or "chips_per_vm" in value:
+                return {**value, "kind": "tpu"}
+        return value
 
     @field_validator("accelerator_type")
     @classmethod
@@ -173,18 +189,21 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
                     f"GPUConfig cannot be used with TPU accelerator_type "
                     f"{self.accelerator_type!r}."
                 )
-            if self.accelerator_config is None:
-                raise ValueError(
-                    "TPU accelerator_type requires accelerator_config with kind='tpu'."
-                )
-            if not isinstance(self.accelerator_config, TPUConfig):
+            if self.accelerator_config is not None and not isinstance(
+                self.accelerator_config, TPUConfig
+            ):
                 raise ValueError(
                     "TPU accelerator_type requires a TPU accelerator_config "
-                    f"(kind='tpu'); got {self.accelerator_config!r}."
+                    f"(or omit it for single-host); got {self.accelerator_config!r}."
                 )
-            if self.concurrency != 1:
+            # Topology-backed SlicePG owns one complete slice per processor.
+            if (
+                isinstance(self.accelerator_config, TPUConfig)
+                and self.accelerator_config.topology
+                and self.concurrency != 1
+            ):
                 raise ValueError(
-                    "TPU batch inference requires concurrency=1; "
+                    "Topology-backed TPU batch inference requires concurrency=1; "
                     f"got {self.concurrency!r}."
                 )
         elif isinstance(self.accelerator_config, TPUConfig):
@@ -202,6 +221,24 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         # Validate through PlacementGroupConfig, then dump back to dict
         validated = PlacementGroupConfig(**value)
         return validated.model_dump(exclude_unset=True)
+
+
+def _resolve_batch_accelerator_backend(
+    config: "vLLMEngineProcessorConfig",
+) -> AcceleratorBackend:
+    """Select the Batch accelerator backend.
+
+    - Explicit TPUConfig (with or without topology) → TPUAccelerator
+    - TPU accelerator_type with no accelerator_config → single-host TPUAccelerator
+    - Otherwise → GPU (default) / configured non-TPU backend
+    """
+    if isinstance(config.accelerator_config, TPUConfig):
+        return TPUAccelerator(config.accelerator_config)
+    if config.accelerator_type and config.accelerator_type.startswith("TPU"):
+        return TPUAccelerator(TPUConfig())
+    if config.accelerator_config is None:
+        return GPUAccelerator()
+    return get_accelerator_backend(config.accelerator_config)
 
 
 def build_vllm_engine_processor(
@@ -349,7 +386,7 @@ def build_vllm_engine_processor(
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
     dp_size = engine_kwargs.get("data_parallel_size", 1)
 
-    backend = get_accelerator_backend(config.accelerator_config or GPUConfig())
+    backend = _resolve_batch_accelerator_backend(config)
 
     telemetry_agent = get_or_create_telemetry_agent()
     telemetry_agent.push_telemetry_report(

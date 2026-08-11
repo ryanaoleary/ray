@@ -45,7 +45,6 @@ def _options(
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": 1,
         "data_parallel_size": 1,
-        "distributed_executor_backend": "ray",
         **engine_overrides,
     }
     return backend.build_batch_scheduling_options(
@@ -71,32 +70,32 @@ def stub_slice_pg(monkeypatch):
     return handle, create
 
 
-def test_config_requires_tpu_kind_and_concurrency_one():
-    cfg = vLLMEngineProcessorConfig(
-        model_source="m",
-        accelerator_type="TPU-V6E",
-        accelerator_config={"kind": "tpu", "topology": "4x4"},
-    )
-    assert isinstance(cfg.accelerator_config, TPUConfig)
+def test_tpu_config_single_host_vs_topology():
+    # TPU accelerator_type alone is valid (single-host resource scheduling).
+    cfg = vLLMEngineProcessorConfig(model_source="m", accelerator_type="TPU-V6E")
+    assert cfg.accelerator_config is None
     assert cfg.concurrency == 1
 
-    # Topology is optional at config time; SlicePG Batch still requires it later.
-    assert (
-        vLLMEngineProcessorConfig(
-            model_source="m",
-            accelerator_type="TPU-V6E",
-            accelerator_config={"kind": "tpu"},
-        ).accelerator_config.topology
-        is None
+    # Topology may omit kind; chips_per_vm alone also coerces to TPUConfig.
+    topo = vLLMEngineProcessorConfig(
+        model_source="m",
+        accelerator_type="TPU-V6E",
+        accelerator_config={"topology": "4x4"},
     )
+    assert isinstance(topo.accelerator_config, TPUConfig)
+    assert topo.accelerator_config.topology == "4x4"
 
-    with pytest.raises(ValueError, match="kind='tpu'"):
-        vLLMEngineProcessorConfig(model_source="m", accelerator_type="TPU-V6E")
+    # concurrency>1 is only rejected for topology-backed SlicePG.
+    vLLMEngineProcessorConfig(
+        model_source="m",
+        accelerator_type="TPU-V6E",
+        concurrency=2,
+    )
     with pytest.raises(ValueError, match="concurrency=1"):
         vLLMEngineProcessorConfig(
             model_source="m",
             accelerator_type="TPU-V6E",
-            accelerator_config={"kind": "tpu", "topology": "4x4"},
+            accelerator_config={"topology": "4x4"},
             concurrency=2,
         )
 
@@ -109,13 +108,40 @@ def test_omitted_accelerator_config_defaults_to_gpu_backend():
     )
 
 
+def test_single_host_tpu_requests_resources_without_slice(stub_slice_pg):
+    _, create = stub_slice_pg
+    # Multi-chip single-host uses the ray executor + dynamic PG (no SlicePG).
+    kwargs, close_fn = _options(
+        TPUAccelerator(TPUConfig()),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=4,
+    )
+    assert close_fn is None
+    assert kwargs["resources"] == {}
+    assert "ray_remote_args_fn" in kwargs
+    assert kwargs["accelerator_type"] == "TPU-V6E"
+    assert "scheduling_strategy" not in kwargs
+    create.assert_not_called()
+
+    # Single-chip defaults to uni and a direct TPU resource request.
+    kwargs, close_fn = _options(
+        TPUAccelerator(TPUConfig()),
+        accelerator_type="TPU-V6E",
+        tensor_parallel_size=1,
+    )
+    assert close_fn is None
+    assert kwargs["resources"] == {"TPU": 1.0}
+    assert "ray_remote_args_fn" not in kwargs
+    create.assert_not_called()
+
+
 def test_builder_pins_bundle_zero_and_close_releases_slice(stub_slice_pg):
     handle, _ = stub_slice_pg
     processor = build_processor(
         vLLMEngineProcessorConfig(
             model_source="test-model",
             accelerator_type="TPU-V6E",
-            accelerator_config={"kind": "tpu", "topology": "4x4"},
+            accelerator_config={"topology": "4x4"},
             engine_kwargs={"tensor_parallel_size": 16},
         )
     )
@@ -300,7 +326,6 @@ def test_head_release_cpu_floor_and_runtime_env_merge(stub_slice_pg):
             },
             "must specify bundle_per_worker or bundles",
         ),
-        ({}, {"tensor_parallel_size": 8}, "topology"),
         (
             {"topology": "2x2x2"},
             {

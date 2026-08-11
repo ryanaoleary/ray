@@ -155,8 +155,9 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             to ``PACK`` when omitted. For topology-backed TPU Batch, these
             fields supply a homogeneous worker-resource template for SlicePG.
         accelerator_config: Optional accelerator configuration for the LLM stage.
-            For TPU batch inference, pass
-            ``{"kind": "tpu", "topology": "4x4"}`` (optional ``chips_per_vm``).
+            For topology-backed TPU Batch (SlicePG / multi-host), pass
+            ``{"topology": "4x4"}`` (optional ``chips_per_vm``). A TPU
+            ``accelerator_type`` alone uses single-host TPU resource scheduling.
             When omitted with a non-TPU ``accelerator_type``, GPU behavior is
             preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
