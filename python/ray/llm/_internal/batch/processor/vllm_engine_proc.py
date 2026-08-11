@@ -450,9 +450,8 @@ def build_vllm_engine_processor(
                 close_fn()
             except Exception:
                 logger.exception(
-                    "Failed to release accelerator batch resources after processor "
-                    "construction failed; resources may remain allocated until the "
-                    "driver exits."
+                    "Failed to release TPU batch resources after processor construction "
+                    "failed; the slice may remain allocated until the driver exits."
                 )
         raise
 
