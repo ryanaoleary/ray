@@ -148,11 +148,18 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
         dynamic_lora_loading_path: Path holding dynamic LoRA adapter checkpoints
             (one per subfolder). If unset and LoRA is used, the ``model`` in a
             LoRA request is interpreted as a HF model ID.
-        placement_group_config: Optional placement group config for scheduling
-            vLLM engine workers. Accepts ``bundle_per_worker`` (auto-replicated by
-            ``tp*pp``) or ``bundles`` (full list of resource dicts), plus an
-            optional ``strategy``
+        placement_group_config: Optional Ray placement group configuration for
+            scheduling vLLM engine workers. Defines resource bundles and
+            placement strategy for multi-node deployments. Can specify either
+            ``bundle_per_worker`` (auto-replicated by ``tp*pp``) or ``bundles``
+            (full list of resource dicts). For topology-backed TPU scheduling,
+            these fields are a homogeneous per-worker resource template; the
+            topology determines the resulting bundle count. Optionally include
+            ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
+        accelerator_config: Hardware-specific configuration parameters for the
+            chosen accelerator. The expected schema is dynamically typed based
+            on the ``kind`` discriminator.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

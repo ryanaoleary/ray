@@ -16,7 +16,6 @@ from ray.llm._internal.batch.stages.vllm_engine_stage import (
     vLLMEngineWrapper,
     vLLMOutputData,
 )
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 @pytest.fixture
@@ -70,6 +69,9 @@ def mock_vllm_wrapper():
 
 
 def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
+    # Stage construction is accelerator-neutral; GPU scheduling
+    # (ray_remote_args_fn / num_gpus) is owned by the GPU AcceleratorBackend
+    # (GPUAccelerator).
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
             model=model_llama_3_2_216M,
@@ -99,7 +101,6 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
             "distributed_executor_backend": "ray",
         },
     }
-    ray_remote_args_fn = stage.map_batches_kwargs.pop("ray_remote_args_fn")
     compute = stage.map_batches_kwargs.pop("compute")
     assert isinstance(compute, ActorPoolStrategy)
     assert compute.min_size == 1
@@ -109,17 +110,7 @@ def test_vllm_engine_stage_post_init(gpu_type, model_llama_3_2_216M):
         "zero_copy_batch": True,
         "max_concurrency": 4,
         "accelerator_type": gpu_type,
-        "num_gpus": 0,
     }
-    scheduling_strategy = ray_remote_args_fn()["scheduling_strategy"]
-    assert isinstance(scheduling_strategy, PlacementGroupSchedulingStrategy)
-
-    bundle_specs = scheduling_strategy.placement_group.bundle_specs
-    assert len(bundle_specs) == 4
-    for bundle_spec in bundle_specs:
-        assert bundle_spec[f"accelerator_type:{gpu_type}"] == 0.001
-        assert bundle_spec["CPU"] == 1.0
-        assert bundle_spec["GPU"] == 1.0
 
 
 @pytest.mark.asyncio

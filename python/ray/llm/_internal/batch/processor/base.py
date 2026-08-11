@@ -1,4 +1,5 @@
 import logging
+import threading
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
@@ -320,6 +321,8 @@ class Processor:
             preprocess stage (e.g., num_cpus, memory, concurrency).
         postprocess_map_kwargs: Optional kwargs to pass to Dataset.map() for the
             postprocess stage (e.g., num_cpus, memory, concurrency).
+        close_fn: Optional callable invoked by ``close()`` to mark the processor
+            closed and release any driver-owned resources.
     """
 
     # The internal used data column name ("__data"). Your input
@@ -335,6 +338,7 @@ class Processor:
         postprocess: Optional[UserDefinedFunction] = None,
         preprocess_map_kwargs: Optional[Dict[str, Any]] = None,
         postprocess_map_kwargs: Optional[Dict[str, Any]] = None,
+        close_fn: Optional[Callable[[], None]] = None,
     ):
         self.config = config
         self.preprocess = None
@@ -342,6 +346,9 @@ class Processor:
         self.preprocess_map_kwargs = preprocess_map_kwargs or {}
         self.postprocess_map_kwargs = postprocess_map_kwargs or {}
         self.stages: OrderedDict[str, StatefulStage] = OrderedDict()
+        self._close_fn = close_fn
+        self._closed = False
+        self._lock = threading.Lock()
 
         # NOTE (Kourosh): If pre/postprocess is not provided, use the identity function.
         # Wrapping is required even if they are identity functions, b/c data_column
@@ -366,6 +373,28 @@ class Processor:
         for stage in stages:
             self._append_stage(stage)
 
+    def close(self) -> None:
+        """Mark this processor closed and release any driver-owned resources.
+
+        ``_close_fn`` is cleared only after a successful call so a failed
+        shutdown can be retried. The closed flag is set under the same lock
+        used by ``__call__``'s closed-check so concurrent close/execute cannot
+        race on the flag. Callers must still materialize every derived Dataset
+        before closing.
+        """
+        with self._lock:
+            self._closed = True
+            if self._close_fn is None:
+                return
+            self._close_fn()
+            self._close_fn = None
+
+    def __enter__(self) -> "Processor":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
     def __call__(self, dataset: Dataset) -> Dataset:
         """Execute the processor:
         preprocess -> stages -> postprocess.
@@ -377,6 +406,11 @@ class Processor:
         Returns:
             The output dataset.
         """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "Processor is closed. Cannot execute new datasets on a closed processor."
+                )
         if self.preprocess is not None:
             dataset = dataset.map(self.preprocess, **self.preprocess_map_kwargs)
 
