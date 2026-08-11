@@ -366,6 +366,22 @@ class Processor:
         for stage in stages:
             self._append_stage(stage)
 
+    def close(self) -> None:
+        """Release any driver-owned resources held by this processor.
+
+        The base implementation is a no-op. Accelerator backends that eagerly
+        reserve cluster resources (for example topology-backed TPU Batch) override
+        this on a managed subclass. Prefer finishing every derived Dataset before
+        calling ``close()``.
+        """
+        return
+
+    def __enter__(self) -> "Processor":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
     def __call__(self, dataset: Dataset) -> Dataset:
         """Execute the processor:
         preprocess -> stages -> postprocess.

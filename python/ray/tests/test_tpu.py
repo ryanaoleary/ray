@@ -938,6 +938,87 @@ def test_get_tpu_worker_resources_chips_per_vm_override():
     assert resources_override["TPU"] == 4
 
 
+def test_resolve_chips_per_vm_supported_packings():
+    """chips_per_vm must be a supported packing, not merely a positive divisor."""
+    resolve = ray.util.tpu.resolve_chips_per_vm
+    supported = ray.util.tpu.get_supported_chips_per_vm
+
+    assert supported("2x4", "v6e") == frozenset({4, 8})
+    assert resolve("2x4", "v6e") == 8
+    assert resolve("2x4", "v6e", chips_per_vm=4) == 4
+    assert resolve("2x4", "v6e", chips_per_vm=8) == 8
+
+    # Mathematically divisible but unsupported for v6e 2x4.
+    with pytest.raises(ValueError, match="not a supported VM packing"):
+        resolve("2x4", "v6e", chips_per_vm=2)
+    with pytest.raises(ValueError, match="evenly divide"):
+        resolve("2x4", "v6e", chips_per_vm=3)
+    with pytest.raises(ValueError, match="positive integer"):
+        resolve("2x4", "v6e", chips_per_vm=True)
+    with pytest.raises(ValueError, match="positive integer"):
+        resolve("2x4", "v6e", chips_per_vm=0)
+
+    # Non-ambiguous topologies only accept the Ray default packing.
+    assert supported("2x2x2", "v4") == frozenset({4})
+    with pytest.raises(ValueError, match="not a supported VM packing"):
+        resolve("2x2x2", "v4", chips_per_vm=2)
+
+
+def test_get_tpu_worker_resources_rejects_invalid_chips_per_vm_packing():
+    """get_tpu_worker_resources shares resolve_chips_per_vm packing checks."""
+    with pytest.raises(ValueError, match="evenly divide"):
+        ray.util.tpu.get_tpu_worker_resources(
+            topology="2x4",
+            accelerator_type="v6e",
+            chips_per_vm=3,
+            resources_per_worker={"TPU": 1},
+        )
+
+
+@patch("ray.util.tpu.placement_group")
+@patch("ray.util.tpu.reserve_tpu_slice")
+def test_slice_placement_group_resolves_strategy_and_single_host_labels(
+    mock_reserve, mock_pg
+):
+    """SlicePG owns single-host label/strategy invariants used by Batch."""
+    mock_pg.return_value = MagicMock()
+
+    # Single-host multi-bundle: PACK upgrades to STRICT_PACK and topology/pod labels.
+    handle = SlicePlacementGroup(
+        topology="2x4",
+        accelerator_version="v6e",
+        resources_per_bundle={"TPU": 1, "CPU": 1},
+        strategy="PACK",
+    )
+    assert handle.num_hosts == 1
+    assert handle.num_bundles == 8
+    mock_reserve.assert_not_called()
+    kwargs = mock_pg.call_args.kwargs
+    assert kwargs["strategy"] == "STRICT_PACK"
+    assert len(kwargs["bundle_label_selector"]) == 8
+    assert kwargs["bundle_label_selector"][0] == {
+        ray._raylet.RAY_NODE_TPU_TOPOLOGY_KEY: "2x4",
+        ray._raylet.RAY_NODE_TPU_POD_TYPE_KEY: "v6e-8",
+    }
+
+    mock_pg.reset_mock()
+    with pytest.raises(ValueError, match="PACK/STRICT_PACK"):
+        SlicePlacementGroup(
+            topology="2x4",
+            accelerator_version="v6e",
+            resources_per_bundle={"TPU": 1, "CPU": 1},
+            strategy="SPREAD",
+        )
+
+    with pytest.raises(ValueError, match="STRICT_PACK cannot represent"):
+        SlicePlacementGroup(
+            topology="4x4",
+            accelerator_version="v6e",
+            resources_per_bundle={"TPU": 4, "CPU": 1},
+            strategy="STRICT_PACK",
+        )
+
+
 def test_get_tpu_worker_resources_ray_tpu_resource_per_chip():
     """Test that tpu_resource_per_chip correctly overrides the logical TPU device calculations."""
     # Default tpu7x 2x2x2 = 2 hosts with 4 chips each (8 chips total). With multiplier=2, we should get 8 TPU logic units per VM, and 16 total.

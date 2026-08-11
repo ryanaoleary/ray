@@ -2,7 +2,6 @@
 
 import copy
 import logging
-import math
 import os
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -14,19 +13,14 @@ from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
 import ray
-import ray._raylet as _raylet
 import ray.util.accelerators.accelerators as accelerators
-from ray._private.accelerators.tpu import (
-    get_chips_per_host,
-    get_num_chips_from_topology,
-    infer_tpu_pod_type_from_topology,
-)
+from ray._private.accelerators.tpu import get_num_chips_from_topology
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.tpu import (
     RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR,
     get_tpu_version_from_type,
-    get_tpu_worker_resources,
+    resolve_chips_per_vm,
     slice_placement_group,
 )
 
@@ -37,11 +31,8 @@ PARENT_ACTOR_CPU_RESERVE = 1
 DEFAULT_USER_CPU_PER_HOST = 1
 CPU_ACCELERATOR_TYPE_LITERAL = "CPU"
 
-# Waiting for a TPU slice can outlast the default when the cluster has to autoscale
-# one. Exposed as an env var (not public API) so operators can wait longer without
-# widening the typed config surface for this alpha MVP.
+# Bound driver-side wait for an eagerly acquired TPU SlicePG.
 DEFAULT_PG_READY_TIMEOUT_S = 180.0
-SLICE_READY_TIMEOUT_ENV_VAR = "RAY_LLM_BATCH_TPU_SLICE_READY_TIMEOUT_S"
 
 # Read by tpu_inference's TPU platform to select its Ray executor. See
 # tpu_inference/platforms/tpu_jax.py.
@@ -60,25 +51,6 @@ def _require_positive_int(value: Any, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} must be a positive integer; got {value!r}.")
     return value
-
-
-def _slice_ready_timeout_s() -> float:
-    """Resolve how long to wait for a TPU slice placement group to become ready."""
-    raw = os.environ.get(SLICE_READY_TIMEOUT_ENV_VAR)
-    if raw is None:
-        return DEFAULT_PG_READY_TIMEOUT_S
-    try:
-        timeout_s = float(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"{SLICE_READY_TIMEOUT_ENV_VAR} must be a number of seconds; got {raw!r}."
-        ) from exc
-    if not math.isfinite(timeout_s) or timeout_s <= 0:
-        raise ValueError(
-            f"{SLICE_READY_TIMEOUT_ENV_VAR} must be a finite positive number of "
-            f"seconds; got {timeout_s}."
-        )
-    return timeout_s
 
 
 def _wait_for_placement_group(pg: PlacementGroup, timeout_s: float) -> None:
@@ -217,20 +189,6 @@ class AcceleratorBackend(ABC):
         """Release any resources owned by this backend. Idempotent."""
         return
 
-    def default_batch_executor_backend(
-        self,
-        *,
-        tensor_parallel_size: int,
-        pipeline_parallel_size: int,
-    ) -> str:
-        """Default vLLM distributed executor backend for Batch.
-
-        GPU legacy behavior: ``uni`` when TP×PP == 1, otherwise ``ray``.
-        Accelerator-specific subclasses may override (e.g. TPU always ``ray``).
-        """
-        return "uni" if tensor_parallel_size * pipeline_parallel_size == 1 else "ray"
-
-    @abstractmethod
     def build_batch_scheduling_options(
         self,
         *,
@@ -238,16 +196,18 @@ class AcceleratorBackend(ABC):
         engine_kwargs: Dict[str, Any],
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
-        concurrency: Any,
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
         """Return ``(map_batches_kwargs, optional driver close_fn)``.
 
         ``map_batches_kwargs`` is a plain, picklable dict safe to embed in the
         lazy Ray Data dataset DAG. ``close_fn`` (when not ``None``) is a
         driver-local callable that releases any resources acquired here; it must
-        never enter the dataset graph. GPU/CPU backends return ``(kwargs, None)``.
+        never enter the dataset graph. Backends that do not support Batch raise
+        ``NotImplementedError`` so Serve-only accelerators need not implement it.
         """
-        pass
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement Batch scheduling options."
+        )
 
 
 class CPUAccelerator(AcceleratorBackend):
@@ -273,23 +233,6 @@ class CPUAccelerator(AcceleratorBackend):
 
     def get_remote_options(self, accelerator_type_str: str = None):
         return {}
-
-    def build_batch_scheduling_options(
-        self,
-        *,
-        accelerator_type: Optional[str],
-        engine_kwargs: Dict[str, Any],
-        placement_group_config: Optional[Dict[str, Any]],
-        runtime_env: Optional[Dict[str, Any]],
-        concurrency: Any,
-    ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        map_batches_kwargs: Dict[str, Any] = {
-            "num_cpus": 1,
-            "num_gpus": 0,
-            "resources": {},
-            "runtime_env": copy.deepcopy(runtime_env),
-        }
-        return map_batches_kwargs, None
 
 
 class GPUAccelerator(AcceleratorBackend):
@@ -329,7 +272,6 @@ class GPUAccelerator(AcceleratorBackend):
         engine_kwargs: Dict[str, Any],
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
-        concurrency: Any,
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
         ray_remote_args: Dict[str, Any] = {}
         if accelerator_type:
@@ -348,9 +290,11 @@ class GPUAccelerator(AcceleratorBackend):
                     bundle_per_worker.copy() for _ in range(num_bundles_per_replica)
                 ]
 
-        executor_backend = engine_kwargs.get("distributed_executor_backend") or (
-            "uni" if num_bundles_per_replica == 1 else "ray"
+        engine_kwargs.setdefault(
+            "distributed_executor_backend",
+            "uni" if num_bundles_per_replica == 1 else "ray",
         )
+        executor_backend = engine_kwargs["distributed_executor_backend"]
 
         map_batches_kwargs: Dict[str, Any] = {
             "runtime_env": copy.deepcopy(runtime_env),
@@ -471,7 +415,9 @@ class TPUAccelerator(AcceleratorBackend):
             )
         topology = self._config.topology.strip().lower()
         version = get_tpu_version_from_type(accelerator_type_str)
-        chips_per_host = self._resolved_chips_per_vm(topology, version)
+        chips_per_host = resolve_chips_per_vm(
+            topology, version, self._config.chips_per_vm
+        )
         # Serve passes TP×PP as num_devices. Convert to physical chips before
         # packing hosts so v7x (TP multiplier 2) and chips_per_vm overrides
         # share one physical host model.
@@ -634,28 +580,6 @@ class TPUAccelerator(AcceleratorBackend):
             finally:
                 self._slice_pg_wrapper = None
 
-    def default_batch_executor_backend(
-        self,
-        *,
-        tensor_parallel_size: int,
-        pipeline_parallel_size: int,
-    ) -> str:
-        # Topology-backed TPU always uses the Ray executor so one SlicePG owns
-        # both the parent actor and every TPU worker, including single-VM shapes.
-        return "ray"
-
-    def _resolved_chips_per_vm(self, topology: str, version: str) -> int:
-        """Resolve chips-per-VM for local host math (config override or Ray default).
-
-        Ray owns provisioning defaults and divisibility; this only reflects the
-        configured value (validated as a positive int if set) so Batch/Serve can
-        derive host counts and single-VM selectors before Ray runs.
-        """
-        chips_per_vm = self._config.chips_per_vm
-        if chips_per_vm is not None:
-            return _require_positive_int(chips_per_vm, "chips_per_vm")
-        return get_chips_per_host(topology, version)
-
     @staticmethod
     def _apply_batch_cpu_floor(bundle: Dict[str, float]) -> Dict[str, float]:
         """Preserve user resources while ensuring Batch parent CPU admission."""
@@ -751,40 +675,6 @@ class TPUAccelerator(AcceleratorBackend):
                     f"TPU resources per bundle must be positive; got {int(tpu)}."
                 )
 
-    @staticmethod
-    def _resolve_batch_slice_strategy(
-        *,
-        requested_strategy: str,
-        topology: str,
-        num_hosts: int,
-        num_bundles: int,
-    ) -> str:
-        """Enforce topology-safe SlicePG strategies for Batch execution layouts."""
-        strategy = requested_strategy
-        is_single_vm = num_hosts == 1
-        if is_single_vm and num_bundles > 1:
-            if strategy not in ("PACK", "STRICT_PACK"):
-                raise ValueError(
-                    "Single-VM TPU topologies with multiple worker bundles require "
-                    "PACK/STRICT_PACK so every bundle remains on the same TPU VM; "
-                    f"got strategy={strategy!r}."
-                )
-            # PACK prefers one node but is not a hard invariant; STRICT_PACK is.
-            return "STRICT_PACK"
-
-        if not is_single_vm:
-            if strategy == "STRICT_PACK":
-                raise ValueError(
-                    "STRICT_PACK cannot represent a multi-VM TPU topology "
-                    f"({num_hosts} VMs for topology '{topology}')."
-                )
-            if strategy == "STRICT_SPREAD" and num_bundles > num_hosts:
-                raise ValueError(
-                    "STRICT_SPREAD requires one node per bundle, but this topology "
-                    f"has {num_hosts} physical TPU VMs and {num_bundles} bundles."
-                )
-        return strategy
-
     def build_batch_scheduling_options(
         self,
         *,
@@ -792,15 +682,13 @@ class TPUAccelerator(AcceleratorBackend):
         engine_kwargs: Dict[str, Any],
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
-        concurrency: Any,
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
         """Reserve a TPU slice and return ``(map_batches_kwargs, close_fn)``.
 
         The driver reserves one ``SlicePlacementGroup`` while the processor is
         built, waits under a bounded timeout, releases head reservation markers,
-        and trusts the SlicePG for physical facts. ``close_fn`` releases the exact
-        acquired slice and propagates errors (Batch construction cleanup must not
-        swallow, unlike Serve replica teardown via ``shutdown()``).
+        and trusts SlicePG for physical packing, labels, and strategy. ``close_fn``
+        is the SlicePG shutdown callable.
         """
         tpu_config = self._config
         if not isinstance(tpu_config, TPUConfig) or not tpu_config.topology:
@@ -817,14 +705,15 @@ class TPUAccelerator(AcceleratorBackend):
             driver_rpc = int(raw_driver_rpc)
         except ValueError as exc:
             raise ValueError(
-                f"Invalid integer for {RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} in driver environment: {raw_driver_rpc!r}."
+                f"Invalid integer for {RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} in "
+                f"driver environment: {raw_driver_rpc!r}."
             ) from exc
 
         if driver_rpc != 1:
             raise ValueError(
-                f"TPU batch inference currently requires {RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} == 1; "
-                f"got {driver_rpc}. Multi-PJRT-device-per-chip configurations are not "
-                "yet validated."
+                f"TPU batch inference currently requires "
+                f"{RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} == 1; got {driver_rpc}. "
+                "Multi-PJRT-device-per-chip configurations are not yet validated."
             )
 
         if not accelerator_type:
@@ -840,8 +729,16 @@ class TPUAccelerator(AcceleratorBackend):
             )
         version = get_tpu_version_from_type(canonical_accel)
 
+        engine_kwargs.setdefault("distributed_executor_backend", "ray")
+        executor_backend = engine_kwargs["distributed_executor_backend"]
+        if executor_backend != "ray":
+            raise ValueError(
+                "TPU batch inference requires distributed_executor_backend='ray'; "
+                f"got {executor_backend!r}."
+            )
+
         # engine_kwargs are free-form, so bool/float spellings of 1 (True, 1.0)
-        # must be rejected the same way concurrency is — before the == 1 checks.
+        # must be rejected before the == 1 checks.
         tp = _require_positive_int(
             engine_kwargs.get("tensor_parallel_size", 1), "tensor_parallel_size"
         )
@@ -851,16 +748,11 @@ class TPUAccelerator(AcceleratorBackend):
         dp = _require_positive_int(
             engine_kwargs.get("data_parallel_size", 1), "data_parallel_size"
         )
-        executor_backend = engine_kwargs.get("distributed_executor_backend")
 
-        # Scalar physical facts. Ray owns the chips_per_vm default and every
-        # divisibility invariant; the local value only supports host-count math
-        # and single-VM selector construction before Ray runs.
         topology = tpu_config.topology.strip().lower()
+        # Validate chips_per_vm packing early via the shared Core helper.
+        resolve_chips_per_vm(topology, version, tpu_config.chips_per_vm)
         total_chips = get_num_chips_from_topology(topology)
-        chips_per_vm = self._resolved_chips_per_vm(topology, version)
-        num_hosts = max(1, total_chips // chips_per_vm)
-        is_single_vm = num_hosts == 1
 
         tp_multiplier = _vllm_tp_multiplier(version)
         expected_tp = total_chips * tp_multiplier
@@ -879,18 +771,6 @@ class TPUAccelerator(AcceleratorBackend):
                 f"TPU batch inference currently supports data_parallel_size=1; got {dp}."
             )
 
-        if executor_backend != "ray":
-            raise ValueError(
-                f"TPU batch inference requires executor_backend='ray'; got {executor_backend!r}."
-            )
-
-        if type(concurrency) is not int or concurrency != 1:
-            raise ValueError(
-                f"TPU batch inference requires concurrency=1 (exactly the integer 1); got "
-                f"{concurrency!r}. Autoscaling and multi-replica TPU execution are "
-                "not supported in this release."
-            )
-
         # Declarative runtime_env merge. Preserve unrelated user variables while
         # forcing the values the TPU engine and its child workers require.
         merged_runtime_env = copy.deepcopy(runtime_env or {})
@@ -907,90 +787,39 @@ class TPUAccelerator(AcceleratorBackend):
                 )
         env_vars.update(TPU_ENGINE_ENV_VARS)
 
-        # Resolve execution-layout worker template and placement strategy.
         resources_per_bundle = self._resolve_batch_worker_bundle(
             placement_group_config,
         )
-
-        requested_strategy = (
+        strategy = (
             placement_group_config.get("strategy") if placement_group_config else None
         ) or "PACK"
 
-        # Ray owns TPU-per-VM fit and slice-wide divisibility. Pass the configured
-        # chips_per_vm through (may be None) so Ray fills the default.
-        expected_num_bundles, _ = get_tpu_worker_resources(
-            topology=topology,
-            accelerator_type=canonical_accel,
-            resources_per_worker=resources_per_bundle,
-            num_slices=1,
-            chips_per_vm=tpu_config.chips_per_vm,
-            tpu_resource_per_chip=1,
-        )
-        strategy = self._resolve_batch_slice_strategy(
-            requested_strategy=requested_strategy,
-            topology=topology,
-            num_hosts=num_hosts,
-            num_bundles=expected_num_bundles,
-        )
-
-        # Single-VM SlicePGs skip Ray's multi-host slice-name reservation, so the
-        # caller must constrain placement to the requested generation/topology.
-        # Selector count must match the *execution* bundle count, not num_hosts.
-        # Multi-VM SlicePGs inject ray.io/tpu-slice-name themselves after head
-        # reservation; leave that path unchanged.
-        bundle_label_selector = None
-        if is_single_vm:
-            pod_type = infer_tpu_pod_type_from_topology(topology, canonical_accel)
-            if not pod_type:
-                raise ValueError(
-                    f"Failed to infer TPU pod type for topology '{topology}' "
-                    f"and accelerator_type '{canonical_accel}'."
-                )
-            selector = {
-                _raylet.RAY_NODE_TPU_TOPOLOGY_KEY: topology,
-                _raylet.RAY_NODE_TPU_POD_TYPE_KEY: pod_type,
-            }
-            bundle_label_selector = [
-                dict(selector) for _ in range(expected_num_bundles)
-            ]
-
         handle = None
         success = False
-        timeout_s = _slice_ready_timeout_s()
-
         try:
             handle = self._create_slice_pg_handle(
                 accelerator_type=canonical_accel,
                 resources_per_bundle=resources_per_bundle,
                 strategy=strategy,
-                bundle_label_selector=bundle_label_selector,
                 tpu_resource_per_chip=1,
                 chips_per_vm=tpu_config.chips_per_vm,
             )
 
             try:
-                _wait_for_placement_group(handle.placement_group, timeout_s)
+                _wait_for_placement_group(
+                    handle.placement_group, DEFAULT_PG_READY_TIMEOUT_S
+                )
             except ray.exceptions.GetTimeoutError as exc:
                 raise TimeoutError(
-                    f"Timed out after {timeout_s}s waiting for TPU slice placement "
-                    f"group readiness. Requested {canonical_accel} "
-                    f"topology={topology} ({num_hosts} VMs, "
-                    f"{expected_num_bundles} bundles). This usually means the "
-                    "cluster has no intact topology of that shape available. Set "
-                    f"{SLICE_READY_TIMEOUT_ENV_VAR} to wait longer while capacity "
-                    "is provisioned."
+                    f"Timed out after {DEFAULT_PG_READY_TIMEOUT_S}s waiting for TPU "
+                    f"slice placement group readiness. Requested {canonical_accel} "
+                    f"topology={topology} ({handle.num_hosts} hosts, "
+                    f"{handle.num_bundles} bundles). This usually means the cluster "
+                    "has no intact topology of that shape available."
                 ) from exc
 
-            # Idempotent for single-host (no head reservation PGs) and multi-host.
-            # After this, trust the SlicePlacementGroup for physical facts.
             handle.release_head_pgs()
 
-            # Schedule the Ray Data engine actor into the driver-owned SlicePG.
-            # Child-task capture keeps tpu_inference workers in the same PG.
-            # vLLM's create_engine_config() (via AsyncLLMEngine.from_engine_args)
-            # copies get_current_placement_group() into ParallelConfig.placement_group
-            # when running inside this actor; tpu_inference reuses that field and does
-            # not call get_current_placement_group() itself.
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=handle.placement_group,
                 placement_group_bundle_index=0,
@@ -1004,15 +833,11 @@ class TPUAccelerator(AcceleratorBackend):
                 "scheduling_strategy": scheduling_strategy,
                 "runtime_env": merged_runtime_env,
             }
-
-            close_fn = self._make_slice_close_fn(handle)
             success = True
-            return map_batches_kwargs, close_fn
+            return map_batches_kwargs, handle.shutdown
 
         finally:
             if handle is not None and not success:
-                # Propagate Batch construction-cleanup failures (unlike Serve's
-                # swallow-on-shutdown path on the backend itself).
                 try:
                     handle.shutdown()
                 except Exception:
@@ -1022,22 +847,6 @@ class TPUAccelerator(AcceleratorBackend):
                     )
                 finally:
                     self._slice_pg_wrapper = None
-
-    def _make_slice_close_fn(self, wrapper: Any) -> Callable[[], None]:
-        """Build a driver-local close callable that releases the acquired SlicePG.
-
-        Unlike ``shutdown()`` (which swallows errors for Serve replica teardown),
-        this callable propagates failures so the Batch processor builder can log
-        and retry. Ownership is only cleared after a successful shutdown so a
-        retained callable can retry the same SlicePG.
-        """
-
-        def _close() -> None:
-            wrapper.shutdown()
-            if self._slice_pg_wrapper is wrapper:
-                self._slice_pg_wrapper = None
-
-        return _close
 
 
 def get_accelerator_backend(

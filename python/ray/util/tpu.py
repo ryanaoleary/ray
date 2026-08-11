@@ -11,6 +11,7 @@ import ray
 from ray._private.accelerators import TPUAcceleratorManager
 from ray._private.accelerators.tpu import (
     DEFAULT_TPU_HEAD_RESERVATION_TIMEOUT_S,
+    TPU_8_CHIPS_PER_HOST_TYPES,
     TPU_SUBSLICE_LABEL_PREFIX,
     VALID_TPU_TYPES,
     _build_subslice_labels,
@@ -154,6 +155,70 @@ def get_tpu_num_slices_for_workers(
 
 
 @PublicAPI(stability="alpha")
+def get_supported_chips_per_vm(
+    topology: str,
+    accelerator_type: str,
+) -> frozenset:
+    """Return the supported physical chips-per-VM packings for a topology.
+
+    Most topologies have a single packing (the Ray default from
+    :func:`get_chips_per_host`). A small number of ambiguous overlays also
+    support an alternate packing that matches GCP node shapes — today that is
+    v5litepod/v6e ``2x4``, which may be one 8-chip VM or two 4-chip VMs.
+    """
+    version = get_tpu_version_from_type(accelerator_type)
+    topology = topology.strip().lower()
+    default = get_chips_per_host(topology, version)
+    if version in TPU_8_CHIPS_PER_HOST_TYPES and topology == "2x4":
+        return frozenset({4, 8})
+    return frozenset({default})
+
+
+@PublicAPI(stability="alpha")
+def resolve_chips_per_vm(
+    topology: str,
+    accelerator_type: str,
+    chips_per_vm: Optional[int] = None,
+) -> int:
+    """Resolve and validate the physical chips-per-VM used for TPU host math.
+
+    When ``chips_per_vm`` is omitted, returns the Ray default for the topology.
+    When provided, requires a positive non-bool integer that evenly divides the
+    topology chip count and is one of the supported packings for that
+    topology/generation (see :func:`get_supported_chips_per_vm`).
+    """
+    version = get_tpu_version_from_type(accelerator_type)
+    topology = topology.strip().lower()
+    if chips_per_vm is None:
+        return get_chips_per_host(topology, version)
+
+    if (
+        isinstance(chips_per_vm, bool)
+        or not isinstance(chips_per_vm, int)
+        or chips_per_vm <= 0
+    ):
+        raise ValueError(
+            f"chips_per_vm must be a positive integer; got {chips_per_vm!r}."
+        )
+
+    total_chips = get_num_chips_from_topology(topology)
+    if total_chips % chips_per_vm != 0:
+        raise ValueError(
+            f"chips_per_vm ({chips_per_vm}) must evenly divide the "
+            f"{total_chips} chips in topology '{topology}'."
+        )
+
+    supported = get_supported_chips_per_vm(topology, accelerator_type)
+    if chips_per_vm not in supported:
+        raise ValueError(
+            f"chips_per_vm={chips_per_vm} is not a supported VM packing for "
+            f"topology '{topology}' on {version}. Supported values: "
+            f"{sorted(supported)}."
+        )
+    return chips_per_vm
+
+
+@PublicAPI(stability="alpha")
 def get_tpu_worker_resources(
     topology: str,
     accelerator_type: str,
@@ -174,7 +239,8 @@ def get_tpu_worker_resources(
         num_slices: The number of TPU slices.
         chips_per_vm: An optional override for the number of chips per VM.
             If unspecified, this is inferred automatically from the topology
-            and accelerator type.
+            and accelerator type. When set, must be a supported packing for
+            the topology (see :func:`resolve_chips_per_vm`).
         tpu_resource_per_chip: The number of logical TPU resources per physical chip.
             This value scales the total number of logical TPU resources reserved by the
             slice.
@@ -195,13 +261,9 @@ def get_tpu_worker_resources(
     accelerator_version = get_tpu_version_from_type(accelerator_type)
 
     # Determine the physical number of chips expected per VM (host).
-    resolved_chips_per_vm = (
-        chips_per_vm
-        if chips_per_vm is not None
-        else get_chips_per_host(topology, accelerator_version)
+    resolved_chips_per_vm = resolve_chips_per_vm(
+        topology, accelerator_version, chips_per_vm
     )
-    if resolved_chips_per_vm <= 0:
-        raise ValueError("chips_per_vm must be positive.")
 
     # Scale physical chips to logical TPU resources per VM.
     resolved_chips_per_vm *= tpu_resource_per_chip
@@ -608,28 +670,21 @@ class SlicePlacementGroup:
             )
         self._tpu_resource_per_chip = tpu_resource_per_chip
 
+        # Shared physical packing resolution used by get_tpu_worker_resources
+        # and host-count math below.
+        self._chips_per_host = resolve_chips_per_vm(
+            self._topology, self._accelerator_version, chips_per_vm
+        )
+
         # Calculate number of bundles and bundle resources for specified TPU topology.
         self._num_bundles, self._bundle_resources = get_tpu_worker_resources(
             topology=self._topology,
             accelerator_type=self._accelerator_version,
             resources_per_worker=resources_per_bundle,
             num_slices=self._num_slices,
-            chips_per_vm=chips_per_vm,
+            chips_per_vm=self._chips_per_host,
             tpu_resource_per_chip=self._tpu_resource_per_chip,
         )
-
-        if chips_per_vm is not None and chips_per_vm <= 0:
-            raise ValueError("chips_per_vm must be positive.")
-
-        self._chips_per_host = (
-            chips_per_vm
-            if chips_per_vm is not None
-            else get_chips_per_host(self._topology, self._accelerator_version)
-        )
-        if self._chips_per_host <= 0:
-            raise ValueError(
-                f"Resolved chips per host must be positive, got {self._chips_per_host}"
-            )
 
         # Within Ray, a "host" corresponds to a user-visible compute VM.
         # This may differ from the physical hardware host definitions in GCP/GKE docs.
@@ -644,6 +699,7 @@ class SlicePlacementGroup:
         self._num_hosts = hosts_per_slice * self._num_slices
 
         self._validate_tpu_config()
+        strategy = self._resolve_strategy(strategy)
 
         # Reserve a TPU slice of the provided accelerator version and topology.
         pgs = self._reserve_slice(
@@ -655,6 +711,40 @@ class SlicePlacementGroup:
             self._managed_pgs = pgs
         else:
             self._managed_pgs = [pgs]
+
+    def _resolve_strategy(self, strategy: str) -> str:
+        """Enforce topology-safe placement strategies for the resolved host/bundle layout.
+
+        Single physical host:
+          - one bundle: keep the requested strategy
+          - multiple bundles: PACK upgrades to STRICT_PACK; SPREAD variants reject
+        Multi-host:
+          - STRICT_PACK rejects
+          - STRICT_SPREAD rejects when bundles exceed hosts
+        """
+        if self._num_hosts == 1:
+            if self._num_bundles > 1:
+                if strategy not in ("PACK", "STRICT_PACK"):
+                    raise ValueError(
+                        "Single-host TPU topologies with multiple worker bundles "
+                        "require PACK/STRICT_PACK so every bundle remains on the "
+                        f"same TPU VM; got strategy={strategy!r}."
+                    )
+                return "STRICT_PACK"
+            return strategy
+
+        if strategy == "STRICT_PACK":
+            raise ValueError(
+                "STRICT_PACK cannot represent a multi-host TPU topology "
+                f"({self._num_hosts} hosts for topology '{self._topology}')."
+            )
+        if strategy == "STRICT_SPREAD" and self._num_bundles > self._num_hosts:
+            raise ValueError(
+                "STRICT_SPREAD requires one node per bundle, but this topology "
+                f"has {self._num_hosts} physical TPU hosts and {self._num_bundles} "
+                "bundles."
+            )
+        return strategy
 
     def _validate_tpu_config(self):
         # Should validate topology and generation values and return a
@@ -697,7 +787,24 @@ class SlicePlacementGroup:
             for slice_idx in range(self.num_slices):
                 tpu_slice_name_label = {}
 
-                if not is_single_host:
+                if is_single_host:
+                    # Single-host topologies skip multi-host slice-name reservation.
+                    # Constrain bundles to the requested topology + pod type so the
+                    # PG cannot land on an unrelated TPU generation/shape.
+                    pod_type = infer_tpu_pod_type_from_topology(
+                        self._topology, accelerator_type
+                    )
+                    if not pod_type:
+                        raise ValueError(
+                            f"Failed to infer TPU pod type for topology "
+                            f"'{self._topology}' and accelerator type "
+                            f"'{accelerator_type}'."
+                        )
+                    tpu_slice_name_label = {
+                        ray._raylet.RAY_NODE_TPU_TOPOLOGY_KEY: self._topology,
+                        ray._raylet.RAY_NODE_TPU_POD_TYPE_KEY: pod_type,
+                    }
+                else:
                     # Reserve a multi-host TPU slice by gang-scheduling using the unique `ray.io/tpu-slice-name`.
                     # Check if user explicitly requested a slice name for this slice
                     user_slice_name = None

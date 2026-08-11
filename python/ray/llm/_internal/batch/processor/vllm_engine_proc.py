@@ -2,7 +2,6 @@
 
 import hashlib
 import logging
-import threading
 from typing import Any, Callable, Dict, List, Optional
 
 import transformers
@@ -65,19 +64,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_ARCHITECTURE = "UNKNOWN_MODEL_ARCHITECTURE"
 
 
-def _looks_like_tpu(accelerator_type: Any, accelerator_config: Any) -> bool:
-    """Detect a TPU request from raw, not-yet-validated config input."""
-    if isinstance(accelerator_type, str) and normalize_tpu_accelerator_type(
-        accelerator_type
-    ).startswith("TPU"):
-        return True
-    if isinstance(accelerator_config, TPUConfig):
-        return True
-    return (
-        isinstance(accelerator_config, dict) and accelerator_config.get("kind") == "tpu"
-    )
-
-
 class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     """The configuration for the vLLM engine processor."""
 
@@ -127,37 +113,10 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         description=(
             "Accelerator configuration for the LLM stage. For TPU batch inference, "
             "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'} (optionally "
-            "chips_per_vm for ambiguous topologies). An omitted accelerator type "
+            "chips_per_vm for ambiguous topologies). An omitted accelerator config "
             "preserves GPU batch behavior for this processor."
         ),
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_coercible_tpu_concurrency(cls, data: Any) -> Any:
-        """Reject TPU concurrency values that Pydantic would silently coerce to 1.
-
-        ``concurrency`` is typed ``Union[int, Tuple[int, int]]``, so ``True``, ``1.0``,
-        and ``"1"`` all become ``1`` during field validation. TPU supports exactly one
-        replica, and accepting those spellings would hide a misconfiguration, so they
-        have to be caught before coercion. Everything else about the accelerator is
-        validated after the model is built.
-        """
-        if not isinstance(data, dict) or not _looks_like_tpu(
-            data.get("accelerator_type"), data.get("accelerator_config")
-        ):
-            return data
-
-        if "concurrency" not in data:
-            return {**data, "concurrency": 1}
-
-        raw_concurrency = data["concurrency"]
-        if type(raw_concurrency) is not int or raw_concurrency != 1:
-            raise ValueError(
-                f"TPU batch inference requires concurrency=1; got {raw_concurrency!r} "
-                f"of type {type(raw_concurrency).__name__}."
-            )
-        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -181,28 +140,28 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         values["engine_kwargs"] = engine_kwargs
         return values
 
+    @field_validator("accelerator_type")
+    @classmethod
+    def _normalize_accelerator_type(cls, value):
+        if value is None:
+            return None
+        normalized = normalize_tpu_accelerator_type(value)
+        if normalized == CPU_ACCELERATOR_TYPE_LITERAL:
+            raise ValueError(
+                "Explicit 'CPU' accelerator type is not supported for vLLM batch inference."
+            )
+        if normalized.startswith("TPU"):
+            if normalized not in TPU_ACCELERATOR_VALUES:
+                raise ValueError(
+                    f"Unknown or unsupported TPU accelerator type: {value!r}. "
+                    f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
+                )
+            return normalized
+        return value
+
     @model_validator(mode="after")
     def _validate_accelerator(self) -> "vLLMEngineProcessorConfig":
-        """Canonicalize the accelerator type and pair it with an accelerator config.
-
-        ``ProcessorConfig`` sets ``validate_assignment``, so plain attribute assignment
-        here would re-enter this validator and recurse. Write through
-        ``object.__setattr__`` instead.
-        """
-        if self.accelerator_type is not None:
-            normalized_type = normalize_tpu_accelerator_type(self.accelerator_type)
-            if normalized_type == CPU_ACCELERATOR_TYPE_LITERAL:
-                raise ValueError(
-                    "Explicit 'CPU' accelerator type is not supported for vLLM batch inference."
-                )
-            if normalized_type.startswith("TPU"):
-                if normalized_type not in TPU_ACCELERATOR_VALUES:
-                    raise ValueError(
-                        f"Unknown or unsupported TPU accelerator type: {self.accelerator_type!r}. "
-                        f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
-                    )
-                object.__setattr__(self, "accelerator_type", normalized_type)
-
+        """Check accelerator type/config compatibility after field normalization."""
         if isinstance(self.accelerator_config, CPUConfig):
             raise ValueError("CPUConfig is not supported for vLLM batch inference.")
 
@@ -214,24 +173,35 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         if is_tpu_type:
             if isinstance(self.accelerator_config, GPUConfig):
                 raise ValueError(
-                    f"GPUConfig cannot be used with TPU accelerator_type {self.accelerator_type!r}."
+                    f"GPUConfig cannot be used with TPU accelerator_type "
+                    f"{self.accelerator_type!r}."
                 )
             if self.accelerator_config is None:
-                object.__setattr__(self, "accelerator_config", TPUConfig())
-        elif isinstance(self.accelerator_config, TPUConfig):
-            raise ValueError(
-                f"TPUConfig requires a TPU accelerator_type; got {self.accelerator_type!r}."
-            )
-        elif self.accelerator_config is None:
-            object.__setattr__(self, "accelerator_config", GPUConfig())
-
-        if isinstance(self.accelerator_config, TPUConfig):
+                raise ValueError(
+                    "TPU batch inference requires accelerator_config with "
+                    "kind='tpu' and topology=..., for example "
+                    "{'kind': 'tpu', 'topology': '4x4'}."
+                )
+            if not isinstance(self.accelerator_config, TPUConfig):
+                raise ValueError(
+                    "TPU accelerator_type requires a TPU accelerator_config "
+                    f"(kind='tpu'); got {self.accelerator_config!r}."
+                )
             if not self.accelerator_config.topology:
                 raise ValueError(
                     "TPU batch inference requires accelerator_config with "
                     "kind='tpu' and topology=..., for example "
                     "{'kind': 'tpu', 'topology': '4x4'}."
                 )
+            if self.concurrency != 1:
+                raise ValueError(
+                    "TPU batch inference requires concurrency=1; "
+                    f"got {self.concurrency!r}."
+                )
+        elif isinstance(self.accelerator_config, TPUConfig):
+            raise ValueError(
+                f"TPUConfig requires a TPU accelerator_type; got {self.accelerator_type!r}."
+            )
 
         return self
 
@@ -245,13 +215,10 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
 
 
 class _ManagedVLLMProcessor(Processor):
-    """A context-managed Processor that owns driver-side batch resources (e.g. TPU slice placement group).
+    """Processor that owns driver-side batch resources (e.g. a TPU SlicePG).
 
-    Lifecycle:
-    The processor owns the slice placement group for its explicit lifetime. It exposes an idempotent,
-    thread-safe ``close()`` method and context-manager support (`with build_processor(config) as p:`).
-    Every Dataset derived from this processor must finish before ``close()`` is called; closing makes
-    future ``processor(dataset)`` calls fail immediately.
+    Finish every Dataset derived from this processor before calling ``close()``.
+    Closing makes future ``processor(dataset)`` calls fail immediately.
     """
 
     def __init__(
@@ -274,45 +241,22 @@ class _ManagedVLLMProcessor(Processor):
         )
         self._close_fn = close_fn
         self._closed = False
-        self._lock = threading.Lock()
 
     def close(self) -> None:
-        """Idempotently release driver-owned batch resources.
-
-        Marks the processor closed, then invokes the driver-local close callable.
-        If the callable raises, it is retained so a later ``close()`` can retry.
-        Production ``SlicePlacementGroup.shutdown()`` typically logs placement-group
-        removal failures and returns successfully, so driver exit remains the
-        fallback fate-sharing boundary for those cases.
-        """
-        with self._lock:
-            self._closed = True
-            if self._close_fn is None:
-                return
-
-            self._close_fn()
-            self._close_fn = None
-
-    def __enter__(self) -> "_ManagedVLLMProcessor":
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
+        """Idempotently release driver-owned batch resources."""
+        self._closed = True
+        if self._close_fn is None:
+            return
+        close_fn = self._close_fn
+        self._close_fn = None
+        close_fn()
 
     def __call__(self, dataset: Dataset) -> Dataset:
-        # Hold the lock across the closed check and Dataset construction so close()
-        # cannot interleave. Base Processor.__call__ must not re-enter this method.
-        with self._lock:
-            if self._closed:
-                raise RuntimeError(
-                    "Processor is closed. Cannot execute new datasets on a closed processor."
-                )
-            return super().__call__(dataset)
-
-    def __reduce__(self):
-        raise TypeError(
-            f"{self.__class__.__name__} owns driver-local lifecycle resources and cannot be serialized or pickled."
-        )
+        if self._closed:
+            raise RuntimeError(
+                "Processor is closed. Cannot execute new datasets on a closed processor."
+            )
+        return super().__call__(dataset)
 
 
 def build_vllm_engine_processor(
@@ -390,15 +334,7 @@ def build_vllm_engine_processor(
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
     dp_size = engine_kwargs.get("data_parallel_size", 1)
 
-    backend = get_accelerator_backend(config.accelerator_config)
-    if "distributed_executor_backend" in engine_kwargs:
-        executor_backend = engine_kwargs["distributed_executor_backend"]
-    else:
-        executor_backend = backend.default_batch_executor_backend(
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-        )
-    engine_kwargs["distributed_executor_backend"] = executor_backend
+    backend = get_accelerator_backend(config.accelerator_config or GPUConfig())
 
     telemetry_agent = get_or_create_telemetry_agent()
     telemetry_agent.push_telemetry_report(
@@ -452,7 +388,6 @@ def build_vllm_engine_processor(
         engine_kwargs=engine_kwargs,
         placement_group_config=config.placement_group_config,
         runtime_env=config.runtime_env,
-        concurrency=config.concurrency,
     )
 
     stages: List[StatefulStage] = []
