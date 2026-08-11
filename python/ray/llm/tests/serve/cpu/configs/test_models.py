@@ -532,13 +532,15 @@ class TestAcceleratorConfigLogic:
         with pytest.raises(ValueError, match="must be a multiple of chips_per_host"):
             tpu_accel.default_bundles(num_devices=6, accelerator_type_str="TPU-V6E")
 
+    def test_chips_per_vm_requires_topology(self):
+        with pytest.raises(ValueError, match="chips_per_vm requires topology"):
+            TPUConfig(kind="tpu", chips_per_vm=4)
+
     def test_default_bundles_and_create_pg_forward_chips_per_vm(self, monkeypatch):
         """TPUConfig.chips_per_vm reaches SlicePG from Serve default_bundles/create_pg."""
         import ray.llm._internal.common.accelerators as accelerators_mod
 
-        create = MagicMock(
-            return_value=MagicMock(placement_group=object())
-        )
+        create = MagicMock(return_value=MagicMock(placement_group=object()))
         monkeypatch.setattr(accelerators_mod, "slice_placement_group", create)
         backend = TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4))
         bundles = backend.default_bundles(num_devices=8, accelerator_type_str="TPU-V6E")
@@ -553,6 +555,30 @@ class TestAcceleratorConfigLogic:
         slice_kwargs = create.call_args.kwargs
         assert slice_kwargs["chips_per_vm"] == 4
         assert slice_kwargs["resources_per_bundle"]["TPU"] == 4
+
+    def test_create_pg_single_host_multi_bundle_strict_pack_and_labels(
+        self, monkeypatch
+    ):
+        """Serve create_placement_group shares single-host SlicePG constraints."""
+        import ray
+        import ray.llm._internal.common.accelerators as accelerators_mod
+
+        create = MagicMock(return_value=MagicMock(placement_group=object()))
+        monkeypatch.setattr(accelerators_mod, "slice_placement_group", create)
+        backend = TPUAccelerator(TPUConfig(topology="2x4"))
+        backend.create_placement_group(
+            bundles=[{"TPU": 1, "CPU": 1}] * 8,
+            strategy="PACK",
+            name="serve-single-host",
+            accelerator_type_str="TPU-V6E",
+        )
+        slice_kwargs = create.call_args.kwargs
+        assert slice_kwargs["strategy"] == "STRICT_PACK"
+        selectors = slice_kwargs["bundle_label_selector"]
+        assert len(selectors) == 8
+        for labels in selectors:
+            assert labels[ray._raylet.RAY_NODE_TPU_TOPOLOGY_KEY] == "2x4"
+            assert labels[ray._raylet.RAY_NODE_TPU_POD_TYPE_KEY] == "v6e-8"
 
 
 class TestCheckpointInfo:

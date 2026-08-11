@@ -847,7 +847,6 @@ class TPUAccelerator(AcceleratorBackend):
                     self._slice_pg_wrapper = None
 
 
-
 def get_accelerator_backend(
     accelerator_config: AcceleratorConfig,
 ) -> AcceleratorBackend:

@@ -320,8 +320,8 @@ class Processor:
             preprocess stage (e.g., num_cpus, memory, concurrency).
         postprocess_map_kwargs: Optional kwargs to pass to Dataset.map() for the
             postprocess stage (e.g., num_cpus, memory, concurrency).
-        close_fn: Optional callable invoked by ``close()`` to release driver-owned
-            resources.
+        close_fn: Optional callable invoked by ``close()`` to mark the processor
+            closed and release any driver-owned resources.
     """
 
     # The internal used data column name ("__data"). Your input
