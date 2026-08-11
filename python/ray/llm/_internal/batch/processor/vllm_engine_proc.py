@@ -289,13 +289,87 @@ def build_vllm_engine_processor(
     """
     ray.init(runtime_env=config.runtime_env, ignore_reinit_error=True)
 
+    stages: List[StatefulStage] = []
+    trust_remote_code = config.engine_kwargs.get("trust_remote_code", False)
+    processor_defaults = {
+        "batch_size": config.batch_size,
+        "concurrency": config.concurrency,
+        "runtime_env": config.runtime_env,
+        "model_source": config.model_source,
+    }
+
+    # Resolve and build PrepareMultimodalStage if enabled.
+    prepare_multimodal_stage_cfg = resolve_stage_config(
+        config.prepare_multimodal_stage,
+        PrepareMultimodalStageConfig,
+        processor_defaults,
+    )
+    if prepare_multimodal_stage_cfg.enabled:
+        base_model_config_kwargs = (
+            prepare_multimodal_stage_cfg.model_config_kwargs or {}
+        )
+        model_config_kwargs = {
+            **base_model_config_kwargs,
+            "model": processor_defaults.get("model_source"),
+        }
+        stages.append(
+            PrepareMultimodalStage(
+                fn_constructor_kwargs=dict(
+                    model_config_kwargs=model_config_kwargs,
+                    chat_template_content_format=prepare_multimodal_stage_cfg.chat_template_content_format,
+                    apply_sys_msg_formatting=prepare_multimodal_stage_cfg.apply_sys_msg_formatting,
+                ),
+                map_batches_kwargs=build_cpu_stage_map_kwargs(
+                    prepare_multimodal_stage_cfg
+                ),
+            )
+        )
+
+    # Resolve and build ChatTemplateStage if enabled.
+    chat_template_stage_cfg = resolve_stage_config(
+        getattr(config, "chat_template_stage", config.apply_chat_template),
+        ChatTemplateStageConfig,
+        processor_defaults,
+    )
+    if chat_template_stage_cfg.enabled:
+        stages.append(
+            ChatTemplateStage(
+                fn_constructor_kwargs=dict(
+                    model=chat_template_stage_cfg.model_source,
+                    chat_template=get_value_or_fallback(
+                        chat_template_stage_cfg.chat_template, config.chat_template
+                    ),
+                    chat_template_kwargs=get_value_or_fallback(
+                        chat_template_stage_cfg.chat_template_kwargs,
+                        chat_template_kwargs,
+                    ),
+                    trust_remote_code=trust_remote_code,
+                ),
+                map_batches_kwargs=build_cpu_stage_map_kwargs(chat_template_stage_cfg),
+            )
+        )
+
+    # Resolve and build TokenizeStage if enabled.
+    tokenize_stage_cfg = resolve_stage_config(
+        getattr(config, "tokenize_stage", config.tokenize),
+        TokenizerStageConfig,
+        processor_defaults,
+    )
+    if tokenize_stage_cfg.enabled:
+        stages.append(
+            TokenizeStage(
+                fn_constructor_kwargs=dict(
+                    model=tokenize_stage_cfg.model_source,
+                    trust_remote_code=trust_remote_code,
+                ),
+                map_batches_kwargs=build_cpu_stage_map_kwargs(tokenize_stage_cfg),
+            )
+        )
+
     # Finish downloads and telemetry before acquiring accelerator slices so a
     # later failure does not leave a reserved TPU slice stranded.
-    # We download the config files here so that we can report the underlying
-    # architecture to the telemetry system. This should be a lightweight operation.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
     # since custom model architectures require Python config files to be downloaded.
-    trust_remote_code = config.engine_kwargs.get("trust_remote_code", False)
     if config.engine_kwargs.get(
         "load_format", None
     ) in STREAMING_LOAD_FORMATS or config.engine_kwargs.get("trust_remote_code", False):
@@ -317,8 +391,6 @@ def build_vllm_engine_processor(
     except Exception:
         # Failed to retrieve HuggingFace config for telemetry purposes.
         # This is non-fatal: we fall back to DEFAULT_MODEL_ARCHITECTURE for telemetry.
-        # The actual model loading happens later in vLLM, which may support models
-        # that aren't available via HuggingFace's AutoConfig.
         logger.warning(
             f"Failed to retrieve HuggingFace config for {config.model_source}"
         )
@@ -327,8 +399,7 @@ def build_vllm_engine_processor(
     architectures = getattr(hf_config, "architectures", [])
     architecture = architectures[0] if architectures else DEFAULT_MODEL_ARCHITECTURE
 
-    # Copy engine_kwargs so defaults such as distributed_executor_backend do not
-    # mutate the caller's configuration object.
+    # Copy engine_kwargs so accelerator defaults do not mutate the caller's config.
     engine_kwargs = dict(config.engine_kwargs)
     tp_size = engine_kwargs.get("tensor_parallel_size", 1)
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
@@ -354,35 +425,6 @@ def build_vllm_engine_processor(
         )
     )
 
-    # Resolve all stage configs before acquiring expensive accelerator resources
-    # (e.g. a TPU slice) so invalid stage configuration fails cheaply.
-    processor_defaults = {
-        "batch_size": config.batch_size,
-        "concurrency": config.concurrency,
-        "runtime_env": config.runtime_env,
-        "model_source": config.model_source,
-    }
-    prepare_multimodal_stage_cfg = resolve_stage_config(
-        config.prepare_multimodal_stage,
-        PrepareMultimodalStageConfig,
-        processor_defaults,
-    )
-    chat_template_stage_cfg = resolve_stage_config(
-        getattr(config, "chat_template_stage", config.apply_chat_template),
-        ChatTemplateStageConfig,
-        processor_defaults,
-    )
-    tokenize_stage_cfg = resolve_stage_config(
-        getattr(config, "tokenize_stage", config.tokenize),
-        TokenizerStageConfig,
-        processor_defaults,
-    )
-    detokenize_stage_cfg = resolve_stage_config(
-        getattr(config, "detokenize_stage", config.detokenize),
-        DetokenizeStageConfig,
-        processor_defaults,
-    )
-
     map_batches_kwargs, close_fn = backend.build_batch_scheduling_options(
         accelerator_type=config.accelerator_type,
         engine_kwargs=engine_kwargs,
@@ -390,74 +432,11 @@ def build_vllm_engine_processor(
         runtime_env=config.runtime_env,
     )
 
-    stages: List[StatefulStage] = []
     try:
-        if prepare_multimodal_stage_cfg.enabled:
-            base_model_config_kwargs = (
-                prepare_multimodal_stage_cfg.model_config_kwargs or {}
-            )
-            model_config_kwargs = {
-                **base_model_config_kwargs,
-                "model": processor_defaults.get("model_source"),
-            }
-            stages.append(
-                PrepareMultimodalStage(
-                    fn_constructor_kwargs=dict(
-                        model_config_kwargs=model_config_kwargs,
-                        chat_template_content_format=prepare_multimodal_stage_cfg.chat_template_content_format,
-                        apply_sys_msg_formatting=prepare_multimodal_stage_cfg.apply_sys_msg_formatting,
-                    ),
-                    map_batches_kwargs=build_cpu_stage_map_kwargs(
-                        prepare_multimodal_stage_cfg
-                    ),
-                )
-            )
-
-        if chat_template_stage_cfg.enabled:
-            stages.append(
-                ChatTemplateStage(
-                    fn_constructor_kwargs=dict(
-                        model=chat_template_stage_cfg.model_source,
-                        chat_template=get_value_or_fallback(
-                            chat_template_stage_cfg.chat_template, config.chat_template
-                        ),
-                        chat_template_kwargs=get_value_or_fallback(
-                            chat_template_stage_cfg.chat_template_kwargs,
-                            chat_template_kwargs,
-                        ),
-                        trust_remote_code=trust_remote_code,
-                    ),
-                    map_batches_kwargs=build_cpu_stage_map_kwargs(
-                        chat_template_stage_cfg
-                    ),
-                )
-            )
-
-        if tokenize_stage_cfg.enabled:
-            stages.append(
-                TokenizeStage(
-                    fn_constructor_kwargs=dict(
-                        model=tokenize_stage_cfg.model_source,
-                        trust_remote_code=trust_remote_code,
-                    ),
-                    map_batches_kwargs=build_cpu_stage_map_kwargs(tokenize_stage_cfg),
-                )
-            )
-
-        # Use the configured actor-pool concurrency; accelerator-specific
-        # constraints are validated by the selected backend.
         compute = ray.data.ActorPoolStrategy(
             **config.get_concurrency(autoscaling_enabled=True),
             max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
         )
-
-        vllm_map_batches_kwargs = dict(
-            zero_copy_batch=True,
-            compute=compute,
-            max_concurrency=config.max_concurrent_batches,
-            **map_batches_kwargs,
-        )
-
         stages.append(
             vLLMEngineStage(
                 fn_constructor_kwargs=dict(
@@ -471,10 +450,20 @@ def build_vllm_engine_processor(
                     should_continue_on_error=config.should_continue_on_error,
                     log_engine_metrics=config.log_engine_metrics,
                 ),
-                map_batches_kwargs=vllm_map_batches_kwargs,
+                map_batches_kwargs=dict(
+                    zero_copy_batch=True,
+                    compute=compute,
+                    max_concurrency=config.max_concurrent_batches,
+                    **map_batches_kwargs,
+                ),
             )
         )
 
+        detokenize_stage_cfg = resolve_stage_config(
+            getattr(config, "detokenize_stage", config.detokenize),
+            DetokenizeStageConfig,
+            processor_defaults,
+        )
         if detokenize_stage_cfg.enabled:
             stages.append(
                 DetokenizeStage(

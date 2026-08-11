@@ -20,6 +20,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.tpu import (
     RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR,
     get_tpu_version_from_type,
+    get_tpu_worker_resources,
     resolve_chips_per_vm,
     slice_placement_group,
 )
@@ -202,7 +203,9 @@ class AcceleratorBackend(ABC):
         ``map_batches_kwargs`` is a plain, picklable dict safe to embed in the
         lazy Ray Data dataset DAG. ``close_fn`` (when not ``None``) is a
         driver-local callable that releases any resources acquired here; it must
-        never enter the dataset graph. Backends that do not support Batch raise
+        never enter the dataset graph. Implementations may populate
+        accelerator-specific defaults in ``engine_kwargs``; callers should pass
+        a private mutable copy. Backends that do not support Batch raise
         ``NotImplementedError`` so Serve-only accelerators need not implement it.
         """
         raise NotImplementedError(
@@ -460,17 +463,11 @@ class TPUAccelerator(AcceleratorBackend):
             )
 
         worker_bundle = self._resolve_topology_worker_bundle(bundles)
-        # Pass the configured chips_per_vm through to Ray (may be None so Ray
-        # owns the default). Reject non-positive / non-int overrides early.
-        chips_per_vm = self._config.chips_per_vm
-        if chips_per_vm is not None:
-            _require_positive_int(chips_per_vm, "chips_per_vm")
         self._create_slice_pg_handle(
             accelerator_type=accelerator_type_str,
             resources_per_bundle=worker_bundle,
             strategy=strategy,
             name=name,
-            chips_per_vm=chips_per_vm,
         )
         return self._slice_pg_wrapper.placement_group
 
@@ -516,14 +513,13 @@ class TPUAccelerator(AcceleratorBackend):
         resources_per_bundle: Dict[str, float],
         strategy: str,
         name: str = "",
-        bundle_label_selector: Optional[List[Dict[str, str]]] = None,
         tpu_resource_per_chip: Optional[int] = None,
-        chips_per_vm: Optional[int] = None,
     ):
         """Create and own a topology-backed SlicePlacementGroup.
 
         Both Serve (deferred replica PG) and Data (eager driver PG) call this
         private primitive so ``slice_placement_group`` stays encapsulated here.
+        ``chips_per_vm`` is taken from this backend's ``TPUConfig``.
         """
         if not self._config.topology:
             raise ValueError(
@@ -535,8 +531,6 @@ class TPUAccelerator(AcceleratorBackend):
             )
             self.shutdown()
 
-        # Canonicalize like SlicePlacementGroup / Batch layout derivation so
-        # topology math and any caller labels always agree.
         topology = self._config.topology.strip().lower()
         version = get_tpu_version_from_type(accelerator_type)
         slice_kwargs: Dict[str, Any] = {
@@ -544,11 +538,10 @@ class TPUAccelerator(AcceleratorBackend):
             "accelerator_version": version,
             "resources_per_bundle": resources_per_bundle,
             "strategy": strategy,
-            "bundle_label_selector": bundle_label_selector,
             "tpu_resource_per_chip": tpu_resource_per_chip,
         }
-        if chips_per_vm is not None:
-            slice_kwargs["chips_per_vm"] = chips_per_vm
+        if self._config.chips_per_vm is not None:
+            slice_kwargs["chips_per_vm"] = self._config.chips_per_vm
         if name:
             slice_kwargs["name"] = name
         self._slice_pg_wrapper = slice_placement_group(**slice_kwargs)
@@ -675,6 +668,38 @@ class TPUAccelerator(AcceleratorBackend):
                     f"TPU resources per bundle must be positive; got {int(tpu)}."
                 )
 
+    @staticmethod
+    def _resolve_batch_slice_strategy(
+        *,
+        requested_strategy: str,
+        topology: str,
+        num_hosts: int,
+        num_bundles: int,
+    ) -> str:
+        """Validate PG strategies permitted by topology-backed TPU Batch."""
+        strategy = requested_strategy
+        if num_hosts == 1 and num_bundles > 1:
+            if strategy not in ("PACK", "STRICT_PACK"):
+                raise ValueError(
+                    "Single-VM TPU topologies with multiple worker bundles require "
+                    "PACK/STRICT_PACK so every bundle remains on the same TPU VM; "
+                    f"got strategy={strategy!r}."
+                )
+            return "STRICT_PACK"
+
+        if num_hosts > 1:
+            if strategy == "STRICT_PACK":
+                raise ValueError(
+                    "STRICT_PACK cannot represent a multi-VM TPU topology "
+                    f"({num_hosts} VMs for topology '{topology}')."
+                )
+            if strategy == "STRICT_SPREAD" and num_bundles > num_hosts:
+                raise ValueError(
+                    "STRICT_SPREAD requires one node per bundle, but this topology "
+                    f"has {num_hosts} physical TPU VMs and {num_bundles} bundles."
+                )
+        return strategy
+
     def build_batch_scheduling_options(
         self,
         *,
@@ -686,8 +711,9 @@ class TPUAccelerator(AcceleratorBackend):
         """Reserve a TPU slice and return ``(map_batches_kwargs, close_fn)``.
 
         The driver reserves one ``SlicePlacementGroup`` while the processor is
-        built, waits under a bounded timeout, releases head reservation markers,
-        and trusts SlicePG for physical packing, labels, and strategy. ``close_fn``
+        built, waits under a bounded timeout, and releases head reservation
+        markers. SlicePG owns physical packing and single-host labels; Batch
+        validates which PG strategies this execution model permits. ``close_fn``
         is the SlicePG shutdown callable.
         """
         tpu_config = self._config
@@ -750,9 +776,9 @@ class TPUAccelerator(AcceleratorBackend):
         )
 
         topology = tpu_config.topology.strip().lower()
-        # Validate chips_per_vm packing early via the shared Core helper.
-        resolve_chips_per_vm(topology, version, tpu_config.chips_per_vm)
+        chips_per_vm = resolve_chips_per_vm(topology, version, tpu_config.chips_per_vm)
         total_chips = get_num_chips_from_topology(topology)
+        num_hosts = max(1, total_chips // chips_per_vm)
 
         tp_multiplier = _vllm_tp_multiplier(version)
         expected_tp = total_chips * tp_multiplier
@@ -790,9 +816,23 @@ class TPUAccelerator(AcceleratorBackend):
         resources_per_bundle = self._resolve_batch_worker_bundle(
             placement_group_config,
         )
-        strategy = (
+        requested_strategy = (
             placement_group_config.get("strategy") if placement_group_config else None
         ) or "PACK"
+        expected_num_bundles, _ = get_tpu_worker_resources(
+            topology=topology,
+            accelerator_type=canonical_accel,
+            resources_per_worker=resources_per_bundle,
+            num_slices=1,
+            chips_per_vm=tpu_config.chips_per_vm,
+            tpu_resource_per_chip=1,
+        )
+        strategy = self._resolve_batch_slice_strategy(
+            requested_strategy=requested_strategy,
+            topology=topology,
+            num_hosts=num_hosts,
+            num_bundles=expected_num_bundles,
+        )
 
         handle = None
         success = False
@@ -802,7 +842,6 @@ class TPUAccelerator(AcceleratorBackend):
                 resources_per_bundle=resources_per_bundle,
                 strategy=strategy,
                 tpu_resource_per_chip=1,
-                chips_per_vm=tpu_config.chips_per_vm,
             )
 
             try:

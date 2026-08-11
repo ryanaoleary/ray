@@ -941,8 +941,9 @@ def test_get_tpu_worker_resources_chips_per_vm_override():
 def test_resolve_chips_per_vm_supported_packings():
     """chips_per_vm must be a supported packing, not merely a positive divisor."""
     resolve = ray.util.tpu.resolve_chips_per_vm
-    supported = ray.util.tpu.get_supported_chips_per_vm
+    supported = ray.util.tpu._get_supported_chips_per_vm
 
+    # v6e 2x4 is the documented ambiguous packing (1x8-chip or 2x4-chip VMs).
     assert supported("2x4", "v6e") == frozenset({4, 8})
     assert resolve("2x4", "v6e") == 8
     assert resolve("2x4", "v6e", chips_per_vm=4) == 4
@@ -957,6 +958,13 @@ def test_resolve_chips_per_vm_supported_packings():
         resolve("2x4", "v6e", chips_per_vm=True)
     with pytest.raises(ValueError, match="positive integer"):
         resolve("2x4", "v6e", chips_per_vm=0)
+
+    # v5litepod 2x4 defaults to one 8-chip host and does not accept the v6e
+    # alternate 4-chip packing without an authoritative provisioning basis.
+    assert supported("2x4", "v5litepod") == frozenset({8})
+    assert resolve("2x4", "v5litepod") == 8
+    with pytest.raises(ValueError, match="not a supported VM packing"):
+        resolve("2x4", "v5litepod", chips_per_vm=4)
 
     # Non-ambiguous topologies only accept the Ray default packing.
     assert supported("2x2x2", "v4") == frozenset({4})
@@ -977,46 +985,27 @@ def test_get_tpu_worker_resources_rejects_invalid_chips_per_vm_packing():
 
 @patch("ray.util.tpu.placement_group")
 @patch("ray.util.tpu.reserve_tpu_slice")
-def test_slice_placement_group_resolves_strategy_and_single_host_labels(
-    mock_reserve, mock_pg
-):
-    """SlicePG owns single-host label/strategy invariants used by Batch."""
+def test_slice_placement_group_single_host_labels(mock_reserve, mock_pg):
+    """SlicePG pins single-host bundles to topology/pod labels; strategy is caller-owned."""
     mock_pg.return_value = MagicMock()
 
-    # Single-host multi-bundle: PACK upgrades to STRICT_PACK and topology/pod labels.
     handle = SlicePlacementGroup(
         topology="2x4",
         accelerator_version="v6e",
         resources_per_bundle={"TPU": 1, "CPU": 1},
-        strategy="PACK",
+        strategy="SPREAD",
     )
     assert handle.num_hosts == 1
     assert handle.num_bundles == 8
     mock_reserve.assert_not_called()
     kwargs = mock_pg.call_args.kwargs
-    assert kwargs["strategy"] == "STRICT_PACK"
+    # Default/public SPREAD remains valid for single-host multi-bundle SlicePG.
+    assert kwargs["strategy"] == "SPREAD"
     assert len(kwargs["bundle_label_selector"]) == 8
     assert kwargs["bundle_label_selector"][0] == {
         ray._raylet.RAY_NODE_TPU_TOPOLOGY_KEY: "2x4",
         ray._raylet.RAY_NODE_TPU_POD_TYPE_KEY: "v6e-8",
     }
-
-    mock_pg.reset_mock()
-    with pytest.raises(ValueError, match="PACK/STRICT_PACK"):
-        SlicePlacementGroup(
-            topology="2x4",
-            accelerator_version="v6e",
-            resources_per_bundle={"TPU": 1, "CPU": 1},
-            strategy="SPREAD",
-        )
-
-    with pytest.raises(ValueError, match="STRICT_PACK cannot represent"):
-        SlicePlacementGroup(
-            topology="4x4",
-            accelerator_version="v6e",
-            resources_per_bundle={"TPU": 4, "CPU": 1},
-            strategy="STRICT_PACK",
-        )
 
 
 def test_get_tpu_worker_resources_ray_tpu_resource_per_chip():

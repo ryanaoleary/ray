@@ -532,6 +532,35 @@ class TestAcceleratorConfigLogic:
         with pytest.raises(ValueError, match="must be a multiple of chips_per_host"):
             tpu_accel.default_bundles(num_devices=6, accelerator_type_str="TPU-V6E")
 
+    def test_default_bundles_and_create_pg_forward_chips_per_vm(self, monkeypatch):
+        """TPUConfig.chips_per_vm reaches SlicePG from Serve default_bundles/create_pg."""
+        slice_kwargs = []
+
+        def fake_slice(**kwargs):
+            slice_kwargs.append(kwargs)
+
+            class _Handle:
+                placement_group = object()
+
+            return _Handle()
+
+        monkeypatch.setattr(
+            "ray.llm._internal.common.accelerators.slice_placement_group",
+            fake_slice,
+        )
+        backend = TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4))
+        bundles = backend.default_bundles(num_devices=8, accelerator_type_str="TPU-V6E")
+        assert len(bundles) == 2
+        assert bundles[0]["TPU"] == 4
+        backend.create_placement_group(
+            bundles=bundles,
+            strategy="PACK",
+            name="serve-pg",
+            accelerator_type_str="TPU-V6E",
+        )
+        assert slice_kwargs[0]["chips_per_vm"] == 4
+        assert slice_kwargs[0]["resources_per_bundle"]["TPU"] == 4
+
 
 class TestCheckpointInfo:
     def test_apply_checkpoint_info_uses_autoconfig_and_threads_trust_remote_code(self):

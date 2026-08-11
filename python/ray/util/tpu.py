@@ -11,7 +11,6 @@ import ray
 from ray._private.accelerators import TPUAcceleratorManager
 from ray._private.accelerators.tpu import (
     DEFAULT_TPU_HEAD_RESERVATION_TIMEOUT_S,
-    TPU_8_CHIPS_PER_HOST_TYPES,
     TPU_SUBSLICE_LABEL_PREFIX,
     VALID_TPU_TYPES,
     _build_subslice_labels,
@@ -154,27 +153,26 @@ def get_tpu_num_slices_for_workers(
         return 1
 
 
-@PublicAPI(stability="alpha")
-def get_supported_chips_per_vm(
+def _get_supported_chips_per_vm(
     topology: str,
     accelerator_type: str,
 ) -> frozenset:
     """Return the supported physical chips-per-VM packings for a topology.
 
     Most topologies have a single packing (the Ray default from
-    :func:`get_chips_per_host`). A small number of ambiguous overlays also
-    support an alternate packing that matches GCP node shapes — today that is
-    v5litepod/v6e ``2x4``, which may be one 8-chip VM or two 4-chip VMs.
+    :func:`get_chips_per_host`). Google documents v6e ``2x4`` as either one
+    8-chip VM or two 4-chip VMs; that is the only alternate packing encoded
+    here.
     """
     version = get_tpu_version_from_type(accelerator_type)
     topology = topology.strip().lower()
     default = get_chips_per_host(topology, version)
-    if version in TPU_8_CHIPS_PER_HOST_TYPES and topology == "2x4":
+    if version == "v6e" and topology == "2x4":
         return frozenset({4, 8})
     return frozenset({default})
 
 
-@PublicAPI(stability="alpha")
+@DeveloperAPI
 def resolve_chips_per_vm(
     topology: str,
     accelerator_type: str,
@@ -185,7 +183,7 @@ def resolve_chips_per_vm(
     When ``chips_per_vm`` is omitted, returns the Ray default for the topology.
     When provided, requires a positive non-bool integer that evenly divides the
     topology chip count and is one of the supported packings for that
-    topology/generation (see :func:`get_supported_chips_per_vm`).
+    topology/generation.
     """
     version = get_tpu_version_from_type(accelerator_type)
     topology = topology.strip().lower()
@@ -208,7 +206,7 @@ def resolve_chips_per_vm(
             f"{total_chips} chips in topology '{topology}'."
         )
 
-    supported = get_supported_chips_per_vm(topology, accelerator_type)
+    supported = _get_supported_chips_per_vm(topology, accelerator_type)
     if chips_per_vm not in supported:
         raise ValueError(
             f"chips_per_vm={chips_per_vm} is not a supported VM packing for "
@@ -240,7 +238,7 @@ def get_tpu_worker_resources(
         chips_per_vm: An optional override for the number of chips per VM.
             If unspecified, this is inferred automatically from the topology
             and accelerator type. When set, must be a supported packing for
-            the topology (see :func:`resolve_chips_per_vm`).
+            the topology (see :func:`ray.util.tpu.resolve_chips_per_vm`).
         tpu_resource_per_chip: The number of logical TPU resources per physical chip.
             This value scales the total number of logical TPU resources reserved by the
             slice.
@@ -699,7 +697,6 @@ class SlicePlacementGroup:
         self._num_hosts = hosts_per_slice * self._num_slices
 
         self._validate_tpu_config()
-        strategy = self._resolve_strategy(strategy)
 
         # Reserve a TPU slice of the provided accelerator version and topology.
         pgs = self._reserve_slice(
@@ -711,40 +708,6 @@ class SlicePlacementGroup:
             self._managed_pgs = pgs
         else:
             self._managed_pgs = [pgs]
-
-    def _resolve_strategy(self, strategy: str) -> str:
-        """Enforce topology-safe placement strategies for the resolved host/bundle layout.
-
-        Single physical host:
-          - one bundle: keep the requested strategy
-          - multiple bundles: PACK upgrades to STRICT_PACK; SPREAD variants reject
-        Multi-host:
-          - STRICT_PACK rejects
-          - STRICT_SPREAD rejects when bundles exceed hosts
-        """
-        if self._num_hosts == 1:
-            if self._num_bundles > 1:
-                if strategy not in ("PACK", "STRICT_PACK"):
-                    raise ValueError(
-                        "Single-host TPU topologies with multiple worker bundles "
-                        "require PACK/STRICT_PACK so every bundle remains on the "
-                        f"same TPU VM; got strategy={strategy!r}."
-                    )
-                return "STRICT_PACK"
-            return strategy
-
-        if strategy == "STRICT_PACK":
-            raise ValueError(
-                "STRICT_PACK cannot represent a multi-host TPU topology "
-                f"({self._num_hosts} hosts for topology '{self._topology}')."
-            )
-        if strategy == "STRICT_SPREAD" and self._num_bundles > self._num_hosts:
-            raise ValueError(
-                "STRICT_SPREAD requires one node per bundle, but this topology "
-                f"has {self._num_hosts} physical TPU hosts and {self._num_bundles} "
-                "bundles."
-            )
-        return strategy
 
     def _validate_tpu_config(self):
         # Should validate topology and generation values and return a
