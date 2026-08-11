@@ -884,9 +884,7 @@ def test_default_topology_layouts(
         )[1],
     )
 
-    acquired = TPUAccelerator(
-        TPUConfig(topology=topology)
-    ).build_batch_scheduling_plan(
+    acquired = TPUAccelerator(TPUConfig(topology=topology)).build_batch_scheduling_plan(
         BatchSchedulingRequest(
             accelerator_type=accelerator_type,
             tensor_parallel_size=total_chips,
@@ -1771,9 +1769,7 @@ def test_single_vm_v4_pod_type_uses_cores_not_chips(monkeypatch):
         on_slice=lambda *args, **kwargs: slice_kwargs.append(kwargs),
     )
 
-    acquired = TPUAccelerator(
-        TPUConfig(topology="2x2x1")
-    ).build_batch_scheduling_plan(
+    acquired = TPUAccelerator(TPUConfig(topology="2x2x1")).build_batch_scheduling_plan(
         BatchSchedulingRequest(
             accelerator_type="TPU-V4",
             tensor_parallel_size=4,
