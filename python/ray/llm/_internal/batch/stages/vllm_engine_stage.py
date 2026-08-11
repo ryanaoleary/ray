@@ -317,11 +317,9 @@ class vLLMEngineWrapper:
                 "Metrics will be available at Ray's Prometheus endpoint."
             )
 
-        # When this actor is already scheduled inside a placement group (e.g. a
-        # driver-owned TPU SlicePG), vLLM's create_engine_config() — called from
-        # from_engine_args — copies get_current_placement_group() into
-        # ParallelConfig.placement_group. Executors such as tpu_inference reuse
-        # that field rather than allocating a second placement group.
+        # If this actor is already inside a placement group, from_engine_args /
+        # create_engine_config copies get_current_placement_group() into
+        # ParallelConfig.placement_group for the distributed executor to reuse.
         self.engine = vllm.AsyncLLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )

@@ -11,7 +11,6 @@ import pytest
 import ray
 from ray.data.llm import build_processor, vLLMEngineProcessorConfig
 from ray.llm._internal.batch.processor.base import Processor
-from ray.llm._internal.batch.processor.vllm_engine_proc import _ManagedVLLMProcessor
 from ray.llm._internal.common.accelerators import (
     DEFAULT_PG_READY_TIMEOUT_S,
     DEFAULT_USER_CPU_PER_HOST,
@@ -114,7 +113,7 @@ def mock_tpu_slice_environment(monkeypatch):
     return fake_handle
 
 
-def test_config_requires_tpu_topology_and_concurrency_one():
+def test_config_requires_tpu_config_and_concurrency_one():
     cfg = vLLMEngineProcessorConfig(
         model_source="m",
         accelerator_type="TPU-V6E",
@@ -124,13 +123,15 @@ def test_config_requires_tpu_topology_and_concurrency_one():
     assert cfg.accelerator_config.topology == "4x4"
     assert cfg.concurrency == 1
 
-    with pytest.raises(ValueError, match="topology"):
-        vLLMEngineProcessorConfig(
-            model_source="m",
-            accelerator_type="TPU-V6E",
-            accelerator_config={"kind": "tpu"},
-        )
-    with pytest.raises(ValueError, match="accelerator_config"):
+    # Topology is optional at config time (single-host may omit it); kind='tpu' is not.
+    cfg_no_topo = vLLMEngineProcessorConfig(
+        model_source="m",
+        accelerator_type="TPU-V6E",
+        accelerator_config={"kind": "tpu"},
+    )
+    assert cfg_no_topo.accelerator_config.topology is None
+
+    with pytest.raises(ValueError, match="kind='tpu'"):
         vLLMEngineProcessorConfig(model_source="m", accelerator_type="TPU-V6E")
     with pytest.raises(ValueError, match="concurrency=1"):
         vLLMEngineProcessorConfig(
@@ -138,6 +139,18 @@ def test_config_requires_tpu_topology_and_concurrency_one():
             accelerator_type="TPU-V6E",
             accelerator_config={"kind": "tpu", "topology": "4x4"},
             concurrency=2,
+        )
+
+
+def test_batch_requires_topology_for_slice_placement(monkeypatch):
+    """Topology may be omitted on the config, but SlicePG Batch still needs it."""
+    monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
+    backend = TPUAccelerator(TPUConfig(kind="tpu"))
+    with pytest.raises(ValueError, match="topology"):
+        _tpu_options(
+            backend,
+            accelerator_type="TPU-V6E",
+            tensor_parallel_size=8,
         )
 
 
@@ -159,7 +172,8 @@ def test_builder_returns_managed_processor_and_defaults_executor(
         engine_kwargs={"tensor_parallel_size": 16},
     )
     processor = build_processor(config)
-    assert isinstance(processor, _ManagedVLLMProcessor)
+    assert isinstance(processor, Processor)
+    assert processor._close_fn is not None
     stage = processor.stages["vLLMEngineStage"]
     assert (
         stage.map_batches_kwargs["scheduling_strategy"].placement_group_bundle_index

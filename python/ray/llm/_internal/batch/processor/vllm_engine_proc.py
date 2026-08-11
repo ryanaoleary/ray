@@ -2,13 +2,12 @@
 
 import hashlib
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import transformers
 from pydantic import Field, field_validator, model_validator
 
 import ray
-from ray.data import Dataset
 from ray.data.block import UserDefinedFunction
 from ray.llm._internal.batch.constants import TypeVLLMTaskType, vLLMTaskType
 from ray.llm._internal.batch.observability.usage_telemetry.usage import (
@@ -20,7 +19,6 @@ from ray.llm._internal.batch.processor.base import (
     OfflineProcessorConfig,
     Processor,
     ProcessorBuilder,
-    ProcessorConfig,
 )
 from ray.llm._internal.batch.processor.utils import (
     build_cpu_stage_map_kwargs,
@@ -99,22 +97,21 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     placement_group_config: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Ray placement group config for vLLM engine workers. For GPU, "
-            "`bundle_per_worker` is replicated by tp*pp and `bundles` gives the "
-            "full bundle list. For topology-backed TPU Batch, these fields supply "
-            "a homogeneous worker template (e.g. {'bundle_per_worker': {'TPU': 1}}) "
-            "while the topology and TPU-per-bundle determine the SlicePG bundle "
-            "count. Optional 'strategy' is one of PACK/STRICT_PACK/SPREAD/"
-            "STRICT_SPREAD."
+            "Ray placement group configuration for scheduling vLLM engine workers. "
+            "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or "
+            "'bundles' (full list of resource dicts). Optionally include 'strategy' "
+            "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
+            "Example with bundle_per_worker: "
+            "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
+            "Example with bundles: "
+            "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
         ),
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Accelerator configuration for the LLM stage. For TPU batch inference, "
-            "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'} (optionally "
-            "chips_per_vm for ambiguous topologies). An omitted accelerator config "
-            "preserves GPU batch behavior for this processor."
+            "Optional accelerator backend configuration for the LLM stage. "
+            "When omitted, GPU batch scheduling is used."
         ),
     )
 
@@ -178,20 +175,12 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
                 )
             if self.accelerator_config is None:
                 raise ValueError(
-                    "TPU batch inference requires accelerator_config with "
-                    "kind='tpu' and topology=..., for example "
-                    "{'kind': 'tpu', 'topology': '4x4'}."
+                    "TPU accelerator_type requires accelerator_config with kind='tpu'."
                 )
             if not isinstance(self.accelerator_config, TPUConfig):
                 raise ValueError(
                     "TPU accelerator_type requires a TPU accelerator_config "
                     f"(kind='tpu'); got {self.accelerator_config!r}."
-                )
-            if not self.accelerator_config.topology:
-                raise ValueError(
-                    "TPU batch inference requires accelerator_config with "
-                    "kind='tpu' and topology=..., for example "
-                    "{'kind': 'tpu', 'topology': '4x4'}."
                 )
             if self.concurrency != 1:
                 raise ValueError(
@@ -210,53 +199,9 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     def validate_placement_group_config(cls, value):
         if value is None:
             return None
+        # Validate through PlacementGroupConfig, then dump back to dict
         validated = PlacementGroupConfig(**value)
         return validated.model_dump(exclude_unset=True)
-
-
-class _ManagedVLLMProcessor(Processor):
-    """Processor that owns driver-side batch resources (e.g. a TPU SlicePG).
-
-    Finish every Dataset derived from this processor before calling ``close()``.
-    Closing makes future ``processor(dataset)`` calls fail immediately.
-    """
-
-    def __init__(
-        self,
-        config: ProcessorConfig,
-        stages: List[StatefulStage],
-        preprocess: Optional[UserDefinedFunction] = None,
-        postprocess: Optional[UserDefinedFunction] = None,
-        preprocess_map_kwargs: Optional[Dict[str, Any]] = None,
-        postprocess_map_kwargs: Optional[Dict[str, Any]] = None,
-        close_fn: Optional[Callable[[], None]] = None,
-    ):
-        super().__init__(
-            config=config,
-            stages=stages,
-            preprocess=preprocess,
-            postprocess=postprocess,
-            preprocess_map_kwargs=preprocess_map_kwargs,
-            postprocess_map_kwargs=postprocess_map_kwargs,
-        )
-        self._close_fn = close_fn
-        self._closed = False
-
-    def close(self) -> None:
-        """Idempotently release driver-owned batch resources."""
-        self._closed = True
-        if self._close_fn is None:
-            return
-        close_fn = self._close_fn
-        self._close_fn = None
-        close_fn()
-
-    def __call__(self, dataset: Dataset) -> Dataset:
-        if self._closed:
-            raise RuntimeError(
-                "Processor is closed. Cannot execute new datasets on a closed processor."
-            )
-        return super().__call__(dataset)
 
 
 def build_vllm_engine_processor(
@@ -366,8 +311,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Finish downloads and telemetry before acquiring accelerator slices so a
-    # later failure does not leave a reserved TPU slice stranded.
+    # Download config files for telemetry before acquiring accelerator resources.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
     # since custom model architectures require Python config files to be downloaded.
     if config.engine_kwargs.get(
@@ -475,17 +419,7 @@ def build_vllm_engine_processor(
                 )
             )
 
-        if close_fn is None:
-            return Processor(
-                config=config,
-                stages=stages,
-                preprocess=preprocess,
-                postprocess=postprocess,
-                preprocess_map_kwargs=preprocess_map_kwargs,
-                postprocess_map_kwargs=postprocess_map_kwargs,
-            )
-
-        return _ManagedVLLMProcessor(
+        return Processor(
             config=config,
             stages=stages,
             preprocess=preprocess,
