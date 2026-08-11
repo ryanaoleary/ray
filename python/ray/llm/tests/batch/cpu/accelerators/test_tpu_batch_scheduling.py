@@ -76,11 +76,11 @@ def test_tpu_config_single_host_vs_topology():
     assert cfg.accelerator_config is None
     assert cfg.concurrency == 1
 
-    # Topology may omit kind; chips_per_vm alone also coerces to TPUConfig.
+    # Topology requires explicit kind, matching Serve accelerator_config dicts.
     topo = vLLMEngineProcessorConfig(
         model_source="m",
         accelerator_type="TPU-V6E",
-        accelerator_config={"topology": "4x4"},
+        accelerator_config={"kind": "tpu", "topology": "4x4"},
     )
     assert isinstance(topo.accelerator_config, TPUConfig)
     assert topo.accelerator_config.topology == "4x4"
@@ -95,7 +95,7 @@ def test_tpu_config_single_host_vs_topology():
         vLLMEngineProcessorConfig(
             model_source="m",
             accelerator_type="TPU-V6E",
-            accelerator_config={"topology": "4x4"},
+            accelerator_config={"kind": "tpu", "topology": "4x4"},
             concurrency=2,
         )
 
@@ -141,7 +141,7 @@ def test_builder_pins_bundle_zero_and_close_releases_slice(stub_slice_pg):
         vLLMEngineProcessorConfig(
             model_source="test-model",
             accelerator_type="TPU-V6E",
-            accelerator_config={"topology": "4x4"},
+            accelerator_config={"kind": "tpu", "topology": "4x4"},
             engine_kwargs={"tensor_parallel_size": 16},
         )
     )

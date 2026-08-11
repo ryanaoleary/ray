@@ -133,15 +133,6 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         values["engine_kwargs"] = engine_kwargs
         return values
 
-    @field_validator("accelerator_config", mode="before")
-    @classmethod
-    def _coerce_tpu_accelerator_config(cls, value):
-        # Allow {"topology": "4x4"} without an explicit kind discriminator.
-        if isinstance(value, dict) and "kind" not in value:
-            if "topology" in value or "chips_per_vm" in value:
-                return {**value, "kind": "tpu"}
-        return value
-
     @field_validator("accelerator_type")
     @classmethod
     def _normalize_accelerator_type(cls, value):
