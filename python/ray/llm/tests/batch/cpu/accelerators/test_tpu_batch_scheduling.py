@@ -1,8 +1,9 @@
-"""Hermetic tests for TPU Batch scheduling (no TPU hardware required).
+"""Hermetic tests for topology-backed TPU Batch scheduling.
 
-Stub ``slice_placement_group`` / PG wait only. Physical SlicePG packing stays in
-``python/ray/tests/test_tpu.py``; these tests cover Batch config validation,
-backend selection, SlicePG kwargs forwarding, and processor lifecycle.
+Stub ``slice_placement_group`` / PG wait only. Physical multi-host SlicePG
+reservation stays in ``python/ray/tests/test_tpu.py``. These tests cover Batch
+config validation, SlicePG kwargs (including single-host labels /
+STRICT_PACK), and processor lifecycle.
 """
 
 from typing import Any, Dict, Optional
@@ -15,16 +16,12 @@ import ray.llm._internal.common.accelerators as accelerators
 from ray.data.llm import build_processor, vLLMEngineProcessorConfig
 from ray.llm._internal.batch.processor.base import Processor
 from ray.llm._internal.batch.processor import vllm_engine_proc
-from ray.llm._internal.batch.processor.vllm_engine_proc import (
-    _default_batch_accelerator_config,
-)
 from ray.llm._internal.common.accelerators import (
     DEFAULT_PG_READY_TIMEOUT_S,
     DEFAULT_USER_CPU_PER_HOST,
     PARENT_ACTOR_CPU_RESERVE,
     RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR,
     TPU_ENGINE_ENV_VARS,
-    GPUAccelerator,
     GPUConfig,
     TPUAccelerator,
     TPUConfig,
@@ -86,101 +83,76 @@ def _topo_config(**kwargs):
 
 
 @pytest.mark.parametrize(
-    "kwargs, expect_topology, expect_error",
+    "kwargs, match",
     [
-        ({"accelerator_type": "TPU-V6E"}, None, None),
+        ({"accelerator_type": "TPU-V6E"}, "requires accelerator_config with topology"),
         (
             {
                 "accelerator_type": "TPU-V6E",
-                "accelerator_config": {"kind": "tpu", "topology": "4x4"},
+                "accelerator_config": {"kind": "tpu"},
             },
-            "4x4",
-            None,
+            "requires accelerator_config with topology",
         ),
-        ({"accelerator_type": "TPU-V6E", "concurrency": 2}, None, None),
         (
             {
                 "accelerator_type": "TPU-V6E",
                 "accelerator_config": {"kind": "tpu", "topology": "4x4"},
                 "concurrency": 2,
             },
-            None,
             "concurrency=1",
         ),
     ],
 )
-def test_processor_config_tpu_rules(kwargs, expect_topology, expect_error):
-    if expect_error:
-        with pytest.raises(ValueError, match=expect_error):
-            vLLMEngineProcessorConfig(model_source="m", **kwargs)
-        return
-    cfg = vLLMEngineProcessorConfig(model_source="m", **kwargs)
-    if expect_topology is None:
-        assert cfg.accelerator_config is None or cfg.accelerator_config.topology is None
-    else:
-        assert isinstance(cfg.accelerator_config, TPUConfig)
-        assert cfg.accelerator_config.topology == expect_topology
+def test_processor_config_rejects_invalid_tpu(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        vLLMEngineProcessorConfig(model_source="m", **kwargs)
 
 
-@pytest.mark.parametrize(
-    "accelerator_type, expected_config, expected_backend",
-    [
-        (None, GPUConfig, GPUAccelerator),
-        ("TPU-V6E", TPUConfig, TPUAccelerator),
-    ],
-)
-def test_omitted_accelerator_config_defaults(
-    accelerator_type, expected_config, expected_backend
-):
-    cfg = vLLMEngineProcessorConfig(
-        model_source="m", accelerator_type=accelerator_type
-    )
+def test_processor_config_accepts_topology():
+    cfg = _topo_config()
+    assert isinstance(cfg.accelerator_config, TPUConfig)
+    assert cfg.accelerator_config.topology == "4x4"
+    assert cfg.concurrency == 1
+
+
+def test_omitted_accelerator_config_defaults_to_gpu():
+    from ray.llm._internal.common.accelerators import GPUAccelerator
+
+    cfg = vLLMEngineProcessorConfig(model_source="m")
     assert cfg.accelerator_config is None
-    resolved = _default_batch_accelerator_config(cfg)
-    assert isinstance(resolved, expected_config)
-    assert isinstance(get_accelerator_backend(resolved), expected_backend)
+    assert isinstance(
+        get_accelerator_backend(cfg.accelerator_config or GPUConfig()), GPUAccelerator
+    )
 
 
-@pytest.mark.parametrize(
-    "tp, expect_resources, expect_ray_fn",
-    [
-        (1, {"TPU": 1.0}, False),
-        (4, {}, True),
-    ],
-)
-def test_single_host_tpu_skips_slice_pg(
-    stub_slice_pg, tp, expect_resources, expect_ray_fn
-):
-    _, create = stub_slice_pg
-    kwargs, close_fn = _schedule(TPUAccelerator(TPUConfig()), tensor_parallel_size=tp)
-    assert close_fn is None
-    assert kwargs["resources"] == expect_resources
-    assert ("ray_remote_args_fn" in kwargs) is expect_ray_fn
-    assert "scheduling_strategy" not in kwargs
-    create.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "version, expected",
-    [("v6e", 1), ("v7x", 2)],
-)
+@pytest.mark.parametrize("version, expected", [("v6e", 1), ("v7x", 2)])
 def test_vllm_tp_multiplier(version, expected):
     assert _vllm_tp_multiplier(version) == expected
 
 
+def test_chips_per_vm_requires_topology():
+    with pytest.raises(ValueError, match="chips_per_vm requires topology"):
+        TPUConfig(chips_per_vm=4)
+
+
 @pytest.mark.parametrize(
-    "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, strategy",
+    "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, strategy, "
+    "expect_strategy, expect_labels",
     [
-        # Default: Ray fills chips-per-VM; strategy defaults to PACK.
-        ("4x4", "TPU-V6E", 16, None, None, None),
-        ("2x4", "TPU-V6E", 8, None, None, None),
-        # Explicit per-chip worker template.
-        ("4x4", "TPU-V6E", 16, None, 1, None),
-        # chips_per_vm override + optional strategy passthrough.
-        ("2x4", "TPU-V6E", 8, 4, 1, "SPREAD"),
-        # v7x: TP = chips × 2.
-        ("2x2x2", "TPU-V7X", 16, None, None, None),
-        ("2x2x1", "TPU-V7X", 8, None, 1, None),
+        # Multi-host: SlicePG reservation handles placement; no Batch labels.
+        ("4x4", "TPU-V6E", 16, None, None, None, "PACK", False),
+        ("4x4", "TPU-V6E", 16, None, 1, None, "PACK", False),
+        # chips_per_vm can make an otherwise single-host topology multi-host.
+        ("2x4", "TPU-V6E", 8, 4, 1, None, "PACK", False),
+        ("2x4", "TPU-V6E", 8, 4, 1, "STRICT_PACK", "STRICT_PACK", False),
+        # Single-host default (one host-sized bundle): labels, PACK fine.
+        ("2x4", "TPU-V6E", 8, None, None, None, "PACK", True),
+        # Single-host multi-bundle: PACK upgrades to STRICT_PACK + labels.
+        ("2x4", "TPU-V6E", 8, None, 1, None, "STRICT_PACK", True),
+        # v7x single-host multi-bundle.
+        ("2x2x1", "TPU-V7X", 8, None, 1, None, "STRICT_PACK", True),
+        # v7x multi-host.
+        ("2x2x2", "TPU-V7X", 16, None, None, None, "PACK", False),
     ],
 )
 def test_topology_forwards_slice_pg_kwargs(
@@ -191,6 +163,8 @@ def test_topology_forwards_slice_pg_kwargs(
     chips_per_vm,
     tpu_per_bundle,
     strategy,
+    expect_strategy,
+    expect_labels,
 ):
     handle, create = stub_slice_pg
     pg_config = None
@@ -214,7 +188,7 @@ def test_topology_forwards_slice_pg_kwargs(
 
     slice_kwargs = create.call_args.kwargs
     assert slice_kwargs["topology"] == topology
-    assert slice_kwargs["strategy"] == (strategy or "PACK")
+    assert slice_kwargs["strategy"] == expect_strategy
     resources = slice_kwargs["resources_per_bundle"]
     if tpu_per_bundle is None:
         assert "TPU" not in resources
@@ -222,8 +196,30 @@ def test_topology_forwards_slice_pg_kwargs(
         assert resources["TPU"] == float(tpu_per_bundle)
     assert slice_kwargs.get("chips_per_vm") == chips_per_vm
 
+    if expect_labels:
+        selectors = slice_kwargs["bundle_label_selector"]
+        assert selectors
+        for labels in selectors:
+            assert labels[ray._raylet.RAY_NODE_TPU_TOPOLOGY_KEY] == topology
+            assert ray._raylet.RAY_NODE_TPU_POD_TYPE_KEY in labels
+    else:
+        assert "bundle_label_selector" not in slice_kwargs
+
     close_fn()
     handle.shutdown.assert_called_once()
+
+
+def test_single_host_rejects_spread(stub_slice_pg):
+    with pytest.raises(ValueError, match="PACK or STRICT_PACK"):
+        _schedule(
+            TPUAccelerator(TPUConfig(topology="2x4")),
+            tensor_parallel_size=8,
+            placement_group_config={
+                "bundle_per_worker": {"TPU": 1},
+                "strategy": "SPREAD",
+            },
+        )
+    stub_slice_pg[1].assert_not_called()
 
 
 def test_topology_merges_runtime_env_and_releases_head(stub_slice_pg):
@@ -340,6 +336,11 @@ def test_builder_failure_and_idempotent_close(stub_slice_pg, monkeypatch):
             {"topology": "2x2x2"},
             {"accelerator_type": "TPU-V7X", "tensor_parallel_size": 8},
             "tensor_parallel_size must be 16",
+        ),
+        (
+            {},
+            {"tensor_parallel_size": 1},
+            "requires accelerator_config.topology",
         ),
     ],
 )

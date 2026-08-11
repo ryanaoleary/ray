@@ -6,7 +6,7 @@ from pydantic import ConfigDict, Field, PrivateAttr, field_validator, model_vali
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.cli_args import FrontendArgs
 
-from ray.llm._internal.common.accelerators import (
+from ray.llm._internal.serve.core.configs.accelerators import (
     AcceleratorBackend,
     AnyAcceleratorConfig,
     CPUAccelerator,

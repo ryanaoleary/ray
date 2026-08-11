@@ -372,7 +372,7 @@ class Processor:
             self._append_stage(stage)
 
     def close(self) -> None:
-        """Release any driver-owned resources held by this processor."""
+        """Mark this processor closed and release any driver-owned resources."""
         self._closed = True
         if self._close_fn is None:
             return

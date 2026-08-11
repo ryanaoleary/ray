@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pydantic
 import pytest
 
-from ray.llm._internal.common.accelerators import (
+from ray.llm._internal.serve.core.configs.accelerators import (
     CPUAccelerator,
     CPUConfig,
     GPUAccelerator,

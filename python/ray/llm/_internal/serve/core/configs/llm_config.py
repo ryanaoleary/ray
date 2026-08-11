@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from ray.llm._internal.common.accelerators import (
+from ray.llm._internal.serve.core.configs.accelerators import (
     TPU_ACCELERATOR_VALUES,
     AcceleratorType,
     AnyAcceleratorConfig,

@@ -42,7 +42,6 @@ from ray.llm._internal.batch.stages.configs import (
 from ray.llm._internal.common.accelerators import (
     CPU_ACCELERATOR_TYPE_LITERAL,
     TPU_ACCELERATOR_VALUES,
-    AcceleratorConfig,
     AnyAcceleratorConfig,
     CPUConfig,
     GPUConfig,
@@ -97,16 +96,26 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     # Custom placement group config for TP/PP.
     placement_group_config: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Ray placement group configuration for scheduling vLLM engine workers. "
-        "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or 'bundles' "
-        "(full list of resource dicts). Optionally include 'strategy' key "
-        "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
-        "Example with bundle_per_worker: {'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
-        "Example with bundles: {'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}.",
+        description=(
+            "Ray placement group configuration for scheduling vLLM engine workers. "
+            "For ordinary placement-group scheduling, 'bundle_per_worker' is "
+            "replicated by TP×PP and 'bundles' specifies the full list. For "
+            "topology-backed TPU scheduling, these fields are the homogeneous "
+            "SlicePG worker template; the topology determines the resulting "
+            "bundle count. Optionally include 'strategy' "
+            "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
+            "Example with bundle_per_worker: "
+            "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
+            "Example with bundles: "
+            "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
+        ),
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
-        description="Optional accelerator backend configuration.",
+        description=(
+            "Optional accelerator backend configuration, discriminated by 'kind'. "
+            "TPU batch inference requires kind='tpu' and a topology."
+        ),
     )
 
     @model_validator(mode="before")
@@ -167,18 +176,15 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
                     f"GPUConfig cannot be used with TPU accelerator_type "
                     f"{self.accelerator_type!r}."
                 )
-            if self.accelerator_config is not None and not isinstance(
-                self.accelerator_config, TPUConfig
+            if not isinstance(self.accelerator_config, TPUConfig) or not (
+                self.accelerator_config.topology
             ):
                 raise ValueError(
-                    "TPU accelerator_type requires a TPU accelerator_config "
-                    f"(or omit it for single-host); got {self.accelerator_config!r}."
+                    "TPU batch inference requires accelerator_config with topology "
+                    "(e.g. {'kind': 'tpu', 'topology': '4x4'}); "
+                    f"got {self.accelerator_config!r}."
                 )
-            if (
-                isinstance(self.accelerator_config, TPUConfig)
-                and self.accelerator_config.topology
-                and self.concurrency != 1
-            ):
+            if self.concurrency != 1:
                 raise ValueError(
                     "Topology-backed TPU batch inference requires concurrency=1; "
                     f"got {self.concurrency!r}."
@@ -198,24 +204,6 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         # Validate through PlacementGroupConfig, then dump back to dict
         validated = PlacementGroupConfig(**value)
         return validated.model_dump(exclude_unset=True)
-
-
-def _default_batch_accelerator_config(
-    config: "vLLMEngineProcessorConfig",
-) -> AcceleratorConfig:
-    """Fill omitted ``accelerator_config`` for Batch backend selection.
-
-    Scheduling is backend-specific (GPU PG vs single-host TPU resources vs
-    topology SlicePG). Placement resources alone cannot select SlicePG; that
-    requires ``accelerator_config.topology``. When the field is omitted, infer
-    single-host ``TPUConfig()`` from a TPU ``accelerator_type``, else GPU.
-    Compatibility is enforced by ``_validate_accelerator``.
-    """
-    if config.accelerator_config is not None:
-        return config.accelerator_config
-    if config.accelerator_type and config.accelerator_type.startswith("TPU"):
-        return TPUConfig()
-    return GPUConfig()
 
 
 def build_vllm_engine_processor(
@@ -365,7 +353,7 @@ def build_vllm_engine_processor(
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
     dp_size = engine_kwargs.get("data_parallel_size", 1)
 
-    backend = get_accelerator_backend(_default_batch_accelerator_config(config))
+    backend = get_accelerator_backend(config.accelerator_config or GPUConfig())
 
     telemetry_agent = get_or_create_telemetry_agent()
     telemetry_agent.push_telemetry_report(
