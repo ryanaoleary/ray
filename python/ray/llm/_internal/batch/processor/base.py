@@ -451,24 +451,6 @@ class Processor:
 
         logger.info(message)
 
-    def close(self) -> None:
-        """Release resources owned by this processor.
-
-        Ordinary processors own no driver-side lifecycle resource, so this is a no-op.
-        Context-manager and ``shutdown()`` support are provided so ``with build_processor(...)``
-        works uniformly for GPU and TPU-managed processors.
-        """
-
-    def shutdown(self) -> None:
-        """Alias for :meth:`close`."""
-        self.close()
-
-    def __enter__(self) -> "Processor":
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
-
 
 @DeveloperAPI
 class ProcessorBuilder:

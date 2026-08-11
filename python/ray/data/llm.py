@@ -152,19 +152,14 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             vLLM engine workers. For GPU, ``bundle_per_worker`` is replicated by
             ``tp*pp`` and ``bundles`` specifies the full placement-group bundle
             list. For topology-backed TPU Batch, these fields provide a
-            homogeneous worker-resource template; the physical topology and TPU
-            resources per bundle determine the actual SlicePG bundle count (for
-            example ``{"bundle_per_worker": {"TPU": 1}}`` for per-chip workers).
-            Optional ``strategy`` is ``PACK``/``STRICT_PACK``/``SPREAD``/
-            ``STRICT_SPREAD``; single-VM TPU layouts with multiple worker
-            bundles require ``PACK``/``STRICT_PACK``.
+            homogeneous worker-resource template (for example
+            ``{"bundle_per_worker": {"TPU": 1}}``) while the topology and
+            TPU-per-bundle determine the SlicePG bundle count. Optional
+            ``strategy`` is ``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``.
         accelerator_config: Optional accelerator configuration for the LLM stage.
             For TPU batch inference, pass a mapping such as
-            ``{"kind": "tpu", "topology": "4x4"}``. For ambiguous shapes such as
-            v6e ``2x4``, optionally set ``chips_per_vm`` to ``4`` to request two
-            4-chip VMs (must match cluster provisioning; omit for Ray's default
-            one 8-chip VM). When omitted with a non-TPU ``accelerator_type``,
-            GPU batch behavior is preserved.
+            ``{"kind": "tpu", "topology": "4x4"}``. When omitted with a non-TPU
+            ``accelerator_type``, GPU batch behavior is preserved.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

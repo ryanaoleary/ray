@@ -6,7 +6,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 import transformers
-from pydantic import Field, TypeAdapter, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 import ray
 from ray.data import Dataset
@@ -66,8 +66,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ARCHITECTURE = "UNKNOWN_MODEL_ARCHITECTURE"
 
-_ACCEL_ADAPTER: TypeAdapter[AnyAcceleratorConfig] = TypeAdapter(AnyAcceleratorConfig)
-
 
 def _looks_like_tpu(accelerator_type: Any, accelerator_config: Any) -> bool:
     """Detect a TPU request from raw, not-yet-validated config input."""
@@ -117,42 +115,23 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     placement_group_config: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Ray placement group configuration for scheduling vLLM engine "
-            "workers. For GPU Batch, `bundle_per_worker` is replicated by "
-            "tp*pp and `bundles` specifies the full placement-group bundle "
-            "list. For topology-backed TPU Batch, these fields provide a "
-            "homogeneous worker-resource template; the physical topology and "
-            "TPU resources per bundle determine the actual SlicePG bundle "
-            "count (e.g. {'bundle_per_worker': {'TPU': 1}} for per-chip "
-            "workers on a topology-selected slice). Optionally include "
-            "'strategy' ('PACK', 'STRICT_PACK', 'SPREAD', or "
-            "'STRICT_SPREAD'). Single-VM TPU layouts with multiple worker "
-            "bundles require PACK/STRICT_PACK (Batch upgrades PACK to "
-            "STRICT_PACK). Example with bundle_per_worker: "
-            "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
-            "Example with bundles: "
-            "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
+            "Ray placement group config for vLLM engine workers. For GPU, "
+            "`bundle_per_worker` is replicated by tp*pp and `bundles` gives the "
+            "full bundle list. For topology-backed TPU Batch, these fields supply "
+            "a homogeneous worker template (e.g. {'bundle_per_worker': {'TPU': 1}}) "
+            "while the topology and TPU-per-bundle determine the SlicePG bundle "
+            "count. Optional 'strategy' is one of PACK/STRICT_PACK/SPREAD/"
+            "STRICT_SPREAD."
         ),
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
             "Accelerator configuration for the LLM stage. For TPU batch inference, "
-            "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'}. For "
-            "ambiguous shapes such as v6e '2x4', optionally set chips_per_vm to 4 "
-            "to request two 4-chip VMs (must match cluster provisioning; omit for "
-            "Ray's default one 8-chip VM). An omitted accelerator type preserves "
-            "GPU batch behavior for this processor."
+            "pass a mapping such as {'kind': 'tpu', 'topology': '4x4'}. An omitted "
+            "accelerator type preserves GPU batch behavior for this processor."
         ),
     )
-
-    @field_validator("accelerator_config", mode="before")
-    @classmethod
-    def _coerce_accelerator_config(cls, v):
-        """Convert a raw mapping into the typed accelerator config."""
-        if v is None or isinstance(v, (CPUConfig, GPUConfig, TPUConfig)):
-            return v
-        return _ACCEL_ADAPTER.validate_python(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -271,9 +250,9 @@ class _ManagedVLLMProcessor(Processor):
 
     Lifecycle:
     The processor owns the slice placement group for its explicit lifetime. It exposes an idempotent,
-    thread-safe close()/shutdown() method and context-manager support (`with build_processor(config) as p:`).
-    Users must not close until all datasets derived from this processor have completed. Closing makes future
-    processor(dataset) calls fail immediately.
+    thread-safe ``close()`` method and context-manager support (`with build_processor(config) as p:`).
+    Every Dataset derived from this processor must finish before ``close()`` is called; closing makes
+    future ``processor(dataset)`` calls fail immediately.
     """
 
     def __init__(
@@ -314,6 +293,12 @@ class _ManagedVLLMProcessor(Processor):
 
             self._close_handle.shutdown()
             self._close_handle = None
+
+    def __enter__(self) -> "_ManagedVLLMProcessor":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def __call__(self, dataset: Dataset) -> Dataset:
         # Hold the lock across the closed check and Dataset construction so close()
@@ -436,7 +421,6 @@ def build_vllm_engine_processor(
 
     request = BatchSchedulingRequest(
         accelerator_type=config.accelerator_type,
-        accelerator_config=config.accelerator_config,
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,
         data_parallel_size=dp_size,

@@ -146,49 +146,30 @@ def infer_hardware_kind_from_bundles(
 
 
 @dataclass(frozen=True)
-class TPUReplicaLayout:
-    """Resolved TPU topology for one model replica.
-
-    Separates physical SlicePG topology from vLLM/framework executor devices.
-    Placement-group bundle count is derived separately from the optional worker
-    template via ``get_tpu_worker_resources`` (Ray scheduling resources), not
-    from ``total_framework_devices``.
-
-    Attributes:
-        topology: Canonical topology string, such as ``"4x4"`` or ``"2x2x1"``.
-        accelerator_type: The canonical Ray accelerator type, such as ``"TPU-V6E"``.
-        accelerator_version: The generation alone, such as ``"v6e"`` or ``"v7x"``.
-        total_chips: Total physical chips across the topology.
-        chips_per_vm: Physical chips on each resolved TPU VM (Ray's default
-            ``chips_per_host`` / ``chips_per_vm``, or an explicit
-            ``accelerator_config.chips_per_vm`` override for ambiguous shapes).
-        num_vms: Number of physical TPU VMs in the topology. This is independent of
-            the SlicePG bundle count when using finer TPU-per-bundle granularity.
-        framework_devices_per_chip: Framework-visible devices per physical chip (1 for
-            all current generations except v7x; 2 for Ironwood/v7x chiplets).
-            Independent of ``RAY_TPU_RESOURCE_PER_CHIP``, which remains a Ray
-            scheduling concern.
-    """
+class _TPUSliceLayout:
+    """Physical TPU slice resolved from topology + chips_per_vm."""
 
     topology: str
-    accelerator_type: str
-    accelerator_version: str
-
-    # Physical slice
     total_chips: int
     chips_per_vm: int
-    num_vms: int
-
-    # Framework execution
-    framework_devices_per_chip: int
 
     @property
-    def total_framework_devices(self) -> int:
-        return self.total_chips * self.framework_devices_per_chip
+    def num_vms(self) -> int:
+        return self.total_chips // self.chips_per_vm
 
     @property
     def is_single_vm(self) -> bool:
         return self.num_vms == 1
+
+
+def _vllm_tp_multiplier(accelerator_version: str) -> int:
+    """vLLM TP size multiplier per physical TPU chip.
+
+    This is the vLLM/framework execution-device count, not the TPU core count
+    Ray uses for pod-type naming. Among currently accepted generations, only
+    v7x exposes two framework devices per physical chip.
+    """
+    return 2 if accelerator_version.strip().lower() == "v7x" else 1
 
 
 @dataclass(frozen=True)
@@ -197,12 +178,11 @@ class BatchSchedulingRequest:
 
     Parallel-size fields default to vLLM's single-replica values (1). Callers that
     omit them intentionally get that default; TPU admission still validates TP
-    against the topology's framework device count and rejects coerced bool/float
-    spellings.
+    against the topology's physical chips × generation TP multiplier and rejects
+    coerced bool/float spellings.
     """
 
     accelerator_type: Optional[str] = None
-    accelerator_config: Optional["AcceleratorConfig"] = None
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     data_parallel_size: int = 1
@@ -285,20 +265,15 @@ class TPUConfig(AcceleratorConfig):
     topology: Optional[str] = Field(
         default=None,
         description=(
-            "Physical TPU topology string (e.g. '4x4', '2x4', '2x2x2'). Required for "
-            "topology-backed TPU batch inference. Ambiguous shapes such as v6e '2x4' "
-            "use Ray's default chips-per-VM resolution unless chips_per_vm is set."
+            "Physical TPU topology string (e.g. '4x4'). Required for "
+            "topology-backed TPU batch inference."
         ),
     )
     chips_per_vm: Optional[int] = Field(
         default=None,
         description=(
-            "Optional override for physical chips per TPU VM on ambiguous "
-            "provisionings such as v6e '2x4' (default 8 chips / 1 VM, or 4 chips / "
-            "2 VMs). This requests a physical realization that must match how the "
-            "cluster is provisioned; SlicePG head reservation does not yet make "
-            "selection deterministic in a mixed cluster. When omitted, Ray's "
-            "default chips-per-host rules apply."
+            "Optional physical chips-per-VM override for TPU topologies with "
+            "multiple supported VM packings. Must match cluster provisioning."
         ),
     )
 
@@ -601,13 +576,13 @@ class TPUAccelerator(AcceleratorBackend):
         # Serve passes TP×PP as num_devices (framework devices). Convert to
         # physical chips before packing hosts so v7x (2 devices/chip) and
         # chips_per_vm overrides share one physical host model.
-        framework_devices_per_chip = self._resolve_framework_devices_per_chip(version)
-        if num_devices % framework_devices_per_chip != 0:
+        tp_multiplier = _vllm_tp_multiplier(version)
+        if num_devices % tp_multiplier != 0:
             raise ValueError(
                 f"num_devices ({num_devices}) must be a multiple of "
-                f"framework_devices_per_chip ({framework_devices_per_chip}) for {version}."
+                f"the vLLM TP multiplier ({tp_multiplier}) for {version}."
             )
-        num_chips = num_devices // framework_devices_per_chip
+        num_chips = num_devices // tp_multiplier
 
         if num_chips > chips_per_host and num_chips % chips_per_host != 0:
             raise ValueError(
@@ -774,13 +749,14 @@ class TPUAccelerator(AcceleratorBackend):
         # both the parent actor and every TPU worker, including single-VM shapes.
         return "ray"
 
-    def _derive_layout(
+    def _resolve_slice_layout(
         self,
+        *,
         topology: str,
-        accelerator_type: str,
+        accelerator_version: str,
         chips_per_vm: Optional[int] = None,
-    ) -> TPUReplicaLayout:
-        """Derive physical VM layout and framework device counts for one replica."""
+    ) -> _TPUSliceLayout:
+        """Resolve the physical TPU slice layout for one replica."""
         # Match SlicePlacementGroup / node-label discovery: topology strings are
         # compared as exact node labels, so Batch must store the canonical form.
         if not isinstance(topology, str):
@@ -791,43 +767,22 @@ class TPUAccelerator(AcceleratorBackend):
         if not canonical_topology:
             raise ValueError("TPU topology must be non-empty.")
 
-        accel_version = get_tpu_version_from_type(accelerator_type)
         total_chips = get_num_chips_from_topology(canonical_topology)
-        default_chips_per_vm = get_chips_per_host(canonical_topology, accel_version)
+        default_chips_per_vm = get_chips_per_host(
+            canonical_topology, accelerator_version
+        )
         resolved_chips_per_vm = self._resolve_chips_per_vm(
             chips_per_vm,
             topology=canonical_topology,
-            accelerator_version=accel_version,
+            accelerator_version=accelerator_version,
             total_chips=total_chips,
             default_chips_per_vm=default_chips_per_vm,
         )
-        num_vms = total_chips // resolved_chips_per_vm
-        framework_devices_per_chip = self._resolve_framework_devices_per_chip(
-            accel_version
-        )
-        return TPUReplicaLayout(
+        return _TPUSliceLayout(
             topology=canonical_topology,
-            accelerator_type=accelerator_type,
-            accelerator_version=accel_version,
             total_chips=total_chips,
             chips_per_vm=resolved_chips_per_vm,
-            num_vms=num_vms,
-            framework_devices_per_chip=framework_devices_per_chip,
         )
-
-    @staticmethod
-    def _resolve_framework_devices_per_chip(accelerator_version: str) -> int:
-        """Framework-visible devices per physical chip for vLLM TP sizing.
-
-        This is the vLLM/framework execution-device count, not the TPU core
-        count Ray uses for pod-type naming (e.g. v4-8). Among currently
-        accepted generations, only v7x exposes two framework devices per
-        physical chip; every other generation maps one chip to one device.
-        Independent of ``RAY_TPU_RESOURCE_PER_CHIP``.
-        """
-        if accelerator_version.strip().lower() == "v7x":
-            return 2
-        return 1
 
     @staticmethod
     def _resolve_chips_per_vm(
@@ -906,7 +861,7 @@ class TPUAccelerator(AcceleratorBackend):
     def _resolve_batch_worker_bundle(
         self,
         placement_group_config: Optional[Dict[str, Any]],
-        layout: TPUReplicaLayout,
+        layout: _TPUSliceLayout,
     ) -> Dict[str, float]:
         """Resolve the homogeneous TPU worker-resource template for Batch.
 
@@ -948,7 +903,7 @@ class TPUAccelerator(AcceleratorBackend):
         return self._apply_batch_cpu_floor(worker_bundle)
 
     @staticmethod
-    def _validate_tpu_per_bundle(tpu_per_bundle: Any, layout: TPUReplicaLayout) -> int:
+    def _validate_tpu_per_bundle(tpu_per_bundle: Any, layout: _TPUSliceLayout) -> int:
         """Reject TPU granularities that cannot land evenly on each physical VM."""
         if isinstance(tpu_per_bundle, bool) or not isinstance(
             tpu_per_bundle, (int, float)
@@ -978,7 +933,7 @@ class TPUAccelerator(AcceleratorBackend):
     def _validate_batch_tpu_template_bundles(
         self,
         bundles: List[Dict[str, float]],
-        layout: TPUReplicaLayout,
+        layout: _TPUSliceLayout,
     ) -> None:
         """Reject invalid Batch templates before shared fallback can mask them."""
         for bundle in bundles:
@@ -995,7 +950,7 @@ class TPUAccelerator(AcceleratorBackend):
     def _resolve_batch_slice_strategy(
         *,
         requested_strategy: str,
-        layout: TPUReplicaLayout,
+        layout: _TPUSliceLayout,
         num_bundles: int,
     ) -> str:
         """Enforce topology-safe SlicePG strategies for Batch execution layouts."""
@@ -1027,11 +982,7 @@ class TPUAccelerator(AcceleratorBackend):
         self, request: BatchSchedulingRequest
     ) -> AcquiredBatchResources:
         """Construct the TPU batch scheduling plan with atomic slice acquisition."""
-        tpu_config = (
-            request.accelerator_config
-            if isinstance(request.accelerator_config, TPUConfig)
-            else self._config
-        )
+        tpu_config = self._config
         if not isinstance(tpu_config, TPUConfig) or not tpu_config.topology:
             raise ValueError(
                 "TPU batch inference requires an explicit `accelerator_config` with "
@@ -1039,10 +990,6 @@ class TPUAccelerator(AcceleratorBackend):
                 "(e.g. {'kind': 'tpu', 'topology': '4x4'}). "
                 f"Got config: {tpu_config}"
             )
-
-        # Keep the backend config topology in sync with the request (Serve may
-        # construct TPUAccelerator once; Batch always passes the request config).
-        self._config = tpu_config
 
         # The bundle layout below assumes one Ray TPU resource per physical chip.
         raw_driver_rpc = os.environ.get(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
@@ -1071,6 +1018,7 @@ class TPUAccelerator(AcceleratorBackend):
                 f"Unknown or unsupported TPU accelerator type: {request.accelerator_type!r}. "
                 f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
             )
+        version = get_tpu_version_from_type(canonical_accel)
 
         # engine_kwargs are free-form, so bool/float spellings of 1 (True, 1.0)
         # must be rejected the same way concurrency is — before the == 1 checks.
@@ -1080,18 +1028,20 @@ class TPUAccelerator(AcceleratorBackend):
         )
         dp = _require_positive_int(request.data_parallel_size, "data_parallel_size")
 
-        layout = self._derive_layout(
-            tpu_config.topology,
-            canonical_accel,
+        layout = self._resolve_slice_layout(
+            topology=tpu_config.topology,
+            accelerator_version=version,
             chips_per_vm=tpu_config.chips_per_vm,
         )
 
-        if tp != layout.total_framework_devices:
+        tp_multiplier = _vllm_tp_multiplier(version)
+        expected_tp = layout.total_chips * tp_multiplier
+        if tp != expected_tp:
             raise ValueError(
                 f"tensor_parallel_size must match the total number of framework "
-                f"devices ({layout.total_framework_devices} = {layout.total_chips} physical "
-                f"chips × {layout.framework_devices_per_chip} device(s)/chip) for topology "
-                f"'{layout.topology}' on {layout.accelerator_version}; got {tp}."
+                f"devices ({expected_tp} = {layout.total_chips} physical "
+                f"chips × {tp_multiplier} device(s)/chip) for topology "
+                f"'{layout.topology}' on {version}; got {tp}."
             )
         if pp != 1:
             raise ValueError(
@@ -1144,7 +1094,7 @@ class TPUAccelerator(AcceleratorBackend):
 
         expected_num_bundles, expected_bundle_resources = get_tpu_worker_resources(
             topology=layout.topology,
-            accelerator_type=layout.accelerator_type,
+            accelerator_type=canonical_accel,
             resources_per_worker=resources_per_bundle,
             num_slices=1,
             chips_per_vm=layout.chips_per_vm,
@@ -1164,12 +1114,12 @@ class TPUAccelerator(AcceleratorBackend):
         bundle_label_selector = None
         if layout.is_single_vm:
             pod_type = infer_tpu_pod_type_from_topology(
-                layout.topology, layout.accelerator_type
+                layout.topology, canonical_accel
             )
             if not pod_type:
                 raise ValueError(
                     f"Failed to infer TPU pod type for topology '{layout.topology}' "
-                    f"and accelerator_type '{layout.accelerator_type}'."
+                    f"and accelerator_type '{canonical_accel}'."
                 )
             selector = {
                 _raylet.RAY_NODE_TPU_TOPOLOGY_KEY: layout.topology,
@@ -1185,7 +1135,7 @@ class TPUAccelerator(AcceleratorBackend):
 
         try:
             handle = self._create_slice_pg_handle(
-                accelerator_type=layout.accelerator_type,
+                accelerator_type=canonical_accel,
                 resources_per_bundle=resources_per_bundle,
                 strategy=strategy,
                 bundle_label_selector=bundle_label_selector,
@@ -1198,7 +1148,7 @@ class TPUAccelerator(AcceleratorBackend):
             except ray.exceptions.GetTimeoutError as exc:
                 raise TimeoutError(
                     f"Timed out after {timeout_s}s waiting for TPU slice placement "
-                    f"group readiness. Requested {layout.accelerator_type} "
+                    f"group readiness. Requested {canonical_accel} "
                     f"topology={layout.topology} ({layout.num_vms} VMs, "
                     f"{expected_num_bundles} bundles). This usually means the "
                     "cluster has no intact topology of that shape available. Set "
@@ -1261,7 +1211,7 @@ class TPUAccelerator(AcceleratorBackend):
 
 def _validate_reserved_layout(
     handle: Any,
-    layout: TPUReplicaLayout,
+    layout: _TPUSliceLayout,
     *,
     expected_num_bundles: int,
     expected_bundle_resources: Dict[str, float],
@@ -1289,8 +1239,8 @@ def _validate_reserved_layout(
         )
     # SlicePlacementGroup.devices_per_host represents Ray logical TPU
     # resources per host. With RAY_TPU_RESOURCE_PER_CHIP=1 this equals
-    # the physical chip count; it is independent of framework devices
-    # (TPUReplicaLayout.framework_devices_per_chip / total_framework_devices).
+    # the physical chip count; it is independent of vLLM TP sizing
+    # (the vLLM TP multiplier), which is a framework execution concern.
     if getattr(handle, "devices_per_host", None) != layout.chips_per_vm:
         raise RuntimeError(
             f"Reserved SlicePlacementGroup reports {handle.devices_per_host} devices "
@@ -1331,7 +1281,7 @@ def _validate_reserved_layout(
 
 
 def _validate_multihost_slice_identity(
-    handle: Any, layout: TPUReplicaLayout
+    handle: Any, layout: _TPUSliceLayout
 ) -> List[Dict[str, Any]]:
     """Validate multi-host slice-name identity and per-node TPU capacity via GCS."""
     label_selectors = getattr(handle, "bundle_label_selector", [])

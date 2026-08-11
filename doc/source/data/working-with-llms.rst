@@ -17,7 +17,6 @@ The :ref:`ray.data.llm <llm-ref>` module enables scalable batch inference on Ray
 * :ref:`Embeddings <embedding_models>` - Generate text embeddings
 * :ref:`Classification <classification_models>` - Content classifiers and sentiment analyzers
 * :ref:`Multimodality <multimodal>` - Batch inference with VLM / omni models on multimodal data
-* :ref:`TPU batch inference <tpu_batch_inference>` - Batch inference on Google Cloud TPUs
 * :ref:`OpenAI-compatible endpoints <openai_compatible_api_endpoint>` - Query deployed models
 * :ref:`Serve deployments <serve_deployments>` - Share vLLM engines across processors
 * :ref:`Custom tokenizers <custom_tokenizers>` - Use vLLM tokenizers for models not supported by HuggingFace
@@ -341,96 +340,6 @@ Key differences for classification models:
 - Set ``chat_template_stage=False`` and ``detokenize_stage=False``
 - Use direct ``prompt`` input instead of ``messages``
 - Access classification logits through ``row["embeddings"]``
-
-.. _tpu_batch_inference:
-
-TPU batch inference
--------------------
-
-.. note::
-    TPU batch inference is available as an **alpha** feature.
-
-Ray Data LLM runs a vLLM model replica across a complete TPU topology (one or more
-TPU VMs). Set ``accelerator_type`` to your TPU generation and pass
-``accelerator_config`` as a dict with ``kind="tpu"`` and the slice ``topology``.
-
-``build_processor(...)`` acquires the topology eagerly: it creates the slice
-placement group and may block while capacity is scheduled or provisioned. This
-differs from the GPU path, where placement-group creation remains lazy through
-Ray Data's worker creation path. The processor holds the reservation for as long
-as it is open, so every worker lands on the same intact topology.
-
-.. code-block:: python
-
-    import ray
-    from ray.data.llm import build_processor, vLLMEngineProcessorConfig
-
-    config = vLLMEngineProcessorConfig(
-        model_source="meta-llama/Llama-3.1-8B-Instruct",
-        accelerator_type="TPU-V6E",
-        accelerator_config={"kind": "tpu", "topology": "4x4"},
-        concurrency=1,
-        engine_kwargs={
-            "tensor_parallel_size": 16,
-            "pipeline_parallel_size": 1,
-            "data_parallel_size": 1,
-        },
-    )
-
-    ds = ray.data.from_items([
-        {"prompt": "What is the capital of France?"},
-        {"prompt": "Explain general relativity in simple terms."},
-    ])
-
-    with build_processor(config) as processor:
-        results = processor(ds).materialize()
-
-    for row in results.take_all():
-        print(row)
-
-The processor holds the TPU slice for as long as it's open. Leaving the context
-manager, or calling ``processor.close()``, requests release of the slice placement
-group and rejects later calls to the processor. Ray logs placement-group removal
-failures; driver exit remains the fallback fate-sharing boundary. Materialize every
-Dataset the processor produces before you close it.
-
-This alpha release runs one model replica on one complete TPU topology:
-
-- ``concurrency`` must be the integer ``1``. Autoscaling and multi-replica TPU pools
-  aren't supported.
-- ``tensor_parallel_size`` must equal the topology's framework device count.
-  For v6e that equals the physical chip count (``16`` for ``4x4``, ``8`` for
-  ``2x4``). Generations with multiple devices per chip (for example Ironwood
-  v7x) require ``tensor_parallel_size = chips × framework_devices_per_chip``.
-- ``pipeline_parallel_size`` and ``data_parallel_size`` must both be ``1``.
-- The topology resolves through Ray's default chips-per-VM rules into one or more
-  TPU VMs. A single-host shape such as v6e ``2x4`` becomes one VM with eight chips
-  by default; a multi-host shape such as v6e ``4x4`` becomes four VMs with four
-  chips each. For the ambiguous v6e ``2x4`` provisioning, pass
-  ``chips_per_vm`` in ``accelerator_config`` — for example
-  ``{"kind": "tpu", "topology": "2x4", "chips_per_vm": 4}`` requests two 4-chip
-  VMs instead of one 8-chip VM. The cluster must be provisioned that way;
-  reserved-layout validation rejects a mismatch, but SlicePG head reservation
-  is not yet deterministic in a mixed 1×8 / 2×4 cluster.
-- By default, Ray Data creates one SlicePG bundle per TPU VM (for example v6e
-  ``4x4`` → four bundles with ``TPU:4``). Use ``placement_group_config`` with a
-  homogeneous worker-resource template to change executor granularity while
-  keeping the same physical topology — for example
-  ``{"bundle_per_worker": {"TPU": 1}}`` creates one bundle per chip
-  (v6e ``4x4`` → 16 bundles). The template length is not authoritative for TPU;
-  topology and TPU-per-bundle determine the SlicePG bundle count. Ray Data may
-  raise the per-bundle CPU reservation so the engine parent can sit in bundle 0,
-  but never lowers an explicit CPU request. Topology-backed TPU templates must
-  be homogeneous. PACK is the default TPU placement strategy; single-VM
-  multi-bundle layouts are strengthened to STRICT_PACK so every bundle stays on
-  the same physical TPU VM.
-- TPU Batch currently fixes Ray's TPU resource-per-chip setting to ``1`` and
-  rejects conflicting driver or runtime-environment values. Ironwood (v7x)
-  hardware qualification must still measure whether Ray advertises one or two
-  ``TPU`` resources per physical chip before that setting is widened.
-- Ray Data selects vLLM's Ray executor for both single-host and multi-host topologies.
-  Don't override ``distributed_executor_backend``.
-- Run one Dataset at a time per processor.
 
 .. _openai_compatible_api_endpoint:
 
