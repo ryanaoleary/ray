@@ -534,20 +534,12 @@ class TestAcceleratorConfigLogic:
 
     def test_default_bundles_and_create_pg_forward_chips_per_vm(self, monkeypatch):
         """TPUConfig.chips_per_vm reaches SlicePG from Serve default_bundles/create_pg."""
-        slice_kwargs = []
+        import ray.llm._internal.common.accelerators as accelerators_mod
 
-        def fake_slice(**kwargs):
-            slice_kwargs.append(kwargs)
-
-            class _Handle:
-                placement_group = object()
-
-            return _Handle()
-
-        monkeypatch.setattr(
-            "ray.llm._internal.common.accelerators.slice_placement_group",
-            fake_slice,
+        create = MagicMock(
+            return_value=MagicMock(placement_group=object())
         )
+        monkeypatch.setattr(accelerators_mod, "slice_placement_group", create)
         backend = TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4))
         bundles = backend.default_bundles(num_devices=8, accelerator_type_str="TPU-V6E")
         assert len(bundles) == 2
@@ -558,8 +550,9 @@ class TestAcceleratorConfigLogic:
             name="serve-pg",
             accelerator_type_str="TPU-V6E",
         )
-        assert slice_kwargs[0]["chips_per_vm"] == 4
-        assert slice_kwargs[0]["resources_per_bundle"]["TPU"] == 4
+        slice_kwargs = create.call_args.kwargs
+        assert slice_kwargs["chips_per_vm"] == 4
+        assert slice_kwargs["resources_per_bundle"]["TPU"] == 4
 
 
 class TestCheckpointInfo:
