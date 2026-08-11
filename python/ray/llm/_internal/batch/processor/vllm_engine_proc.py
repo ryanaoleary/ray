@@ -42,12 +42,10 @@ from ray.llm._internal.batch.stages.configs import (
 from ray.llm._internal.common.accelerators import (
     CPU_ACCELERATOR_TYPE_LITERAL,
     TPU_ACCELERATOR_VALUES,
-    AcceleratorBackend,
+    AcceleratorConfig,
     AnyAcceleratorConfig,
     CPUConfig,
-    GPUAccelerator,
     GPUConfig,
-    TPUAccelerator,
     TPUConfig,
     get_accelerator_backend,
     normalize_tpu_accelerator_type,
@@ -202,17 +200,22 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         return validated.model_dump(exclude_unset=True)
 
 
-def _resolve_batch_accelerator_backend(
+def _default_batch_accelerator_config(
     config: "vLLMEngineProcessorConfig",
-) -> AcceleratorBackend:
-    """Select the Batch accelerator backend from config / accelerator_type."""
-    if isinstance(config.accelerator_config, TPUConfig):
-        return TPUAccelerator(config.accelerator_config)
+) -> AcceleratorConfig:
+    """Fill omitted ``accelerator_config`` for Batch backend selection.
+
+    Scheduling is backend-specific (GPU PG vs single-host TPU resources vs
+    topology SlicePG). Placement resources alone cannot select SlicePG; that
+    requires ``accelerator_config.topology``. When the field is omitted, infer
+    single-host ``TPUConfig()`` from a TPU ``accelerator_type``, else GPU.
+    Compatibility is enforced by ``_validate_accelerator``.
+    """
+    if config.accelerator_config is not None:
+        return config.accelerator_config
     if config.accelerator_type and config.accelerator_type.startswith("TPU"):
-        return TPUAccelerator(TPUConfig())
-    if config.accelerator_config is None:
-        return GPUAccelerator()
-    return get_accelerator_backend(config.accelerator_config)
+        return TPUConfig()
+    return GPUConfig()
 
 
 def build_vllm_engine_processor(
@@ -362,7 +365,7 @@ def build_vllm_engine_processor(
     pp_size = engine_kwargs.get("pipeline_parallel_size", 1)
     dp_size = engine_kwargs.get("data_parallel_size", 1)
 
-    backend = _resolve_batch_accelerator_backend(config)
+    backend = get_accelerator_backend(_default_batch_accelerator_config(config))
 
     telemetry_agent = get_or_create_telemetry_agent()
     telemetry_agent.push_telemetry_report(

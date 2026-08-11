@@ -100,11 +100,27 @@ def test_tpu_config_single_host_vs_topology():
         )
 
 
-def test_omitted_accelerator_config_defaults_to_gpu_backend():
-    cfg = vLLMEngineProcessorConfig(model_source="m")
-    assert cfg.accelerator_config is None
+def test_omitted_accelerator_config_defaults_by_accelerator_type():
+    from ray.llm._internal.batch.processor.vllm_engine_proc import (
+        _default_batch_accelerator_config,
+    )
+
+    gpu_cfg = vLLMEngineProcessorConfig(model_source="m")
+    assert gpu_cfg.accelerator_config is None
+    assert isinstance(_default_batch_accelerator_config(gpu_cfg), GPUConfig)
     assert isinstance(
-        get_accelerator_backend(cfg.accelerator_config or GPUConfig()), GPUAccelerator
+        get_accelerator_backend(_default_batch_accelerator_config(gpu_cfg)),
+        GPUAccelerator,
+    )
+
+    tpu_cfg = vLLMEngineProcessorConfig(
+        model_source="m", accelerator_type="TPU-V6E"
+    )
+    assert tpu_cfg.accelerator_config is None
+    assert isinstance(_default_batch_accelerator_config(tpu_cfg), TPUConfig)
+    assert isinstance(
+        get_accelerator_backend(_default_batch_accelerator_config(tpu_cfg)),
+        TPUAccelerator,
     )
 
 
