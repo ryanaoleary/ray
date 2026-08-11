@@ -153,11 +153,9 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             ``tp*pp``) or ``bundles``, and optionally ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). Defaults
             to ``PACK`` when omitted.
-        accelerator_config: Optional accelerator configuration for the LLM stage.
-            For TPU with a topology, pass ``{"topology": "4x4"}`` (optional
-            ``chips_per_vm``). A TPU ``accelerator_type`` alone uses single-host
-            TPU resource scheduling. When omitted with a non-TPU
-            ``accelerator_type``, GPU behavior is preserved.
+        accelerator_config: Optional accelerator backend configuration
+            (discriminated by ``kind``). When omitted, the backend is inferred
+            from ``accelerator_type`` (GPU by default).
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy
