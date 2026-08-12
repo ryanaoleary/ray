@@ -160,6 +160,11 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
         accelerator_config: Hardware-specific configuration. For topology-backed
             TPU Batch use ``{'kind': 'tpu', 'topology': '4x4'}`` (optional
             ``chips_per_vm`` for ambiguous topologies such as v6e ``2x4``).
+            ``tensor_parallel_size`` must equal the topology chip count, and
+            topology-backed Batch requires ``concurrency=1`` (or ``(1, 1)``),
+            ``pipeline_parallel_size=1``, and ``data_parallel_size=1``. Prefer
+            ``with build_processor(config) as processor:`` and materialize every
+            derived Dataset before exiting the block so the slice is released.
             Omit or use a GPU config for GPU scheduling.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,

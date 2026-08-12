@@ -99,14 +99,13 @@ def test_llm_serve_default_placement_strategy(tp_size, pp_size):
 def test_llm_serve_placement_group_validation():
     """Test validation of placement group configurations."""
 
-    # Test missing both bundle_per_worker and bundles
-    with pytest.raises(
-        ValueError, match="must specify either 'bundle_per_worker' or 'bundles'"
-    ):
-        llm_config = get_llm_config_with_placement_group(
-            placement_group_config={"strategy": "PACK"}
-        )
-        LLMServer.get_deployment_options(llm_config)
+    # Strategy-only configs fall through to accelerator default bundles.
+    llm_config = get_llm_config_with_placement_group(
+        placement_group_config={"strategy": "PACK"}
+    )
+    serve_options = LLMServer.get_deployment_options(llm_config)
+    assert serve_options["placement_group_strategy"] == "PACK"
+    assert len(serve_options["placement_group_bundles"]) >= 1
 
     # Test missing strategy (should default to PACK, not fail)
     llm_config = get_llm_config_with_placement_group(

@@ -73,9 +73,6 @@ class PlacementGroupConfig(BaseModelExtended):
                 "per-worker resource specification (auto-replicated by tp*pp), "
                 "or 'bundles' for full control."
             )
-        if self.bundle_per_worker is None and self.bundles is None:
-            raise ValueError(
-                "placement_group_config must specify either 'bundle_per_worker' "
-                "or 'bundles'."
-            )
+        # Strategy-only configs are allowed: consumers supply default bundles
+        # (Serve/GPU accelerator defaults; TPU Batch uses the CPU floor template).
         return self

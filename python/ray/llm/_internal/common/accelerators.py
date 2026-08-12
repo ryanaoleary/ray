@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import math
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -69,6 +70,17 @@ TPU_ACCELERATOR_VALUES = {
 def normalize_tpu_accelerator_type(accelerator_type_str: str) -> str:
     """Normalize a TPU accelerator type string to uppercase standard form."""
     return accelerator_type_str.strip().upper().replace("_", "-")
+
+
+def validate_tpu_accelerator_type(value: str) -> str:
+    """Normalize and validate a TPU accelerator type; raise ValueError if unknown."""
+    canonical = normalize_tpu_accelerator_type(value)
+    if canonical not in TPU_ACCELERATOR_VALUES:
+        raise ValueError(
+            f"Unknown or unsupported TPU accelerator type: {value!r}. "
+            f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
+        )
+    return canonical
 
 
 def format_ray_accelerator_resource(accelerator_type_str: str) -> str:
@@ -155,9 +167,20 @@ class TPUConfig(AcceleratorConfig):
                 "chips_per_vm must be a positive integer; "
                 f"got {self.chips_per_vm!r}."
             )
-        if self.chips_per_vm is not None and self.topology is not None:
-            total_chips = get_num_chips_from_topology(self.topology)
-            if total_chips % self.chips_per_vm != 0:
+        if self.topology is not None:
+            try:
+                total_chips = get_num_chips_from_topology(self.topology)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid TPU topology {self.topology!r}. Expected a chip "
+                    f"topology such as '4x4' or '2x2x1'."
+                ) from exc
+            if total_chips <= 0:
+                raise ValueError(
+                    f"Invalid TPU topology {self.topology!r}. Expected a chip "
+                    f"topology such as '4x4' or '2x2x1'."
+                )
+            if self.chips_per_vm is not None and total_chips % self.chips_per_vm != 0:
                 raise ValueError(
                     f"chips_per_vm ({self.chips_per_vm}) must divide the topology "
                     f"chip count ({total_chips} for '{self.topology}')."
@@ -483,13 +506,45 @@ class TPUAccelerator(AcceleratorBackend):
                 dict(bundle) for bundle in placement_group_config["bundles"]
             ]
         else:
-            raise ValueError(
-                "placement_group_config must specify bundle_per_worker or bundles."
-            )
+            # Strategy-only (or empty) config: use the default CPU-floor template.
+            return {"CPU": cpu_floor}
         if not source_bundles:
             raise ValueError(
                 "placement_group_config bundles must be non-empty when provided."
             )
+
+        # Validate resource types before any numeric comparisons.
+        for bundle in source_bundles:
+            gpu = bundle.get("GPU", 0)
+            if (
+                isinstance(gpu, bool)
+                or not isinstance(gpu, (int, float))
+                or not math.isfinite(gpu)
+            ):
+                raise ValueError(
+                    f"GPU resources per bundle must be a finite number; got {gpu!r}."
+                )
+            if gpu > 0:
+                raise ValueError(
+                    "GPU resources are not supported in TPU Batch "
+                    f"placement_group_config bundles; got GPU={bundle['GPU']!r}."
+                )
+            if "TPU" in bundle:
+                tpu = bundle["TPU"]
+                if (
+                    isinstance(tpu, bool)
+                    or not isinstance(tpu, (int, float))
+                    or not math.isfinite(tpu)
+                ):
+                    raise ValueError(
+                        "TPU resources per bundle must be a positive integer; "
+                        f"got {tpu!r}."
+                    )
+                if float(tpu) != int(tpu) or int(tpu) <= 0:
+                    raise ValueError(
+                        "TPU resources per bundle must be a positive integer; "
+                        f"got {tpu!r}."
+                    )
 
         has_positive_tpu = [bundle.get("TPU", 0) > 0 for bundle in source_bundles]
         if any(has_positive_tpu) and not all(has_positive_tpu):
@@ -498,23 +553,16 @@ class TPUAccelerator(AcceleratorBackend):
                 "and non-TPU bundles."
             )
 
-        for bundle in source_bundles:
-            if bundle.get("GPU", 0) > 0:
-                raise ValueError(
-                    "GPU resources are not supported in TPU Batch "
-                    f"placement_group_config bundles; got GPU={bundle['GPU']!r}."
-                )
-            if "TPU" not in bundle:
-                continue
-            tpu = bundle["TPU"]
-            if isinstance(tpu, bool) or not isinstance(tpu, (int, float)):
-                raise ValueError(
-                    f"TPU resources per bundle must be a positive number; got {tpu!r}."
-                )
-            if float(tpu) != int(tpu) or int(tpu) <= 0:
-                raise ValueError(
-                    f"TPU resources per bundle must be a positive integer; got {tpu!r}."
-                )
+        if len(source_bundles) > 1:
+            logger.warning(
+                "placement_group_config specified %d bundles, but topology-backed TPU "
+                "scheduling derives the bundle count from topology %r. Using bundles[0] "
+                "as a homogeneous per-worker template; the extra %d entries only "
+                "participate in the homogeneity check.",
+                len(source_bundles),
+                self._config.topology,
+                len(source_bundles) - 1,
+            )
 
         if any(has_positive_tpu):
             worker_bundle = dict(source_bundles[0])
@@ -582,12 +630,7 @@ class TPUAccelerator(AcceleratorBackend):
             raise ValueError(
                 "`accelerator_type` (e.g. 'TPU-V6E') is required for TPU batch inference."
             )
-        canonical_accel = normalize_tpu_accelerator_type(accelerator_type)
-        if canonical_accel not in TPU_ACCELERATOR_VALUES:
-            raise ValueError(
-                f"Unknown or unsupported TPU accelerator type: {accelerator_type!r}. "
-                f"Supported TPU types: {sorted(TPU_ACCELERATOR_VALUES)}."
-            )
+        canonical_accel = validate_tpu_accelerator_type(accelerator_type)
         version = get_tpu_version_from_type(canonical_accel)
 
         engine_kwargs.setdefault("distributed_executor_backend", "ray")
@@ -663,6 +706,11 @@ class TPUAccelerator(AcceleratorBackend):
                     f"topology={topology} ({handle.num_hosts} hosts, "
                     f"{handle.num_bundles} bundles)."
                 ) from exc
+            # Head PGs are temporary reservation markers that atomically claim a
+            # slice label before the worker PG is scheduled. Once the worker PG is
+            # ready they are redundant; releasing them here frees those markers for
+            # other jobs. Serve's create_placement_group path does not call this
+            # today (pre-existing asymmetry — Batch readiness is eager at build time).
             handle.release_head_pgs()
         except Exception:
             try:
@@ -685,6 +733,12 @@ class TPUAccelerator(AcceleratorBackend):
             self._slice_pg_wrapper = None
 
         map_batches_kwargs = {
+            # Bundle 0 CPU is sized exactly for the Ray Data engine actor + user
+            # map work. This is only safe because vLLM's Ray TPU executor requests
+            # num_cpus=0 for its workers (verified against vLLM 0.26.0,
+            # vllm/v1/executor/ray_executor.py non-GPU branch). If that changes,
+            # child tasks captured into this PG will queue forever rather than
+            # fail loudly.
             "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
             "num_gpus": 0,
             "resources": {},

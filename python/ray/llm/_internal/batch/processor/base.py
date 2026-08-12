@@ -1,5 +1,6 @@
 import logging
 import threading
+import weakref
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
@@ -353,6 +354,12 @@ class Processor:
         self._close_fn = close_fn
         self._closed = False
         self._lock = threading.Lock()
+        self._finalizer = None
+        if close_fn is not None:
+            # Do not close over self — that would make the object immortal.
+            self._finalizer = weakref.finalize(
+                self, Processor._warn_unclosed, close_fn, type(self).__name__
+            )
 
         # NOTE (Kourosh): If pre/postprocess is not provided, use the identity function.
         # Wrapping is required even if they are identity functions, b/c data_column
@@ -377,14 +384,34 @@ class Processor:
         for stage in stages:
             self._append_stage(stage)
 
+    @staticmethod
+    def _warn_unclosed(close_fn: Callable[[], None], cls_name: str) -> None:
+        try:
+            logger.warning(
+                "%s was garbage-collected without close(). Driver-owned accelerator "
+                "resources (e.g. a TPU slice placement group) were still held. Use "
+                "`with build_processor(cfg) as p:` or call p.close() after materializing "
+                "all derived Datasets. Attempting release now.",
+                cls_name,
+            )
+            close_fn()
+        except Exception:
+            try:
+                logger.exception("Failed to release resources during finalization.")
+            except Exception:
+                # Interpreter shutdown can tear down logging before this runs.
+                pass
+
     def close(self) -> None:
         """Mark this processor closed and release any driver-owned resources.
 
+        Callers must materialize every derived Dataset before calling close(); the
+        lock only serializes the closed-flag check, it cannot prevent execution of a
+        Dataset graph that was constructed earlier.
+
         ``_close_fn`` is cleared only after a successful call so a failed
-        shutdown can be retried. The closed flag is set under the same lock
-        used by ``__call__``'s closed-check so concurrent close/execute cannot
-        race on the flag. Callers must still materialize every derived Dataset
-        before closing.
+        shutdown can be retried. The finalizer is detached only after a successful
+        close so a failed close still has GC safety-net coverage.
         """
         with self._lock:
             self._closed = True
@@ -392,6 +419,9 @@ class Processor:
                 return
             self._close_fn()
             self._close_fn = None
+            if self._finalizer is not None:
+                self._finalizer.detach()
+                self._finalizer = None
 
     def __enter__(self) -> "Processor":
         return self

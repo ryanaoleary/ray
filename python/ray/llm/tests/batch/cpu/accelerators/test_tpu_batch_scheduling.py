@@ -7,6 +7,9 @@ config validation, placement kwargs, and processor lifecycle.
 
 from typing import Any, Dict, Optional
 from unittest.mock import MagicMock
+import gc
+import inspect
+import logging
 
 import pytest
 
@@ -27,6 +30,8 @@ from ray.llm._internal.common.accelerators import (
     get_accelerator_backend,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.placement_group import PlacementGroup
+from ray.util.tpu import SlicePlacementGroup, slice_placement_group
 
 _CPU_FLOOR = PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST
 
@@ -58,8 +63,8 @@ def _schedule(
 def stub_slice_pg(monkeypatch):
     """Stub TPU placement create/wait; keep Batch validation and builder real."""
     monkeypatch.setenv(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-    handle = MagicMock(name="slice_pg_handle")
-    handle.placement_group = MagicMock(name="placement_group")
+    handle = MagicMock(spec=SlicePlacementGroup)
+    handle.placement_group = MagicMock(spec=PlacementGroup)
     handle.num_hosts = 4
     handle.num_bundles = 4
     create = MagicMock(return_value=handle)
@@ -97,7 +102,23 @@ def _topo_config(**kwargs):
                 "accelerator_config": {"kind": "tpu", "topology": "4x4"},
                 "concurrency": 2,
             },
-            "concurrency=1",
+            "concurrency=1 or \\(1, 1\\)",
+        ),
+        (
+            {
+                "accelerator_type": "TPU-V6E",
+                "accelerator_config": {"kind": "tpu", "topology": "4x4"},
+                "concurrency": (1, 2),
+            },
+            "concurrency=1 or \\(1, 1\\)",
+        ),
+        (
+            {
+                "accelerator_type": "TPU-V6E",
+                "accelerator_config": {"kind": "tpu", "topology": "4x4"},
+                "concurrency": (2, 2),
+            },
+            "concurrency=1 or \\(1, 1\\)",
         ),
         (
             {
@@ -156,6 +177,8 @@ def test_omitted_accelerator_config_defaults_to_gpu():
         ("2x4", "TPU-V6E", 8, 4, 1, None, "SPREAD"),
         ("2x4", "TPU-V6E", 8, 4, 1, "STRICT_PACK", "STRICT_PACK"),
         ("2x4", "TPU-V6E", 8, 4, 1, "PACK", "PACK"),
+        ("2x4", "TPU-V6E", 8, 4, 1, "SPREAD", "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 4, 1, "STRICT_SPREAD", "STRICT_SPREAD"),
         ("2x4", "TPU-V6E", 8, None, None, None, "SPREAD"),
         ("2x4", "TPU-V6E", 8, None, 1, None, "SPREAD"),
     ],
@@ -191,6 +214,8 @@ def test_topology_forwards_slice_pg_kwargs(
     assert kwargs["num_cpus"] == _CPU_FLOOR
 
     slice_kwargs = create.call_args.kwargs
+    # Contract test: stubbed kwargs must bind against the real Ray API.
+    inspect.signature(slice_placement_group).bind(**slice_kwargs)
     assert slice_kwargs["topology"] == topology
     assert slice_kwargs["strategy"] == expect_strategy
     resources = slice_kwargs["resources_per_bundle"]
@@ -438,25 +463,6 @@ def test_eager_timeout_shuts_down_before_head_release(stub_slice_pg, monkeypatch
     handle.release_head_pgs.assert_not_called()
 
 
-def test_builder_pins_bundle_zero_and_close_releases(stub_slice_pg):
-    handle, _ = stub_slice_pg
-    processor = build_processor(
-        _topo_config(engine_kwargs={"tensor_parallel_size": 16})
-    )
-    assert isinstance(processor, Processor)
-    stage = processor.get_stage_by_name("vLLMEngineStage")
-    strategy = stage.map_batches_kwargs["scheduling_strategy"]
-    assert isinstance(strategy, PlacementGroupSchedulingStrategy)
-    assert strategy.placement_group_bundle_index == 0
-    assert strategy.placement_group_capture_child_tasks is True
-    assert (
-        stage.fn_constructor_kwargs["engine_kwargs"]["distributed_executor_backend"]
-        == "ray"
-    )
-    processor.close()
-    handle.shutdown.assert_called_once()
-
-
 def test_builder_failure_and_idempotent_close(stub_slice_pg, monkeypatch):
     handle, _ = stub_slice_pg
     real_stage = vllm_engine_proc.vLLMEngineStage
@@ -588,14 +594,6 @@ def test_close_during_call_does_not_deadlock(stub_slice_pg, monkeypatch):
         ),
         (
             {"topology": "4x4"},
-            {
-                "tensor_parallel_size": 16,
-                "placement_group_config": {"strategy": "PACK"},
-            },
-            "must specify bundle_per_worker or bundles",
-        ),
-        (
-            {"topology": "4x4"},
             {"tensor_parallel_size": 8},
             "tensor_parallel_size must be 16",
         ),
@@ -623,3 +621,197 @@ def test_rejects_invalid_topology_inputs(
     with pytest.raises(ValueError, match=match):
         _schedule(TPUAccelerator(TPUConfig(**backend_kwargs)), **option_kwargs)
     create.assert_not_called()
+
+
+@pytest.mark.parametrize("concurrency", [1, (1, 1)])
+def test_concurrency_one_forms_accepted(concurrency):
+    cfg = _topo_config(concurrency=concurrency)
+    assert cfg.concurrency == concurrency
+
+
+def test_strategy_only_pg_config_uses_default_bundle(stub_slice_pg):
+    _, create = stub_slice_pg
+    kwargs, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+        placement_group_config={"strategy": "PACK"},
+    )
+    assert create.call_args.kwargs["strategy"] == "PACK"
+    assert create.call_args.kwargs["resources_per_bundle"] == {"CPU": float(_CPU_FLOOR)}
+    assert kwargs["num_cpus"] == _CPU_FLOOR
+    close_fn()
+
+
+def test_empty_bundles_list_rejected(stub_slice_pg):
+    _, create = stub_slice_pg
+    with pytest.raises(ValueError, match="must be non-empty"):
+        _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+            placement_group_config={"bundles": []},
+        )
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        {"TPU": "4"},
+        {"TPU": None},
+        {"TPU": True},
+        {"TPU": 1.5},
+        {"TPU": 0},
+        {"TPU": -1},
+        {"TPU": float("nan")},
+        {"TPU": float("inf")},
+        {"GPU": "1"},
+        {"GPU": 1},
+    ],
+)
+def test_bundle_resource_type_validation(stub_slice_pg, bundle):
+    _, create = stub_slice_pg
+    with pytest.raises(ValueError):
+        _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+            placement_group_config={"bundle_per_worker": bundle},
+        )
+    create.assert_not_called()
+
+
+def test_multi_bundle_list_warns(stub_slice_pg, caplog):
+    _, create = stub_slice_pg
+    with caplog.at_level(logging.WARNING, logger=accelerators.__name__):
+        _, close_fn = _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+            placement_group_config={
+                "bundles": [{"TPU": 1, "CPU": 2}, {"TPU": 1, "CPU": 2}]
+            },
+        )
+    assert any("specified 2 bundles" in r.message for r in caplog.records)
+    close_fn()
+    create.assert_called_once()
+
+
+@pytest.mark.parametrize("bad", ["4xx4", "abc", "4x", "-4x4"])
+def test_topology_rejects_malformed_strings(bad):
+    with pytest.raises(ValueError, match="Invalid TPU topology"):
+        TPUConfig(topology=bad)
+
+
+@pytest.mark.parametrize("good", ["2x2x1", "4x4x8", "1x1"])
+def test_topology_accepts_2d_and_3d(good):
+    assert TPUConfig(topology=good).topology == good
+
+
+def test_cpu_floor_matches_actor_request(stub_slice_pg):
+    _, create = stub_slice_pg
+    kwargs, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+    )
+    assert kwargs["num_cpus"] == create.call_args.kwargs["resources_per_bundle"]["CPU"]
+    close_fn()
+
+
+def test_builder_releases_slice_when_concurrency_invalid(stub_slice_pg, monkeypatch):
+    handle, _ = stub_slice_pg
+    monkeypatch.setattr(
+        ray.data,
+        "ActorPoolStrategy",
+        MagicMock(side_effect=RuntimeError("bad pool")),
+    )
+    with pytest.raises(RuntimeError, match="bad pool"):
+        build_processor(
+            _topo_config(
+                engine_kwargs={"tensor_parallel_size": 16},
+                tokenize=False,
+                detokenize=False,
+                apply_chat_template=False,
+            )
+        )
+    handle.shutdown.assert_called_once()
+    handle.release_head_pgs.assert_called_once()
+
+
+def test_unclosed_processor_warns_and_releases(stub_slice_pg, caplog):
+    handle, _ = stub_slice_pg
+    processor = build_processor(
+        _topo_config(
+            engine_kwargs={"tensor_parallel_size": 16},
+            tokenize=False,
+            detokenize=False,
+            apply_chat_template=False,
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="ray.llm._internal.batch.processor.base"):
+        del processor
+        gc.collect()
+    assert any("garbage-collected without close()" in r.message for r in caplog.records)
+    handle.shutdown.assert_called_once()
+
+
+def test_tpu_stage_preserves_builder_scheduling_strategy(stub_slice_pg):
+    processor = build_processor(
+        _topo_config(
+            engine_kwargs={"tensor_parallel_size": 16},
+            tokenize=False,
+            detokenize=False,
+            apply_chat_template=False,
+        )
+    )
+    stage = processor.get_stage_by_name("vLLMEngineStage")
+    strategy = stage.map_batches_kwargs["scheduling_strategy"]
+    assert isinstance(strategy, PlacementGroupSchedulingStrategy)
+    # Re-run post_init path by reconstructing stage values: identity must survive.
+    from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage
+
+    rebuilt = vLLMEngineStage(
+        fn_constructor_kwargs=dict(stage.fn_constructor_kwargs),
+        map_batches_kwargs=dict(stage.map_batches_kwargs),
+    )
+    assert (
+        rebuilt.map_batches_kwargs["scheduling_strategy"]
+        is stage.map_batches_kwargs["scheduling_strategy"]
+    )
+    processor.close()
+
+
+def test_tpu_stage_retains_post_init_side_effects(stub_slice_pg):
+    """R-02: remainder of post_init is PG-only; TPU keeps builder-supplied keys."""
+    processor = build_processor(
+        _topo_config(
+            engine_kwargs={"tensor_parallel_size": 16},
+            tokenize=False,
+            detokenize=False,
+            apply_chat_template=False,
+        )
+    )
+    stage = processor.get_stage_by_name("vLLMEngineStage")
+    # Builder-supplied set (plus processor compute/max_concurrency/zero_copy).
+    assert "scheduling_strategy" in stage.map_batches_kwargs
+    assert stage.map_batches_kwargs["num_gpus"] == 0
+    assert "ray_remote_args_fn" not in stage.map_batches_kwargs
+    processor.close()
+
+
+def test_builder_pins_bundle_zero_and_close_releases(stub_slice_pg):
+    # Deliberately leave tokenize/detokenize/apply_chat_template at defaults so
+    # the full stage set (incl. AutoConfig download stub) is exercised once.
+    handle, _ = stub_slice_pg
+    processor = build_processor(
+        _topo_config(engine_kwargs={"tensor_parallel_size": 16})
+    )
+    assert isinstance(processor, Processor)
+    stage = processor.get_stage_by_name("vLLMEngineStage")
+    strategy = stage.map_batches_kwargs["scheduling_strategy"]
+    assert isinstance(strategy, PlacementGroupSchedulingStrategy)
+    assert strategy.placement_group_bundle_index == 0
+    assert strategy.placement_group_capture_child_tasks is True
+    assert (
+        stage.fn_constructor_kwargs["engine_kwargs"]["distributed_executor_backend"]
+        == "ray"
+    )
+    processor.close()
+    handle.shutdown.assert_called_once()

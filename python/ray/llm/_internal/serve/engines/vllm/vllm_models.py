@@ -274,17 +274,22 @@ class VLLMEngineConfig(BaseModelExtended):
                     bundles.append(bundle)
                 return bundles
 
-            # Otherwise use explicit bundles list
-            bundles = []
-            explicit_bundles = self.placement_group_config.get("bundles") or []
-            for bundle_dict in explicit_bundles:
-                bundle = bundle_dict.copy()
-                if self.accelerator_type:
-                    # Use setdefault to add accelerator hint WITHOUT overriding explicit user values
-                    res_key = format_ray_accelerator_resource(self.accelerator_type)
-                    bundle.setdefault(res_key, 0.001)
-                bundles.append(bundle)
-            return bundles
+            # Otherwise use explicit bundles list when provided.
+            explicit_bundles = self.placement_group_config.get("bundles")
+            if explicit_bundles is not None:
+                bundles = []
+                for bundle_dict in explicit_bundles:
+                    bundle = bundle_dict.copy()
+                    if self.accelerator_type:
+                        # Use setdefault to add accelerator hint WITHOUT overriding
+                        # explicit user values
+                        res_key = format_ray_accelerator_resource(
+                            self.accelerator_type
+                        )
+                        bundle.setdefault(res_key, 0.001)
+                    bundles.append(bundle)
+                return bundles
+            # Strategy-only placement_group_config: fall through to accelerator defaults.
 
         # Default bundles based on the accelerator backend.
         return self.accelerator.default_bundles(
