@@ -560,18 +560,18 @@ class TestAcceleratorConfigLogic:
         assert slice_kwargs["resources_per_bundle"]["TPU"] == 4
 
     def test_create_pg_passes_strategy_through(self, monkeypatch):
-        """create_placement_group forwards the caller strategy unchanged."""
+        """create_placement_group forwards a non-default strategy unchanged."""
         create = MagicMock(return_value=MagicMock(placement_group=object()))
         monkeypatch.setattr(accelerators_mod, "slice_placement_group", create)
         backend = TPUAccelerator(TPUConfig(topology="2x4"))
         backend.create_placement_group(
             bundles=[{"TPU": 1, "CPU": 1}] * 8,
-            strategy="PACK",
+            strategy="SPREAD",
             name="serve-single-host",
             accelerator_type_str="TPU-V6E",
         )
         slice_kwargs = create.call_args.kwargs
-        assert slice_kwargs["strategy"] == "PACK"
+        assert slice_kwargs["strategy"] == "SPREAD"
 
 
 class TestCheckpointInfo:

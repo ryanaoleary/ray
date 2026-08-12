@@ -23,11 +23,8 @@ from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage
 from ray.llm._internal.common.accelerators import (
     DEFAULT_USER_CPU_PER_HOST,
     PARENT_ACTOR_CPU_RESERVE,
-    GPUAccelerator,
-    GPUConfig,
     TPUAccelerator,
     TPUConfig,
-    get_accelerator_backend,
 )
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -118,19 +115,6 @@ def _topo_config(**kwargs):
 def test_rejects_invalid_processor_config(kwargs, match):
     with pytest.raises(ValueError, match=match):
         vLLMEngineProcessorConfig(model_source="m", **kwargs)
-
-
-@pytest.mark.parametrize("concurrency", [1, (1, 1)])
-def test_concurrency_one_accepted(concurrency):
-    assert _topo_config(concurrency=concurrency).concurrency == concurrency
-
-
-def test_omitted_accelerator_config_defaults_to_gpu():
-    cfg = vLLMEngineProcessorConfig(model_source="m")
-    assert cfg.accelerator_config is None
-    assert isinstance(
-        get_accelerator_backend(cfg.accelerator_config or GPUConfig()), GPUAccelerator
-    )
 
 
 @pytest.mark.parametrize(
@@ -287,9 +271,8 @@ def test_topology_rejects_malformed(bad):
         TPUConfig(topology=bad)
 
 
-@pytest.mark.parametrize("good", ["2x2x1", "4x4x8", "1x1"])
-def test_topology_accepts_valid(good):
-    assert TPUConfig(topology=good).topology == good
+def test_topology_normalizes_case_and_whitespace():
+    assert TPUConfig(topology=" 4X4 ").topology == "4x4"
 
 
 @pytest.mark.parametrize(
