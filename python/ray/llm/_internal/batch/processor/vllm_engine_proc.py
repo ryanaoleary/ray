@@ -113,6 +113,8 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or 'bundles' "
         "(full list of resource dicts). Optionally include 'strategy' key "
         "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
+        "When strategy is omitted it is absent from the stored dict (same idea as Serve "
+        "exclude_unset); GPU scheduling resolves absence to PACK, TPU Batch to SPREAD. "
         "Example with bundle_per_worker: {'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
         "Example with bundles: {'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}.",
     )
@@ -206,9 +208,15 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         if value is None:
             return None
         # Validate through PlacementGroupConfig, then dump back to dict.
-        # strategy defaults to None (unset); consumers resolve their default.
+        # PlacementGroupConfig.strategy defaults to PACK. Pop it when the user
+        # omitted the key so Batch TPU can default to SPREAD while GPU/Serve
+        # still resolve absence to PACK. Explicit strategy is preserved.
+        # Readers must use .get("strategy") or a default — never ["strategy"].
         validated = PlacementGroupConfig(**value)
-        return validated.model_dump()
+        dumped = validated.model_dump()
+        if isinstance(value, dict) and "strategy" not in value:
+            dumped.pop("strategy", None)
+        return dumped
 
 
 def build_vllm_engine_processor(
@@ -421,7 +429,7 @@ def build_vllm_engine_processor(
                 **map_batches_kwargs,
             )
         else:
-            # Stage post_init owns GPU scheduling when strategy is unset.
+            # Stage post_init owns GPU scheduling.
             fn_constructor_kwargs = dict(
                 batch_size=config.batch_size,
                 max_concurrent_batches=config.max_concurrent_batches,
