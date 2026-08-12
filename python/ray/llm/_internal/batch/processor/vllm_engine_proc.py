@@ -2,7 +2,7 @@
 
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import transformers
 from pydantic import Field, field_validator, model_validator
@@ -28,7 +28,6 @@ from ray.llm._internal.batch.stages import (
     ChatTemplateStage,
     DetokenizeStage,
     PrepareMultimodalStage,
-    StatefulStage,
     TokenizeStage,
     vLLMEngineStage,
 )
@@ -261,7 +260,7 @@ def build_vllm_engine_processor(
     """
     ray.init(runtime_env=config.runtime_env, ignore_reinit_error=True)
 
-    stages: List[StatefulStage] = []
+    stages = []
 
     # Prepare processor defaults for merging into stage configs
     trust_remote_code = config.engine_kwargs.get("trust_remote_code", False)
@@ -342,7 +341,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Download config for telemetry before acquiring accelerator resources.
+    # Telemetry before reserving accelerator resources (e.g. TPU SlicePG).
     # We download the config files here so that we can report the underlying
     # architecture to the telemetry system. This should be a lightweight operation.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
@@ -398,85 +397,61 @@ def build_vllm_engine_processor(
         )
     )
 
+    # Core stage -- the vLLM engine.
+    fn_constructor_kwargs = dict(
+        batch_size=config.batch_size,
+        max_concurrent_batches=config.max_concurrent_batches,
+        model=config.model_source,
+        engine_kwargs=config.engine_kwargs,
+        task_type=config.task_type,
+        max_pending_requests=config.max_pending_requests,
+        dynamic_lora_loading_path=config.dynamic_lora_loading_path,
+        placement_group_config=config.placement_group_config,
+        should_continue_on_error=config.should_continue_on_error,
+        log_engine_metrics=config.log_engine_metrics,
+    )
+    map_batches_kwargs = dict(
+        zero_copy_batch=True,
+        # The number of running batches "per actor" in Ray Core level.
+        # This is used to make sure we overlap batches to avoid the tail
+        # latency of each batch.
+        max_concurrency=config.max_concurrent_batches,
+        accelerator_type=config.accelerator_type,
+        runtime_env=config.runtime_env,
+    )
+
     close_fn = None
     if isinstance(config.accelerator_config, TPUConfig):
-        # Backend owns SlicePG lifecycle and map kwargs.
-        # Shallow copy: only top-level engine_kwargs keys are mutated downstream.
+        # Reserve SlicePG via the accelerator backend. Stage post_init skips its
+        # own PG when map_batches already has scheduling_strategy / ray_remote_args_fn.
         engine_kwargs = dict(config.engine_kwargs)
         backend = get_accelerator_backend(config.accelerator_config)
-        map_batches_kwargs, close_fn = backend.build_batch_scheduling_options(
+        tpu_map_kwargs, close_fn = backend.build_batch_scheduling_options(
             accelerator_type=config.accelerator_type,
             engine_kwargs=engine_kwargs,
             placement_group_config=config.placement_group_config,
             runtime_env=config.runtime_env,
         )
+        fn_constructor_kwargs["engine_kwargs"] = engine_kwargs
+        fn_constructor_kwargs.pop("placement_group_config")
+        map_batches_kwargs.pop("accelerator_type")
+        map_batches_kwargs.update(tpu_map_kwargs)
 
     try:
-        if isinstance(config.accelerator_config, TPUConfig):
-            fn_constructor_kwargs = dict(
-                batch_size=config.batch_size,
-                max_concurrent_batches=config.max_concurrent_batches,
-                model=config.model_source,
-                engine_kwargs=engine_kwargs,
-                task_type=config.task_type,
-                max_pending_requests=config.max_pending_requests,
-                dynamic_lora_loading_path=config.dynamic_lora_loading_path,
-                should_continue_on_error=config.should_continue_on_error,
-                log_engine_metrics=config.log_engine_metrics,
-            )
-            stage_map_batches_kwargs = dict(
-                zero_copy_batch=True,
-                # The number of running replicas. This is a deprecated field, but
-                # we need to set `max_tasks_in_flight_per_actor` through `compute`,
-                # which initiates enough many overlapping UDF calls per actor, to
-                # saturate `max_concurrency`.
-                compute=ray.data.ActorPoolStrategy(
-                    **config.get_concurrency(autoscaling_enabled=True),
-                    max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
-                ),
-                # The number of running batches "per actor" in Ray Core level.
-                # This is used to make sure we overlap batches to avoid the tail
-                # latency of each batch.
-                max_concurrency=config.max_concurrent_batches,
-                **map_batches_kwargs,
-            )
-        else:
-            # Stage post_init owns GPU scheduling.
-            fn_constructor_kwargs = dict(
-                batch_size=config.batch_size,
-                max_concurrent_batches=config.max_concurrent_batches,
-                model=config.model_source,
-                engine_kwargs=config.engine_kwargs,
-                task_type=config.task_type,
-                max_pending_requests=config.max_pending_requests,
-                dynamic_lora_loading_path=config.dynamic_lora_loading_path,
-                placement_group_config=config.placement_group_config,
-                should_continue_on_error=config.should_continue_on_error,
-                log_engine_metrics=config.log_engine_metrics,
-            )
-            stage_map_batches_kwargs = dict(
-                zero_copy_batch=True,
-                # The number of running replicas. This is a deprecated field, but
-                # we need to set `max_tasks_in_flight_per_actor` through `compute`,
-                # which initiates enough many overlapping UDF calls per actor, to
-                # saturate `max_concurrency`.
-                compute=ray.data.ActorPoolStrategy(
-                    **config.get_concurrency(autoscaling_enabled=True),
-                    max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
-                ),
-                # The number of running batches "per actor" in Ray Core level.
-                # This is used to make sure we overlap batches to avoid the tail
-                # latency of each batch.
-                max_concurrency=config.max_concurrent_batches,
-                accelerator_type=config.accelerator_type,
-                runtime_env=config.runtime_env,
-            )
-
-        # Core stage -- the vLLM engine.
+        # Build compute after any SlicePG reservation so construction failures
+        # still run close_fn cleanup.
+        # The number of running replicas. This is a deprecated field, but
+        # we need to set `max_tasks_in_flight_per_actor` through `compute`,
+        # which initiates enough many overlapping UDF calls per actor, to
+        # saturate `max_concurrency`.
+        map_batches_kwargs["compute"] = ray.data.ActorPoolStrategy(
+            **config.get_concurrency(autoscaling_enabled=True),
+            max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
+        )
         stages.append(
             vLLMEngineStage(
                 fn_constructor_kwargs=fn_constructor_kwargs,
-                map_batches_kwargs=stage_map_batches_kwargs,
+                map_batches_kwargs=map_batches_kwargs,
             )
         )
 
@@ -498,8 +473,8 @@ def build_vllm_engine_processor(
             )
 
         return Processor(
-            config=config,
-            stages=stages,
+            config,
+            stages,
             preprocess=preprocess,
             postprocess=postprocess,
             preprocess_map_kwargs=preprocess_map_kwargs,

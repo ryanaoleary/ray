@@ -310,8 +310,9 @@ class Processor:
     processing stages, and finally a postprocess stage. We use processor as a
     paradigm for processing data using LLMs.
 
-    Call ``close()`` (or use as a context manager) after derived Datasets have
-    been fully consumed when the builder attached driver-owned resources.
+    When the builder passes ``close_fn`` (e.g. to tear down a reserved TPU
+    slice placement group), call ``close()`` or use as a context manager after
+    derived Datasets have been fully consumed.
 
     Args:
         config: The processor config.
@@ -325,8 +326,7 @@ class Processor:
             preprocess stage (e.g., num_cpus, memory, concurrency).
         postprocess_map_kwargs: Optional kwargs to pass to Dataset.map() for the
             postprocess stage (e.g., num_cpus, memory, concurrency).
-        close_fn: Optional callable invoked by ``close()`` to release
-            driver-owned resources.
+        close_fn: Optional callback for ``close()`` (e.g. SlicePG shutdown).
     """
 
     # The internal used data column name ("__data"). Your input
@@ -387,9 +387,10 @@ class Processor:
     def _warn_unclosed(close_fn: Callable[[], None], cls_name: str) -> None:
         try:
             logger.warning(
-                "%s was garbage-collected without close(). Driver-owned resources "
-                "may still be held. Call close() or use a context manager after "
-                "materializing derived Datasets. Attempting release now.",
+                "%s was garbage-collected without close(). Reserved resources "
+                "(e.g. a placement group) may still be held. Call close() or use "
+                "a context manager after materializing derived Datasets. "
+                "Attempting release now.",
                 cls_name,
             )
             close_fn()
@@ -401,15 +402,11 @@ class Processor:
                 pass
 
     def close(self) -> None:
-        """Mark this processor closed and release any driver-owned resources.
+        """Release resources from ``close_fn`` and mark this processor closed.
 
-        Callers must materialize every derived Dataset before calling close(); the
-        lock only serializes the closed-flag check, it cannot prevent execution of a
-        Dataset graph that was constructed earlier.
-
-        ``_close_fn`` is cleared only after a successful call so a failed
-        shutdown can be retried. The finalizer is detached only after a successful
-        close so a failed close still has GC safety-net coverage.
+        Materialize derived Datasets before calling close(). ``close_fn`` and the
+        GC finalizer are cleared only after a successful ``close_fn`` call so a
+        failed shutdown can be retried.
         """
         with self._lock:
             self._closed = True
