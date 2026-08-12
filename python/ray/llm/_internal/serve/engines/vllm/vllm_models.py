@@ -11,10 +11,9 @@ from ray.llm._internal.common.accelerators import (
     AnyAcceleratorConfig,
     CPUAccelerator,
     CPUConfig,
-    GPUAccelerator,
-    TPUAccelerator,
-    TPUConfig,
+    GPUConfig,
     format_ray_accelerator_resource,
+    get_accelerator_backend,
 )
 from ray.llm._internal.common.base_pydantic import BaseModelExtended
 from ray.llm._internal.common.placement import PlacementGroupConfig
@@ -107,14 +106,8 @@ class VLLMEngineConfig(BaseModelExtended):
                 "CPU-only configurations. Either remove accelerator_type, or provide an accelerator_config."
             )
 
-        # LLMConfig has already resolved and validated accelerator_config
-        if isinstance(cfg, TPUConfig):
-            self._accelerator = TPUAccelerator(cfg)
-        elif isinstance(cfg, CPUConfig):
-            self._accelerator = CPUAccelerator()
-        else:
-            # Default to GPU if it's GPUConfig or isn't set
-            self._accelerator = GPUAccelerator()
+        # LLMConfig has already resolved and validated accelerator_config.
+        self._accelerator = get_accelerator_backend(cfg or GPUConfig())
         return self
 
     @property

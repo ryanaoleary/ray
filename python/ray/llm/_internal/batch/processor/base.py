@@ -309,6 +309,10 @@ class Processor:
     processing stages, and finally a postprocess stage. We use processor as a
     paradigm for processing data using LLMs.
 
+    Call ``close()`` (or use the processor as a context manager) after all
+    derived Datasets have been fully consumed when the builder attached
+    driver-owned resources (for example a TPU slice placement group).
+
     Args:
         config: The processor config.
         stages: List of processing stages.

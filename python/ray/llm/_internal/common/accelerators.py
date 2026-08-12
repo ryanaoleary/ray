@@ -358,8 +358,9 @@ def _gpu_ray_scheduling_strategy_fn(
         placement_group_config = copy.deepcopy(placement_group_config)
         bundles = placement_group_config.get("bundles") or []
         if accelerator_type:
+            accel_resource = format_ray_accelerator_resource(accelerator_type)
             for bundle in bundles:
-                bundle[f"accelerator_type:{accelerator_type}"] = 0.001
+                bundle[accel_resource] = 0.001
         pg = backend.create_placement_group(
             bundles=bundles,
             strategy=placement_group_config.get("strategy") or "PACK",
@@ -368,7 +369,7 @@ def _gpu_ray_scheduling_strategy_fn(
     else:
         bundle: Dict[str, float] = {"GPU": 1, "CPU": 1}
         if accelerator_type:
-            bundle[f"accelerator_type:{accelerator_type}"] = 0.001
+            bundle[format_ray_accelerator_resource(accelerator_type)] = 0.001
         pg = backend.create_placement_group(
             bundles=[bundle] * num_bundles_per_replica,
             strategy="PACK",
@@ -541,7 +542,7 @@ class TPUAccelerator(AcceleratorBackend):
         if self._slice_pg_wrapper is None:
             return
         try:
-            logger.info("Shutting down TPU slice PG for server replica.")
+            logger.info("Shutting down TPU slice placement group.")
             self._slice_pg_wrapper.shutdown()
         except Exception as e:
             logger.warning(f"Failed to shut down TPU slice PG: {e}")
