@@ -3,7 +3,6 @@
 import copy
 import logging
 import math
-import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -20,7 +19,6 @@ from ray._private.accelerators.tpu import (
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.tpu import (
-    RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR,
     get_tpu_version_from_type,
     slice_placement_group,
 )
@@ -34,27 +32,6 @@ CPU_ACCELERATOR_TYPE_LITERAL = "CPU"
 
 # Bound driver-side wait for an eagerly acquired TPU placement group.
 DEFAULT_PG_READY_TIMEOUT_S = 180.0
-
-# Env vars injected into the Batch engine actor runtime so vLLM's TPU path
-# uses Ray for process orchestration and reports one resource unit per chip.
-# Users should not need to set these manually; conflicting values are rejected.
-TPU_MULTIHOST_BACKEND_ENV_VAR = "TPU_MULTIHOST_BACKEND"
-TPU_ENGINE_ENV_VARS = {
-    TPU_MULTIHOST_BACKEND_ENV_VAR: "ray",
-    RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR: "1",
-}
-
-
-def _require_positive_int(value: Any, name: str) -> int:
-    """Validate that a value is a positive integer (excluding bools)."""
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer; got {value!r}.")
-    return value
-
-
-def _wait_for_placement_group(pg: PlacementGroup, timeout_s: float) -> None:
-    """Block until the placement group is scheduled, or raise ``GetTimeoutError``."""
-    ray.get(pg.ready(), timeout=timeout_s)
 
 
 AcceleratorType = Enum("AcceleratorType", vars(accelerators))
@@ -125,7 +102,7 @@ class TPUConfig(AcceleratorConfig):
     topology: Optional[str] = Field(
         default=None,
         description=(
-            "TPU slice topology (e.g. '4x4', '2x4'). Required for topology-backed "
+            "TPU slice topology (e.g. '4x4', '2x4'). Required for multi-host "
             "Batch and for deferred Serve SlicePG placement."
         ),
     )
@@ -349,8 +326,8 @@ class TPUAccelerator(AcceleratorBackend):
                 f"Resolved chips per host must be positive, got {chips_per_host}"
             )
 
-        # Serve passes TP*PP as num_devices and treats them as the chip count for
-        # host packing (same as master Serve accelerators).
+        # Serve passes TP*PP as num_devices and treats them as the chip count
+        # for host packing.
         if num_devices > chips_per_host and num_devices % chips_per_host != 0:
             raise ValueError(
                 f"num_devices ({num_devices}) must be a multiple of "
@@ -411,12 +388,11 @@ class TPUAccelerator(AcceleratorBackend):
         strategy: Optional[str],
         name: str = "",
     ):
-        """Create and own a topology-backed TPU placement group.
+        """Create and own a TPU slice placement group.
 
         Passes ``strategy`` through unmodified (aside from defaulting unset
         strategy to PACK). Serve always supplies an explicit strategy from
-        deployment config (historical default PACK). Batch resolves its own
-        default (SPREAD when topology is set) before calling this helper.
+        deployment config. Batch resolves its own default before calling this.
         """
         if not self._config.topology:
             raise ValueError(
@@ -434,7 +410,6 @@ class TPUAccelerator(AcceleratorBackend):
             "topology": topology,
             "accelerator_version": version,
             "resources_per_bundle": resources_per_bundle,
-            # Serve historical default when callers omit strategy.
             "strategy": strategy or "PACK",
             "name": name,
         }
@@ -447,9 +422,9 @@ class TPUAccelerator(AcceleratorBackend):
     def requires_deferred_placement_group(self) -> bool:
         """
         If a TPU topology is specified, we defer PG creation so the replica can
-        provision a topology-backed placement group at runtime. This ensures
-        multi-host TPU slices are gang-scheduled atomically according to their
-        physical topology rather than fragmented across the cluster.
+        provision a slice placement group at runtime. This ensures multi-host
+        TPU slices are gang-scheduled atomically according to their physical
+        topology rather than fragmented across the cluster.
         """
         return bool(self._config.topology)
 
@@ -506,8 +481,11 @@ class TPUAccelerator(AcceleratorBackend):
                 dict(bundle) for bundle in placement_group_config["bundles"]
             ]
         else:
-            # Strategy-only (or empty) config: use the default CPU-floor template.
-            return {"CPU": cpu_floor}
+            # Strategy-only or empty config is rejected upstream by
+            # PlacementGroupConfig; treat as a programming error here.
+            raise ValueError(
+                "placement_group_config must specify bundle_per_worker or bundles."
+            )
         if not source_bundles:
             raise ValueError(
                 "placement_group_config bundles must be non-empty when provided."
@@ -555,10 +533,10 @@ class TPUAccelerator(AcceleratorBackend):
 
         if len(source_bundles) > 1:
             logger.warning(
-                "placement_group_config specified %d bundles, but topology-backed TPU "
-                "scheduling derives the bundle count from topology %r. Using bundles[0] "
-                "as a homogeneous per-worker template; the extra %d entries only "
-                "participate in the homogeneity check.",
+                "placement_group_config specified %d bundles, but TPU Batch "
+                "scheduling derives the bundle count from topology %r. Using "
+                "bundles[0] as a homogeneous per-worker template; the extra %d "
+                "entries only participate in the homogeneity check.",
                 len(source_bundles),
                 self._config.topology,
                 len(source_bundles) - 1,
@@ -598,32 +576,18 @@ class TPUAccelerator(AcceleratorBackend):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Eagerly reserve one topology-backed TPU placement group for Batch.
+        """Eagerly reserve one TPU slice placement group for Batch.
 
-        Validates config, waits for SlicePG readiness, releases head PGs, and
-        returns map kwargs plus a ``close_fn`` that tears down the slice.
-        Do not use ``self.shutdown`` as ``close_fn``: that path swallows errors
-        for Serve replica teardown, while Batch must surface failures so
+        Validates config, waits for SlicePG readiness, and returns map kwargs
+        plus a ``close_fn`` that tears down the slice. Do not use
+        ``self.shutdown`` as ``close_fn``: that path swallows errors for Serve
+        replica teardown, while Batch must surface failures so
         ``Processor.close()`` can retry.
         """
         if not self._config.topology:
             raise ValueError(
                 "TPU batch inference requires accelerator_config.topology. "
                 "Omit accelerator_config (or use GPUConfig) for GPU scheduling."
-            )
-
-        raw_driver_rpc = os.environ.get(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
-        try:
-            driver_rpc = int(raw_driver_rpc)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid integer for {RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} in "
-                f"driver environment: {raw_driver_rpc!r}."
-            ) from exc
-        if driver_rpc != 1:
-            raise ValueError(
-                f"Topology-backed TPU batch inference requires "
-                f"{RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR} == 1; got {driver_rpc}."
             )
 
         if not accelerator_type:
@@ -636,18 +600,22 @@ class TPUAccelerator(AcceleratorBackend):
         engine_kwargs.setdefault("distributed_executor_backend", "ray")
         if engine_kwargs["distributed_executor_backend"] != "ray":
             raise ValueError(
-                "Topology-backed TPU batch inference requires "
-                "distributed_executor_backend='ray'; "
+                "TPU batch inference requires distributed_executor_backend='ray'; "
                 f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
 
-        tp = _require_positive_int(
+        def _positive_int(value: Any, name: str) -> int:
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+            return value
+
+        tp = _positive_int(
             engine_kwargs.get("tensor_parallel_size", 1), "tensor_parallel_size"
         )
-        pp = _require_positive_int(
+        pp = _positive_int(
             engine_kwargs.get("pipeline_parallel_size", 1), "pipeline_parallel_size"
         )
-        dp = _require_positive_int(
+        dp = _positive_int(
             engine_kwargs.get("data_parallel_size", 1), "data_parallel_size"
         )
 
@@ -661,32 +629,22 @@ class TPUAccelerator(AcceleratorBackend):
             )
         if pp != 1:
             raise ValueError(
-                "Topology-backed TPU batch inference currently supports "
-                f"pipeline_parallel_size=1; got {pp}."
+                "TPU batch inference currently supports pipeline_parallel_size=1; "
+                f"got {pp}."
             )
         if dp != 1:
             raise ValueError(
-                "Topology-backed TPU batch inference currently supports "
-                f"data_parallel_size=1; got {dp}."
+                "TPU batch inference currently supports data_parallel_size=1; "
+                f"got {dp}."
             )
 
         merged_runtime_env = copy.deepcopy(runtime_env or {})
         env_vars = merged_runtime_env.setdefault("env_vars", {})
         if not isinstance(env_vars, dict):
             raise ValueError("runtime_env['env_vars'] must be a dictionary.")
-        for name, required in TPU_ENGINE_ENV_VARS.items():
-            supplied = env_vars.get(name)
-            if supplied is not None and supplied != required:
-                raise ValueError(
-                    f"runtime_env['env_vars']['{name}'] must be the string "
-                    f"{required!r}; got {supplied!r}."
-                )
-        env_vars.update(TPU_ENGINE_ENV_VARS)
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
-        # Topology-backed Batch defaults to SPREAD (matches SlicePlacementGroup
-        # and JaxTrainer TPU examples). Serve keeps its own PACK default.
-        # Users can still override via placement_group_config["strategy"].
+        # Default SPREAD for multi-host TPU Batch; override via placement_group_config.
         strategy = (placement_group_config or {}).get("strategy") or "SPREAD"
 
         handle = self._create_slice_pg_handle(
@@ -696,9 +654,7 @@ class TPUAccelerator(AcceleratorBackend):
         )
         try:
             try:
-                _wait_for_placement_group(
-                    handle.placement_group, DEFAULT_PG_READY_TIMEOUT_S
-                )
+                ray.get(handle.placement_group.ready(), timeout=DEFAULT_PG_READY_TIMEOUT_S)
             except ray.exceptions.GetTimeoutError as exc:
                 raise TimeoutError(
                     f"Timed out after {DEFAULT_PG_READY_TIMEOUT_S}s waiting for TPU "
@@ -706,12 +662,6 @@ class TPUAccelerator(AcceleratorBackend):
                     f"topology={topology} ({handle.num_hosts} hosts, "
                     f"{handle.num_bundles} bundles)."
                 ) from exc
-            # Head PGs are temporary reservation markers that atomically claim a
-            # slice label before the worker PG is scheduled. Once the worker PG is
-            # ready they are redundant; releasing them here frees those markers for
-            # other jobs. Serve's create_placement_group path does not call this
-            # today (pre-existing asymmetry — Batch readiness is eager at build time).
-            handle.release_head_pgs()
         except Exception:
             try:
                 handle.shutdown()
@@ -733,12 +683,8 @@ class TPUAccelerator(AcceleratorBackend):
             self._slice_pg_wrapper = None
 
         map_batches_kwargs = {
-            # Bundle 0 CPU is sized exactly for the Ray Data engine actor + user
-            # map work. This is only safe because vLLM's Ray TPU executor requests
-            # num_cpus=0 for its workers (verified against vLLM 0.26.0,
-            # vllm/v1/executor/ray_executor.py non-GPU branch). If that changes,
-            # child tasks captured into this PG will queue forever rather than
-            # fail loudly.
+            # Bundle 0 CPU is sized for the Ray Data engine actor + user map work.
+            # Safe while vLLM's Ray TPU workers request num_cpus=0.
             "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
             "num_gpus": 0,
             "resources": {},

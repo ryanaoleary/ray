@@ -250,8 +250,7 @@ class VLLMEngineConfig(BaseModelExtended):
     @property
     def placement_strategy(self) -> str:
         # Use custom strategy if placement_group_config is provided.
-        # None / missing means unset → PACK (PlacementGroupConfig.strategy
-        # is Optional; absence must not be confused with an explicit choice).
+        # None means unset → PACK.
         if self.placement_group_config:
             return self.placement_group_config.get("strategy") or "PACK"
         # Default to PACK (cross-node best-effort placement)
@@ -274,22 +273,17 @@ class VLLMEngineConfig(BaseModelExtended):
                     bundles.append(bundle)
                 return bundles
 
-            # Otherwise use explicit bundles list when provided.
-            explicit_bundles = self.placement_group_config.get("bundles")
-            if explicit_bundles is not None:
-                bundles = []
-                for bundle_dict in explicit_bundles:
-                    bundle = bundle_dict.copy()
-                    if self.accelerator_type:
-                        # Use setdefault to add accelerator hint WITHOUT overriding
-                        # explicit user values
-                        res_key = format_ray_accelerator_resource(
-                            self.accelerator_type
-                        )
-                        bundle.setdefault(res_key, 0.001)
-                    bundles.append(bundle)
-                return bundles
-            # Strategy-only placement_group_config: fall through to accelerator defaults.
+            # Otherwise use explicit bundles list
+            bundles = []
+            explicit_bundles = self.placement_group_config.get("bundles") or []
+            for bundle_dict in explicit_bundles:
+                bundle = bundle_dict.copy()
+                if self.accelerator_type:
+                    # Prefer setdefault so an explicit accelerator resource is kept.
+                    res_key = format_ray_accelerator_resource(self.accelerator_type)
+                    bundle.setdefault(res_key, 0.001)
+                bundles.append(bundle)
+            return bundles
 
         # Default bundles based on the accelerator backend.
         return self.accelerator.default_bundles(

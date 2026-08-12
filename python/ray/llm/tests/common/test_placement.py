@@ -58,11 +58,9 @@ def test_placement_group_config_bundle_per_worker_only():
     assert out["strategy"] == "SPREAD"
 
 
-def test_placement_group_config_strategy_only_allowed():
-    pg = PlacementGroupConfig(strategy="PACK")
-    assert pg.bundle_per_worker is None
-    assert pg.bundles is None
-    assert pg.strategy == "PACK"
+def test_placement_group_config_rejects_neither_bundles_nor_per_worker():
+    with pytest.raises(ValueError, match="either 'bundle_per_worker'"):
+        PlacementGroupConfig(strategy="PACK")
 
 
 def test_placement_group_config_rejects_both_bundles_and_per_worker():

@@ -58,8 +58,7 @@ class PlacementGroupConfig(BaseModelExtended):
     bundles: Optional[List[BundleConfig]] = Field(
         default=None, description="List of resource bundles"
     )
-    # None means the caller did not choose a strategy. Consumers must resolve:
-    # Serve/GPU → PACK, topology-backed Batch TPU → SPREAD.
+    # None means unset; consumers resolve their own default (e.g. PACK or SPREAD).
     strategy: Optional[
         Literal["PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"]
     ] = Field(default=None, description="Placement group strategy")
@@ -73,6 +72,9 @@ class PlacementGroupConfig(BaseModelExtended):
                 "per-worker resource specification (auto-replicated by tp*pp), "
                 "or 'bundles' for full control."
             )
-        # Strategy-only configs are allowed: consumers supply default bundles
-        # (Serve/GPU accelerator defaults; TPU Batch uses the CPU floor template).
+        if self.bundle_per_worker is None and self.bundles is None:
+            raise ValueError(
+                "placement_group_config must specify either 'bundle_per_worker' "
+                "or 'bundles'."
+            )
         return self

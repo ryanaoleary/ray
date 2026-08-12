@@ -310,9 +310,8 @@ class Processor:
     processing stages, and finally a postprocess stage. We use processor as a
     paradigm for processing data using LLMs.
 
-    Call ``close()`` (or use the processor as a context manager) after all
-    derived Datasets have been fully consumed when the builder attached
-    driver-owned resources (for example a TPU slice placement group).
+    Call ``close()`` (or use as a context manager) after derived Datasets have
+    been fully consumed when the builder attached driver-owned resources.
 
     Args:
         config: The processor config.
@@ -326,8 +325,8 @@ class Processor:
             preprocess stage (e.g., num_cpus, memory, concurrency).
         postprocess_map_kwargs: Optional kwargs to pass to Dataset.map() for the
             postprocess stage (e.g., num_cpus, memory, concurrency).
-        close_fn: Optional callable invoked by ``close()`` to mark the processor
-            closed and release any driver-owned resources.
+        close_fn: Optional callable invoked by ``close()`` to release
+            driver-owned resources.
     """
 
     # The internal used data column name ("__data"). Your input
@@ -388,10 +387,9 @@ class Processor:
     def _warn_unclosed(close_fn: Callable[[], None], cls_name: str) -> None:
         try:
             logger.warning(
-                "%s was garbage-collected without close(). Driver-owned accelerator "
-                "resources (e.g. a TPU slice placement group) were still held. Use "
-                "`with build_processor(cfg) as p:` or call p.close() after materializing "
-                "all derived Datasets. Attempting release now.",
+                "%s was garbage-collected without close(). Driver-owned resources "
+                "may still be held. Call close() or use a context manager after "
+                "materializing derived Datasets. Attempting release now.",
                 cls_name,
             )
             close_fn()

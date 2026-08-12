@@ -63,15 +63,15 @@ DEFAULT_MODEL_ARCHITECTURE = "UNKNOWN_MODEL_ARCHITECTURE"
 
 
 def _release_close_fn(close_fn) -> None:
-    """Best-effort release of builder-owned accelerator resources."""
+    """Best-effort release of builder-owned resources."""
     if close_fn is None:
         return
     try:
         close_fn()
     except Exception:
         logger.exception(
-            "Failed to release TPU batch resources after processor construction "
-            "failed; the slice may remain allocated until the driver exits."
+            "Failed to release builder-owned resources after processor "
+            "construction failed."
         )
 
 
@@ -109,27 +109,18 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     # Custom placement group config for TP/PP.
     placement_group_config: Optional[Dict[str, Any]] = Field(
         default=None,
-        description=(
-            "Ray placement group configuration for scheduling vLLM engine workers. "
-            "Defines resource bundles and placement strategy for multi-node "
-            "deployments. Can specify either 'bundle_per_worker' (auto-replicated "
-            "by tp*pp) or 'bundles' (full list of resource dicts). For "
-            "topology-backed TPU scheduling, these fields are a homogeneous "
-            "per-worker resource template; the topology determines the resulting "
-            "bundle count. Optionally include 'strategy' key "
-            "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
-            "Example with bundle_per_worker: "
-            "{'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
-            "Example with bundles: "
-            "{'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}."
-        ),
+        description="Ray placement group configuration for scheduling vLLM engine workers. "
+        "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or 'bundles' "
+        "(full list of resource dicts). Optionally include 'strategy' key "
+        "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
+        "Example with bundle_per_worker: {'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
+        "Example with bundles: {'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}.",
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Hardware-specific configuration. Use {'kind': 'tpu', 'topology': '4x4'} "
-            "for topology-backed TPU Batch (optional chips_per_vm for ambiguous "
-            "topologies such as v6e 2x4). Omit or use GPUConfig for GPU scheduling."
+            "Hardware-specific configuration parameters for the chosen accelerator. "
+            "The expected schema is dynamically typed based on the 'kind' discriminator."
         ),
     )
 
@@ -160,8 +151,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     def _normalize_accelerator_type(cls, value):
         if value is None:
             return None
-        # Normalize only TPU types; GPU accelerator_type strings are passed
-        # through untouched to preserve existing behavior for non-TPU users.
+        # Normalize TPU accelerator_type strings only; leave other values unchanged.
         normalized = normalize_tpu_accelerator_type(value)
         if normalized == CPU_ACCELERATOR_TYPE_LITERAL:
             raise ValueError(
@@ -216,8 +206,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         if value is None:
             return None
         # Validate through PlacementGroupConfig, then dump back to dict.
-        # strategy defaults to None (unset); GPU/Serve resolve to PACK and
-        # topology-backed Batch resolves to SPREAD at the consumption site.
+        # strategy defaults to None (unset); consumers resolve their default.
         validated = PlacementGroupConfig(**value)
         return validated.model_dump()
 
@@ -391,9 +380,8 @@ def build_vllm_engine_processor(
 
     close_fn = None
     if isinstance(config.accelerator_config, TPUConfig):
-        # Topology-backed TPU: backend owns SlicePG lifecycle and map kwargs.
-        # Shallow copy is enough: build_batch_scheduling_options only mutates
-        # top-level engine_kwargs keys (e.g. distributed_executor_backend).
+        # Backend owns SlicePG lifecycle and map kwargs.
+        # Shallow copy: only top-level engine_kwargs keys are mutated downstream.
         engine_kwargs = dict(config.engine_kwargs)
         backend = get_accelerator_backend(config.accelerator_config)
         map_batches_kwargs, close_fn = backend.build_batch_scheduling_options(
@@ -433,9 +421,7 @@ def build_vllm_engine_processor(
                 **map_batches_kwargs,
             )
         else:
-            # GPU: stage post_init owns scheduling (same as master).
-            # placement_group_config.strategy may be None when unset; Ray's
-            # placement_group treats None as PACK.
+            # Stage post_init owns GPU scheduling when strategy is unset.
             fn_constructor_kwargs = dict(
                 batch_size=config.batch_size,
                 max_concurrent_batches=config.max_concurrent_batches,

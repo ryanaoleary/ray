@@ -918,12 +918,8 @@ class vLLMEngineStage(StatefulStage):
             The updated values.
         """
         map_batches_kwargs = values["map_batches_kwargs"]
-        # Everything below this point constructs the GPU placement group and the
-        # resource / distributed_executor_backend defaults that accompany that
-        # path (accelerator_type remote args, TP/PP sizing, uni vs ray executor,
-        # num_gpus/num_cpus/resources). TPU Batch supplies its own
-        # scheduling_strategy in the builder and must not be overwritten here.
-        # See FINDINGS.md R-02 for the full inventory.
+        # Skip GPU placement-group construction when the builder already attached
+        # scheduling (e.g. multi-host TPU Batch).
         if (
             "scheduling_strategy" in map_batches_kwargs
             or "ray_remote_args_fn" in map_batches_kwargs

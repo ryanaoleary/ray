@@ -148,24 +148,14 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
         dynamic_lora_loading_path: Path holding dynamic LoRA adapter checkpoints
             (one per subfolder). If unset and LoRA is used, the ``model`` in a
             LoRA request is interpreted as a HF model ID.
-        placement_group_config: Optional Ray placement group configuration for
-            scheduling vLLM engine workers. Defines resource bundles and
-            placement strategy for multi-node deployments. Can specify either
-            ``bundle_per_worker`` (auto-replicated by ``tp*pp``) or ``bundles``
-            (full list of resource dicts). For topology-backed TPU scheduling,
-            these fields are a homogeneous per-worker resource template; the
-            topology determines the resulting bundle count. Optionally include
-            ``strategy``
+        placement_group_config: Optional placement group config for scheduling
+            vLLM engine workers. Accepts ``bundle_per_worker`` (auto-replicated by
+            ``tp*pp``) or ``bundles`` (full list of resource dicts), plus an
+            optional ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
-        accelerator_config: Hardware-specific configuration. For topology-backed
-            TPU Batch use ``{'kind': 'tpu', 'topology': '4x4'}`` (optional
-            ``chips_per_vm`` for ambiguous topologies such as v6e ``2x4``).
-            ``tensor_parallel_size`` must equal the topology chip count, and
-            topology-backed Batch requires ``concurrency=1`` (or ``(1, 1)``),
-            ``pipeline_parallel_size=1``, and ``data_parallel_size=1``. Prefer
-            ``with build_processor(config) as processor:`` and materialize every
-            derived Dataset before exiting the block so the slice is released.
-            Omit or use a GPU config for GPU scheduling.
+        accelerator_config: Hardware-specific configuration parameters for the
+            chosen accelerator. The expected schema is dynamically typed based
+            on the ``kind`` discriminator.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy
