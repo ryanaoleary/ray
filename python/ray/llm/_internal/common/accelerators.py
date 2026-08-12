@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Annotated
 
 import ray
@@ -111,6 +111,28 @@ class GPUConfig(AcceleratorConfig):
 class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
     topology: Optional[str] = None
+    # Optional override for ambiguous topologies (e.g. v6e 2x4 can be 1x8 or
+    # 2x4 chips/VM). When unset, Ray's get_chips_per_host default is used.
+    chips_per_vm: Optional[int] = None
+
+    @field_validator("chips_per_vm", mode="before")
+    @classmethod
+    def _reject_bool_chips_per_vm(cls, value):
+        # bool is a subclass of int; reject before Pydantic coerces True to 1.
+        if isinstance(value, bool):
+            raise ValueError(f"chips_per_vm must be a positive integer; got {value!r}.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_chips_per_vm(self) -> "TPUConfig":
+        if self.chips_per_vm is not None and not self.topology:
+            raise ValueError("chips_per_vm requires topology to be specified.")
+        if self.chips_per_vm is not None and self.chips_per_vm <= 0:
+            raise ValueError(
+                "chips_per_vm must be a positive integer; "
+                f"got {self.chips_per_vm!r}."
+            )
+        return self
 
 
 AnyAcceleratorConfig = Annotated[
@@ -264,7 +286,11 @@ class TPUAccelerator(AcceleratorBackend):
             )
         topology = self._config.topology.strip().lower()
         version = get_tpu_version_from_type(accelerator_type_str)
-        chips_per_host = get_chips_per_host(topology, version)
+        chips_per_host = (
+            self._config.chips_per_vm
+            if self._config.chips_per_vm is not None
+            else get_chips_per_host(topology, version)
+        )
         if chips_per_host <= 0:
             raise ValueError(
                 f"Resolved chips per host must be positive, got {chips_per_host}"
@@ -359,6 +385,8 @@ class TPUAccelerator(AcceleratorBackend):
             "strategy": strategy or "PACK",
             "name": name,
         }
+        if self._config.chips_per_vm is not None:
+            slice_kwargs["chips_per_vm"] = self._config.chips_per_vm
         self._slice_pg_wrapper = slice_placement_group(**slice_kwargs)
         return self._slice_pg_wrapper
 

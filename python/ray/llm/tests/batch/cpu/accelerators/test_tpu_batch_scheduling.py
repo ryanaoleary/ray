@@ -124,15 +124,18 @@ def test_omitted_accelerator_config_defaults_to_gpu():
 
 
 @pytest.mark.parametrize(
-    "topology, accelerator_type, tp, tpu_per_bundle, strategy, expect_strategy",
+    "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, strategy, "
+    "expect_strategy",
     [
         # Topology-backed Batch defaults to SPREAD; explicit strategy wins.
-        ("4x4", "TPU-V6E", 16, None, None, "SPREAD"),
-        ("4x4", "TPU-V6E", 16, 1, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 1, "STRICT_PACK", "STRICT_PACK"),
-        ("2x4", "TPU-V6E", 8, 1, "PACK", "PACK"),
-        ("2x4", "TPU-V6E", 8, None, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 1, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 16, None, None, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 16, None, 1, None, "SPREAD"),
+        # Ambiguous v6e 2x4: chips_per_vm=4 selects 2x4-chip VMs over default 1x8.
+        ("2x4", "TPU-V6E", 8, 4, 1, None, "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 4, 1, "STRICT_PACK", "STRICT_PACK"),
+        ("2x4", "TPU-V6E", 8, 4, 1, "PACK", "PACK"),
+        ("2x4", "TPU-V6E", 8, None, None, None, "SPREAD"),
+        ("2x4", "TPU-V6E", 8, None, 1, None, "SPREAD"),
     ],
 )
 def test_topology_forwards_slice_pg_kwargs(
@@ -140,6 +143,7 @@ def test_topology_forwards_slice_pg_kwargs(
     topology,
     accelerator_type,
     tp,
+    chips_per_vm,
     tpu_per_bundle,
     strategy,
     expect_strategy,
@@ -154,7 +158,7 @@ def test_topology_forwards_slice_pg_kwargs(
             pg_config["strategy"] = strategy
 
     kwargs, close_fn = _schedule(
-        TPUAccelerator(TPUConfig(topology=topology)),
+        TPUAccelerator(TPUConfig(topology=topology, chips_per_vm=chips_per_vm)),
         accelerator_type=accelerator_type,
         tensor_parallel_size=tp,
         placement_group_config=pg_config,
@@ -172,10 +176,22 @@ def test_topology_forwards_slice_pg_kwargs(
         assert "TPU" not in resources
     else:
         assert resources["TPU"] == float(tpu_per_bundle)
+    assert slice_kwargs.get("chips_per_vm") == chips_per_vm
     assert "bundle_label_selector" not in slice_kwargs
 
     close_fn()
     handle.shutdown.assert_called_once()
+
+
+def test_chips_per_vm_requires_topology():
+    with pytest.raises(ValueError, match="chips_per_vm requires topology"):
+        TPUConfig(chips_per_vm=4)
+
+
+@pytest.mark.parametrize("bad", [0, -1, True])
+def test_chips_per_vm_rejects_invalid_values(bad):
+    with pytest.raises(ValueError, match="chips_per_vm must be a positive integer"):
+        TPUConfig(topology="2x4", chips_per_vm=bad)
 
 
 def test_topology_merges_runtime_env_and_releases_head(stub_slice_pg):
