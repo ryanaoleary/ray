@@ -42,7 +42,6 @@ def _schedule(
     accelerator_type: str = "TPU-V6E",
     tensor_parallel_size: int,
     placement_group_config: Optional[Dict[str, Any]] = None,
-    runtime_env: Optional[Dict[str, Any]] = None,
     **engine_overrides,
 ):
     engine_kwargs = {
@@ -55,7 +54,6 @@ def _schedule(
         accelerator_type=accelerator_type,
         engine_kwargs=engine_kwargs,
         placement_group_config=placement_group_config,
-        runtime_env=runtime_env,
     )
 
 

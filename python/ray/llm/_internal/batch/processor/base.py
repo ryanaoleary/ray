@@ -311,7 +311,9 @@ class Processor:
     paradigm for processing data using LLMs.
 
     When ``close_fn`` is set, call ``close()`` or use as a context manager after
-    derived Datasets have been fully consumed.
+    derived Datasets have been fully consumed so reserved resources are released.
+    ``close()`` / ``__exit__`` mark the processor closed even when ``close_fn``
+    is unset.
 
     Args:
         config: The processor config.

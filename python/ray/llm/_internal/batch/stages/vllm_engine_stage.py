@@ -919,10 +919,7 @@ class vLLMEngineStage(StatefulStage):
         """
         map_batches_kwargs = values["map_batches_kwargs"]
         # Skip default PG construction when the builder already set scheduling.
-        if (
-            "scheduling_strategy" in map_batches_kwargs
-            or "ray_remote_args_fn" in map_batches_kwargs
-        ):
+        if "scheduling_strategy" in map_batches_kwargs:
             return values
         accelerator_type = map_batches_kwargs.get("accelerator_type", "")
         fn_constructor_kwargs = values["fn_constructor_kwargs"]

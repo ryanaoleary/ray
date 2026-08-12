@@ -1,6 +1,5 @@
 """Shared accelerator configurations and backend abstractions for LLM serving and batch inference."""
 
-import logging
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -15,6 +14,7 @@ from ray._private.accelerators.tpu import (
     get_chips_per_host,
     get_num_chips_from_topology,
 )
+from ray.llm._internal.common.observability.logging import get_logger
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.tpu import (
@@ -22,7 +22,7 @@ from ray.util.tpu import (
     slice_placement_group,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # CPU reservation for the Ray Data actor on each TPU host.
 PARENT_ACTOR_CPU_RESERVE = 1
@@ -215,7 +215,6 @@ class AcceleratorBackend(ABC):
         accelerator_type: Optional[str],
         engine_kwargs: Dict[str, Any],
         placement_group_config: Optional[Dict[str, Any]],
-        runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
         """Return ``(map_batches_kwargs, optional close_fn)`` for batch inference.
 
@@ -229,6 +228,7 @@ class AcceleratorBackend(ABC):
 
 
 class CPUAccelerator(AcceleratorBackend):
+    # stateless — no __init__
     def default_bundles(
         self, *, num_devices: int, accelerator_type_str: Optional[str] = None
     ):
@@ -253,6 +253,7 @@ class CPUAccelerator(AcceleratorBackend):
 
 
 class GPUAccelerator(AcceleratorBackend):
+    # stateless — no __init__
     def default_bundles(
         self, *, num_devices: int, accelerator_type_str: Optional[str] = None
     ):
@@ -438,7 +439,7 @@ class TPUAccelerator(AcceleratorBackend):
         if self._slice_pg_wrapper is None:
             return
         try:
-            logger.info("Shutting down TPU slice PG for server replica.")
+            logger.info("Shutting down TPU slice placement group.")
             self._slice_pg_wrapper.shutdown()
         except Exception as e:
             logger.warning(f"Failed to shut down TPU slice PG: {e}")
@@ -470,8 +471,6 @@ class TPUAccelerator(AcceleratorBackend):
                 dict(bundle) for bundle in placement_group_config["bundles"]
             ]
         else:
-            # Strategy-only or empty config is rejected upstream by
-            # PlacementGroupConfig; treat as a programming error here.
             raise ValueError(
                 "placement_group_config must specify bundle_per_worker or bundles."
             )
@@ -570,7 +569,6 @@ class TPUAccelerator(AcceleratorBackend):
         accelerator_type: Optional[str],
         engine_kwargs: Dict[str, Any],
         placement_group_config: Optional[Dict[str, Any]],
-        runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
         """Reserve a TPU slice placement group for batch inference.
 
@@ -578,7 +576,6 @@ class TPUAccelerator(AcceleratorBackend):
         ``(map_batches_kwargs, close_fn)``. ``close_fn`` tears down the slice
         and raises on failure so callers can retry.
         """
-        # runtime_env is applied by the builder; do not duplicate it here.
         if not self._config.topology:
             raise ValueError(
                 "TPU batch inference requires accelerator_config.topology. "

@@ -157,7 +157,12 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             ``accelerator_config`` sets a TPU topology.
         accelerator_config: Hardware-specific configuration parameters for the
             chosen accelerator. The expected schema is dynamically typed based
-            on the ``kind`` discriminator.
+            on the ``kind`` discriminator. For TPU batch inference, set
+            ``kind="tpu"`` with a ``topology`` (for example ``"4x4"``); engine
+            ``tensor_parallel_size * pipeline_parallel_size`` must equal the
+            topology chip count, and ``concurrency`` must be ``1`` or ``(1, 1)``.
+            Release the reserved slice with ``Processor.close()`` or a context
+            manager after materializing derived Datasets.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy
