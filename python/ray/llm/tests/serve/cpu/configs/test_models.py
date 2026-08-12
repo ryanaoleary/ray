@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pydantic
 import pytest
 
+import ray.llm._internal.common.accelerators as accelerators_mod
 from ray.llm._internal.common.accelerators import (
     CPUAccelerator,
     CPUConfig,
@@ -542,8 +543,6 @@ class TestAcceleratorConfigLogic:
 
     def test_default_bundles_and_create_pg_forward_chips_per_vm(self, monkeypatch):
         """TPUConfig.chips_per_vm reaches create_placement_group from Serve defaults."""
-        import ray.llm._internal.common.accelerators as accelerators_mod
-
         create = MagicMock(return_value=MagicMock(placement_group=object()))
         monkeypatch.setattr(accelerators_mod, "slice_placement_group", create)
         backend = TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4))
@@ -562,8 +561,6 @@ class TestAcceleratorConfigLogic:
 
     def test_create_pg_passes_strategy_through(self, monkeypatch):
         """create_placement_group forwards the caller strategy unchanged."""
-        import ray.llm._internal.common.accelerators as accelerators_mod
-
         create = MagicMock(return_value=MagicMock(placement_group=object()))
         monkeypatch.setattr(accelerators_mod, "slice_placement_group", create)
         backend = TPUAccelerator(TPUConfig(topology="2x4"))

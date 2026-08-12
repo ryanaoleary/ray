@@ -23,6 +23,7 @@ from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage
 from ray.llm._internal.common.accelerators import (
     DEFAULT_USER_CPU_PER_HOST,
     PARENT_ACTOR_CPU_RESERVE,
+    GPUAccelerator,
     GPUConfig,
     TPUAccelerator,
     TPUConfig,
@@ -127,8 +128,6 @@ def test_concurrency_one_accepted(concurrency):
 
 
 def test_omitted_accelerator_config_defaults_to_gpu():
-    from ray.llm._internal.common.accelerators import GPUAccelerator
-
     cfg = vLLMEngineProcessorConfig(model_source="m")
     assert cfg.accelerator_config is None
     assert isinstance(
