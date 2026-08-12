@@ -918,8 +918,8 @@ class vLLMEngineStage(StatefulStage):
             The updated values.
         """
         map_batches_kwargs = values["map_batches_kwargs"]
-        # Skip GPU placement-group construction when the builder already attached
-        # scheduling (e.g. multi-host TPU Batch).
+        # Skip default placement-group setup when scheduling is already configured
+        # (e.g. multi-host TPU batch).
         if (
             "scheduling_strategy" in map_batches_kwargs
             or "ray_remote_args_fn" in map_batches_kwargs

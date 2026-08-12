@@ -278,7 +278,7 @@ class VLLMEngineConfig(BaseModelExtended):
             for bundle_dict in explicit_bundles:
                 bundle = bundle_dict.copy()
                 if self.accelerator_type:
-                    # Prefer setdefault so an explicit accelerator resource is kept.
+                    # Don't override an explicit accelerator resource hint.
                     res_key = format_ray_accelerator_resource(self.accelerator_type)
                     bundle.setdefault(res_key, 0.001)
                 bundles.append(bundle)

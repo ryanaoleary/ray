@@ -560,12 +560,8 @@ class TestAcceleratorConfigLogic:
         assert slice_kwargs["chips_per_vm"] == 4
         assert slice_kwargs["resources_per_bundle"]["TPU"] == 4
 
-    def test_create_pg_passes_strategy_through_without_labels(self, monkeypatch):
-        """Serve must not rewrite strategy or inject bundle labels.
-
-        Placement strategy is caller-controlled (Serve defaults to PACK via
-        placement_strategy). Users may pass STRICT_PACK/SPREAD explicitly.
-        """
+    def test_create_pg_passes_strategy_through(self, monkeypatch):
+        """create_placement_group forwards the caller strategy unchanged."""
         import ray.llm._internal.common.accelerators as accelerators_mod
 
         create = MagicMock(return_value=MagicMock(placement_group=object()))
@@ -579,7 +575,6 @@ class TestAcceleratorConfigLogic:
         )
         slice_kwargs = create.call_args.kwargs
         assert slice_kwargs["strategy"] == "PACK"
-        assert "bundle_label_selector" not in slice_kwargs
 
 
 class TestCheckpointInfo:

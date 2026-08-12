@@ -1,7 +1,7 @@
-"""Unit tests for multi-host TPU Batch scheduling.
+"""Unit tests for multi-host TPU batch scheduling.
 
-Stub ``slice_placement_group`` / PG wait only. These tests cover Batch config
-validation, placement kwargs, and processor lifecycle.
+Mocks ``slice_placement_group`` and placement-group readiness. Covers config
+validation, map_batches kwargs, and processor close lifecycle.
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ def test_defaults_spread_when_strategy_unset(stub_slice_pg):
         detokenize=False,
         apply_chat_template=False,
     )
-    # TPU topology + omitted strategy → SPREAD.
+    # Omitted strategy with TPU topology defaults to SPREAD.
     assert cfg.placement_group_config["strategy"] == "SPREAD"
     processor = build_processor(cfg)
     assert create.call_args.kwargs["strategy"] == "SPREAD"

@@ -2,7 +2,7 @@
 
 import hashlib
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import transformers
 from pydantic import Field, field_validator, model_validator
@@ -61,8 +61,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_ARCHITECTURE = "UNKNOWN_MODEL_ARCHITECTURE"
 
 
-def _release_close_fn(close_fn) -> None:
-    """Best-effort invocation of the processor close callback (e.g. SlicePG shutdown)."""
+def _release_close_fn(close_fn: Optional[Callable[[], None]]) -> None:
+    """Best-effort invocation of the processor close callback."""
     if close_fn is None:
         return
     try:
@@ -119,8 +119,9 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Hardware-specific configuration parameters for the chosen accelerator. "
-            "The expected schema is dynamically typed based on the 'kind' discriminator."
+            "Hardware-specific settings selected by 'kind'. For TPU multi-host "
+            "batch, use e.g. {'kind': 'tpu', 'topology': '4x4'} "
+            "(optional 'chips_per_vm')."
         ),
     )
 
@@ -151,7 +152,6 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     def _normalize_accelerator_type(cls, value):
         if value is None:
             return None
-        # Normalize TPU accelerator_type strings only; leave other values unchanged.
         normalized = normalize_tpu_accelerator_type(value)
         if normalized == CPU_ACCELERATOR_TYPE_LITERAL:
             raise ValueError(
@@ -190,7 +190,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
             _, hi = (conc, conc) if isinstance(conc, int) else conc
             if hi != 1:
                 raise ValueError(
-                    "Topology-backed TPU batch inference requires a single engine "
+                    "TPU batch inference with topology requires a single engine "
                     f"replica (concurrency=1 or (1, 1)); got {self.concurrency!r}."
                 )
         elif isinstance(self.accelerator_config, TPUConfig):
@@ -341,7 +341,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Telemetry before reserving accelerator resources (e.g. TPU SlicePG).
+    # Telemetry before reserving accelerator resources (e.g. a TPU slice).
     # We download the config files here so that we can report the underlying
     # architecture to the telemetry system. This should be a lightweight operation.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
@@ -422,8 +422,8 @@ def build_vllm_engine_processor(
 
     close_fn = None
     if isinstance(config.accelerator_config, TPUConfig):
-        # Reserve SlicePG via the accelerator backend. Stage post_init skips its
-        # own PG when map_batches already has scheduling_strategy / ray_remote_args_fn.
+        # Reserve a TPU slice via the accelerator backend. Stage post_init skips
+        # its own placement group when scheduling_strategy is already set.
         engine_kwargs = dict(config.engine_kwargs)
         backend = get_accelerator_backend(config.accelerator_config)
         tpu_map_kwargs, close_fn = backend.build_batch_scheduling_options(
@@ -438,8 +438,7 @@ def build_vllm_engine_processor(
         map_batches_kwargs.update(tpu_map_kwargs)
 
     try:
-        # Build compute after any SlicePG reservation so construction failures
-        # still run close_fn cleanup.
+        # Build compute after slice reservation so failures still run close_fn.
         # The number of running replicas. This is a deprecated field, but
         # we need to set `max_tasks_in_flight_per_actor` through `compute`,
         # which initiates enough many overlapping UDF calls per actor, to

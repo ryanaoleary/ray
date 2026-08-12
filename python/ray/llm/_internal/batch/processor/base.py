@@ -310,8 +310,8 @@ class Processor:
     processing stages, and finally a postprocess stage. We use processor as a
     paradigm for processing data using LLMs.
 
-    When the builder passes ``close_fn`` (e.g. to tear down a reserved TPU
-    slice placement group), call ``close()`` or use as a context manager after
+    When ``close_fn`` is set (for example to release a reserved TPU slice
+    placement group), call ``close()`` or use as a context manager after
     derived Datasets have been fully consumed.
 
     Args:
@@ -326,7 +326,7 @@ class Processor:
             preprocess stage (e.g., num_cpus, memory, concurrency).
         postprocess_map_kwargs: Optional kwargs to pass to Dataset.map() for the
             postprocess stage (e.g., num_cpus, memory, concurrency).
-        close_fn: Optional callback for ``close()`` (e.g. SlicePG shutdown).
+        close_fn: Optional callback invoked by ``close()`` to release reserved resources.
     """
 
     # The internal used data column name ("__data"). Your input
@@ -355,7 +355,7 @@ class Processor:
         self._lock = threading.Lock()
         self._finalizer = None
         if close_fn is not None:
-            # Finalize must not capture self (creates a reference cycle).
+            # Avoid capturing self in the finalizer.
             self._finalizer = weakref.finalize(
                 self, Processor._warn_unclosed, close_fn, type(self).__name__
             )
@@ -402,11 +402,11 @@ class Processor:
                 pass
 
     def close(self) -> None:
-        """Release resources from ``close_fn`` and mark this processor closed.
+        """Mark closed and run ``close_fn``.
 
-        Materialize derived Datasets before calling close(). ``close_fn`` and the
-        GC finalizer are cleared only after a successful ``close_fn`` call so a
-        failed shutdown can be retried.
+        Materialize derived Datasets before calling close(). ``_close_fn`` is
+        cleared only after a successful call so shutdown can be retried. The
+        processor stays closed even if ``close_fn`` fails.
         """
         with self._lock:
             self._closed = True

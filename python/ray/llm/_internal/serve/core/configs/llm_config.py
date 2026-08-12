@@ -185,8 +185,8 @@ class LLMConfig(BaseModelExtended):
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Hardware-specific configuration parameters for the chosen accelerator. "
-            "The expected schema is dynamically typed based on the 'kind' discriminator."
+            "Hardware-specific settings selected by 'kind' "
+            "(e.g. {'kind': 'tpu', 'topology': '4x4'})."
         ),
     )
 

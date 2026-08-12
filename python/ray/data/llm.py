@@ -152,10 +152,12 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             vLLM engine workers. Accepts ``bundle_per_worker`` (auto-replicated by
             ``tp*pp``) or ``bundles`` (full list of resource dicts), plus an
             optional ``strategy``
-            (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
-        accelerator_config: Hardware-specific configuration parameters for the
-            chosen accelerator. The expected schema is dynamically typed based
-            on the ``kind`` discriminator.
+            (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). When
+            ``strategy`` is omitted, defaults to ``PACK``, or to ``SPREAD`` when
+            ``accelerator_config`` sets a TPU topology.
+        accelerator_config: Hardware-specific settings selected by ``kind``. For
+            TPU multi-host batch, use e.g. ``{"kind": "tpu", "topology": "4x4"}``
+            (optional ``chips_per_vm``).
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

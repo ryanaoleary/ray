@@ -25,12 +25,12 @@ from ray.util.tpu import (
 
 logger = logging.getLogger(__name__)
 
-# Constants for TPU batch scheduling
+# CPU reservation for the Ray Data actor on each TPU host.
 PARENT_ACTOR_CPU_RESERVE = 1
 DEFAULT_USER_CPU_PER_HOST = 1
 CPU_ACCELERATOR_TYPE_LITERAL = "CPU"
 
-# Bound driver-side wait for an eagerly acquired TPU placement group.
+# Timeout for waiting on TPU slice placement group readiness.
 DEFAULT_PG_READY_TIMEOUT_S = 180.0
 
 
@@ -81,7 +81,7 @@ def infer_hardware_kind_from_bundles(
     if any(b.get("GPU", 0) > 0 for b in all_bundles):
         return "gpu"
 
-    # If a config was provided but lacks GPUs or TPUs, it is a CPU deployment
+    # If a config was provided but lacks GPUs or TPUs, it is a CPU deployment.
     return "cpu"
 
 
@@ -103,7 +103,7 @@ class TPUConfig(AcceleratorConfig):
         default=None,
         description=(
             "TPU slice topology (e.g. '4x4', '2x4'). Required for multi-host "
-            "Batch and for deferred Serve SlicePG placement."
+            "batch inference and for Serve deferred slice placement."
         ),
     )
     chips_per_vm: Optional[int] = Field(
@@ -228,15 +228,14 @@ class AcceleratorBackend(ABC):
 
         Implementations may populate accelerator-specific defaults in
         ``engine_kwargs``; callers should pass a private mutable copy. Backends
-        without Batch support raise ``NotImplementedError``.
+        without batch support raise ``NotImplementedError``.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} does not implement Batch scheduling options."
+            f"{type(self).__name__} does not implement batch scheduling options."
         )
 
 
 class CPUAccelerator(AcceleratorBackend):
-    # Stateless backend; no instance state.
     def default_bundles(
         self, *, num_devices: int, accelerator_type_str: Optional[str] = None
     ):
@@ -261,7 +260,6 @@ class CPUAccelerator(AcceleratorBackend):
 
 
 class GPUAccelerator(AcceleratorBackend):
-    # Stateless backend; no instance state.
     def default_bundles(
         self, *, num_devices: int, accelerator_type_str: Optional[str] = None
     ):
@@ -302,13 +300,11 @@ class TPUAccelerator(AcceleratorBackend):
         self, *, num_devices: int, accelerator_type_str: Optional[str] = None
     ):
         if not self._config.topology:
-            # Fallback to per-chip bundles if no topology is specified
             bundle = {"TPU": 1}
             if accelerator_type_str:
                 bundle[format_ray_accelerator_resource(accelerator_type_str)] = 0.001
             return [bundle.copy() for _ in range(num_devices)]
 
-        # Topology is specified, compute per-host bundles
         if not accelerator_type_str:
             raise ValueError(
                 "`accelerator_type` must be specified when `topology` is present "
@@ -356,7 +352,7 @@ class TPUAccelerator(AcceleratorBackend):
                 "accelerator_type must be provided for TPU slice provisioning."
             )
 
-        # Serve semantics: homogeneous positive-TPU bundles, else TPU:1.
+        # Prefer an explicit homogeneous TPU bundle; otherwise default to TPU:1.
         if bundles:
             tpu_bundles = [b for b in bundles if b.get("TPU", 0) > 0]
             if not tpu_bundles:
@@ -388,11 +384,9 @@ class TPUAccelerator(AcceleratorBackend):
         strategy: Optional[str],
         name: str = "",
     ):
-        """Create and own a TPU slice placement group.
+        """Create a TPU slice placement group and store the handle.
 
-        Passes ``strategy`` through unmodified (aside from defaulting unset
-        strategy to PACK). Serve always supplies an explicit strategy from
-        deployment config. Batch resolves its own default before calling this.
+        Uses ``strategy`` as provided, or ``PACK`` if unset.
         """
         if not self._config.topology:
             raise ValueError(
@@ -400,7 +394,8 @@ class TPUAccelerator(AcceleratorBackend):
             )
         if self._slice_pg_wrapper is not None:
             logger.debug(
-                "Existing TPU slice PG found. Shutting it down before creating a new one."
+                "Existing TPU slice placement group found; shutting it down "
+                "before creating a new one."
             )
             self.shutdown()
 
@@ -420,11 +415,10 @@ class TPUAccelerator(AcceleratorBackend):
 
     @property
     def requires_deferred_placement_group(self) -> bool:
-        """
-        If a TPU topology is specified, we defer PG creation so the replica can
-        provision a slice placement group at runtime. This ensures multi-host
-        TPU slices are gang-scheduled atomically according to their physical
-        topology rather than fragmented across the cluster.
+        """Defer placement-group creation when a TPU topology is configured.
+
+        The Serve replica then provisions a slice placement group at runtime so
+        multi-host TPU slices are gang-scheduled by physical topology.
         """
         return bool(self._config.topology)
 
@@ -445,14 +439,14 @@ class TPUAccelerator(AcceleratorBackend):
         return options
 
     def shutdown(self) -> None:
-        """Release the owned SlicePG. Swallows errors for Serve replica teardown."""
+        """Shut down the slice placement group if present. Swallows errors (Serve teardown)."""
         if self._slice_pg_wrapper is None:
             return
         try:
             logger.info("Shutting down TPU slice placement group.")
             self._slice_pg_wrapper.shutdown()
         except Exception as e:
-            logger.warning(f"Failed to shut down TPU slice PG: {e}")
+            logger.warning(f"Failed to shut down TPU slice placement group: {e}")
         finally:
             self._slice_pg_wrapper = None
 
@@ -460,7 +454,7 @@ class TPUAccelerator(AcceleratorBackend):
         self,
         placement_group_config: Optional[Dict[str, Any]],
     ) -> Dict[str, float]:
-        """Resolve the Batch worker-resource template for one TPU bundle.
+        """Resolve the per-worker resource template for one TPU bundle.
 
         Default omits TPU so Ray fills chips-per-VM. Explicit configs supply a
         homogeneous template. Always apply the parent-actor CPU floor so the
@@ -491,7 +485,6 @@ class TPUAccelerator(AcceleratorBackend):
                 "placement_group_config bundles must be non-empty when provided."
             )
 
-        # Validate resource types before any numeric comparisons.
         for bundle in source_bundles:
             gpu = bundle.get("GPU", 0)
             if (
@@ -504,7 +497,7 @@ class TPUAccelerator(AcceleratorBackend):
                 )
             if gpu > 0:
                 raise ValueError(
-                    "GPU resources are not supported in TPU Batch "
+                    "GPU resources are not supported in TPU batch "
                     f"placement_group_config bundles; got GPU={bundle['GPU']!r}."
                 )
             if "TPU" in bundle:
@@ -527,13 +520,13 @@ class TPUAccelerator(AcceleratorBackend):
         has_positive_tpu = [bundle.get("TPU", 0) > 0 for bundle in source_bundles]
         if any(has_positive_tpu) and not all(has_positive_tpu):
             raise ValueError(
-                "TPU Batch placement_group_config bundles cannot mix TPU-bearing "
+                "TPU batch placement_group_config bundles cannot mix TPU-bearing "
                 "and non-TPU bundles."
             )
 
         if len(source_bundles) > 1:
             logger.warning(
-                "placement_group_config specified %d bundles, but TPU Batch "
+                "placement_group_config specified %d bundles, but TPU batch "
                 "scheduling derives the bundle count from topology %r. Using "
                 "bundles[0] as a homogeneous per-worker template; the extra %d "
                 "entries only participate in the homogeneity check.",
@@ -576,13 +569,11 @@ class TPUAccelerator(AcceleratorBackend):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Eagerly reserve one TPU slice placement group for Batch.
+        """Reserve a TPU slice placement group for batch inference.
 
-        Validates config, waits for SlicePG readiness, and returns map kwargs
-        plus a ``close_fn`` that tears down the slice. Do not use
-        ``self.shutdown`` as ``close_fn``: that path swallows errors for Serve
-        replica teardown, while Batch must surface failures so
-        ``Processor.close()`` can retry.
+        Validates config, waits until the slice is ready, and returns
+        ``(map_batches_kwargs, close_fn)``. ``close_fn`` tears down the slice
+        and raises on failure so callers can retry.
         """
         if not self._config.topology:
             raise ValueError(
@@ -639,12 +630,11 @@ class TPUAccelerator(AcceleratorBackend):
             )
 
         merged_runtime_env = copy.deepcopy(runtime_env or {})
-        env_vars = merged_runtime_env.setdefault("env_vars", {})
-        if not isinstance(env_vars, dict):
+        env_vars = merged_runtime_env.get("env_vars")
+        if env_vars is not None and not isinstance(env_vars, dict):
             raise ValueError("runtime_env['env_vars'] must be a dictionary.")
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
-        # Topology-backed path: SPREAD when unset (ProcessorConfig resolves the same).
         strategy = (placement_group_config or {}).get("strategy") or "SPREAD"
 
         handle = self._create_slice_pg_handle(
@@ -653,18 +643,8 @@ class TPUAccelerator(AcceleratorBackend):
             strategy=strategy,
         )
         try:
-            try:
-                ray.get(
-                    handle.placement_group.ready(), timeout=DEFAULT_PG_READY_TIMEOUT_S
-                )
-            except ray.exceptions.GetTimeoutError as exc:
-                raise TimeoutError(
-                    f"Timed out after {DEFAULT_PG_READY_TIMEOUT_S}s waiting for TPU "
-                    f"slice placement group readiness. Requested {canonical_accel} "
-                    f"topology={topology} ({handle.num_hosts} hosts, "
-                    f"{handle.num_bundles} bundles)."
-                ) from exc
-        except Exception:
+            ray.get(handle.placement_group.ready(), timeout=DEFAULT_PG_READY_TIMEOUT_S)
+        except Exception as exc:
             try:
                 handle.shutdown()
             except Exception:
@@ -674,19 +654,26 @@ class TPUAccelerator(AcceleratorBackend):
                 )
             finally:
                 self._slice_pg_wrapper = None
+            if isinstance(exc, ray.exceptions.GetTimeoutError):
+                raise TimeoutError(
+                    f"Timed out after {DEFAULT_PG_READY_TIMEOUT_S}s waiting for TPU "
+                    f"slice placement group readiness. Requested {canonical_accel} "
+                    f"topology={topology} ({handle.num_hosts} hosts, "
+                    f"{handle.num_bundles} bundles)."
+                ) from exc
             raise
 
         def close_fn() -> None:
-            owned = self._slice_pg_wrapper
-            if owned is None:
+            # Prefer this over shutdown(): batch needs failures to propagate for retry.
+            pg_handle = self._slice_pg_wrapper
+            if pg_handle is None:
                 return
             # Clear only after a successful shutdown so a failed close can retry.
-            owned.shutdown()
+            pg_handle.shutdown()
             self._slice_pg_wrapper = None
 
         map_batches_kwargs = {
-            # Bundle 0 CPU is sized for the Ray Data engine actor + user map work.
-            # Safe while vLLM's Ray TPU workers request num_cpus=0.
+            # Bundle 0 CPU covers the Ray Data actor (vLLM TPU workers use num_cpus=0).
             "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
             "num_gpus": 0,
             "resources": {},
