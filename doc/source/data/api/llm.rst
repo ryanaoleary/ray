@@ -35,6 +35,7 @@ Processor configs
     ~HttpRequestProcessorConfig
     ~vLLMEngineProcessorConfig
     ~SGLangEngineProcessorConfig
+    ~TPUConfig
 
 .. _stage-configs-ref:
 

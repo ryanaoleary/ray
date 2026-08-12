@@ -1,6 +1,5 @@
 """Shared accelerator configurations and backend abstractions for LLM serving and batch inference."""
 
-import copy
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -32,6 +31,17 @@ CPU_ACCELERATOR_TYPE_LITERAL = "CPU"
 
 # Timeout for waiting on TPU slice placement group readiness.
 DEFAULT_PG_READY_TIMEOUT_S = 180.0
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+    return value
+
+
+def _wait_for_placement_group(pg: PlacementGroup, timeout_s: float) -> None:
+    """Wait until ``pg`` is ready. Tests patch this seam instead of ``ray.get``."""
+    ray.get(pg.ready(), timeout=timeout_s)
 
 
 AcceleratorType = Enum("AcceleratorType", vars(accelerators))
@@ -99,7 +109,15 @@ class GPUConfig(AcceleratorConfig):
 
 class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
-    topology: Optional[str] = None
+    topology: Optional[str] = Field(
+        default=None,
+        description=(
+            "Physical TPU chip topology (e.g. '4x4', '2x4'). Required for "
+            "multi-host TPU batch inference and deferred Serve slice placement. "
+            "When set, Ray reserves a SlicePlacementGroup whose bundle count "
+            "comes from the topology (not from placement_group_config)."
+        ),
+    )
     chips_per_vm: Optional[int] = Field(
         default=None,
         description=(
@@ -130,7 +148,7 @@ class TPUConfig(AcceleratorConfig):
         return value
 
     @model_validator(mode="after")
-    def _validate_chips_per_vm(self) -> "TPUConfig":
+    def _validate_topology_and_chips(self) -> "TPUConfig":
         if self.chips_per_vm is not None and not self.topology:
             raise ValueError("chips_per_vm requires topology to be specified.")
         if self.chips_per_vm is not None and self.chips_per_vm <= 0:
@@ -223,6 +241,10 @@ class AcceleratorBackend(ABC):
         Implementations may populate accelerator-specific defaults in
         ``engine_kwargs``; callers should pass a private mutable copy. Backends
         without batch support raise ``NotImplementedError``.
+
+        ``runtime_env`` is part of the shared signature for future backends; the
+        TPU backend does not consume it (the builder already applies
+        ``config.runtime_env`` to map_batches kwargs).
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement batch scheduling options."
@@ -455,9 +477,17 @@ class TPUAccelerator(AcceleratorBackend):
         Default omits TPU so Ray fills chips-per-VM. Explicit configs supply a
         homogeneous template. Always apply the parent-actor CPU floor so the
         Ray Data engine actor and user map work can admit onto bundle 0.
+
+        Chip fill: ``get_tpu_worker_resources`` in ``ray/util/tpu.py`` fills
+        ``TPU`` with chips-per-VM whenever the key is absent, even when a
+        non-``None`` ``resources_per_worker`` dict is supplied (e.g.
+        ``{"CPU": 2.0}``). Passing a CPU-only template therefore matches Ray's
+        standard fill behavior; it does not suppress it.
         """
         cpu_floor = float(PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST)
         if placement_group_config is None:
+            # Omit TPU: SlicePlacementGroup / get_tpu_worker_resources fills
+            # chips-per-VM (ray/util/tpu.py get_tpu_worker_resources).
             return {"CPU": cpu_floor}
 
         bundle_per_worker = placement_group_config.get("bundle_per_worker")
@@ -541,7 +571,7 @@ class TPUAccelerator(AcceleratorBackend):
                 )
         else:
             # No positive TPU: keep CPU/custom resources and omit TPU so
-            # SlicePlacementGroup fills chips-per-VM (same as the default path).
+            # get_tpu_worker_resources fills chips-per-VM (same as default path).
             cleaned = [
                 {k: v for k, v in b.items() if v != 0 and v != 0.0}
                 for b in source_bundles
@@ -554,7 +584,18 @@ class TPUAccelerator(AcceleratorBackend):
             worker_bundle = cleaned[0]
 
         out = {k: v for k, v in worker_bundle.items() if v != 0 and v != 0.0}
-        out["CPU"] = max(float(out.get("CPU", 0.0)), cpu_floor)
+        requested_cpu = float(out.get("CPU", 0.0))
+        if 0 < requested_cpu < cpu_floor:
+            logger.warning(
+                "placement_group_config requested CPU=%s per bundle, raising to %s: the "
+                "Ray Data engine actor (%s CPU) and user map work (%s CPU) must admit onto "
+                "bundle 0 of the TPU slice.",
+                requested_cpu,
+                cpu_floor,
+                PARENT_ACTOR_CPU_RESERVE,
+                DEFAULT_USER_CPU_PER_HOST,
+            )
+        out["CPU"] = max(requested_cpu, cpu_floor)
         return out
 
     def build_batch_scheduling_options(
@@ -570,7 +611,12 @@ class TPUAccelerator(AcceleratorBackend):
         Validates config, waits until the slice is ready, and returns
         ``(map_batches_kwargs, close_fn)``. ``close_fn`` tears down the slice
         and raises on failure so callers can retry.
+
+        ``runtime_env`` is unused here: the builder already sets
+        ``config.runtime_env`` on map_batches kwargs. Users must supply
+        ``TPU_MULTIHOST_BACKEND=ray`` themselves via that config field.
         """
+        del runtime_env  # Kept on the shared signature; builder owns runtime_env.
         if not self._config.topology:
             raise ValueError(
                 "TPU batch inference requires accelerator_config.topology. "
@@ -588,11 +634,6 @@ class TPUAccelerator(AcceleratorBackend):
                 "TPU batch inference requires distributed_executor_backend='ray'; "
                 f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
-
-        def _positive_int(value: Any, name: str) -> int:
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer; got {value!r}.")
-            return value
 
         tp = _positive_int(
             engine_kwargs.get("tensor_parallel_size", 1), "tensor_parallel_size"
@@ -623,11 +664,6 @@ class TPUAccelerator(AcceleratorBackend):
                 f"got {dp}."
             )
 
-        merged_runtime_env = copy.deepcopy(runtime_env or {})
-        env_vars = merged_runtime_env.get("env_vars")
-        if env_vars is not None and not isinstance(env_vars, dict):
-            raise ValueError("runtime_env['env_vars'] must be a dictionary.")
-
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
         strategy = (placement_group_config or {}).get("strategy") or "SPREAD"
 
@@ -635,9 +671,12 @@ class TPUAccelerator(AcceleratorBackend):
             accelerator_type=canonical_accel,
             resources_per_bundle=resources_per_bundle,
             strategy=strategy,
+            name=f"ray-data-llm-tpu-{topology}",
         )
         try:
-            ray.get(handle.placement_group.ready(), timeout=DEFAULT_PG_READY_TIMEOUT_S)
+            _wait_for_placement_group(
+                handle.placement_group, DEFAULT_PG_READY_TIMEOUT_S
+            )
         except Exception as exc:
             try:
                 handle.shutdown()
@@ -657,6 +696,20 @@ class TPUAccelerator(AcceleratorBackend):
                 ) from exc
             raise
 
+        # Retain head PGs for the lifetime of the slice. Ray's
+        # SlicePlacementGroup.release_head_pgs docstring (ray/util/tpu.py) says
+        # head PGs are redundant after the worker PG is ready and recommends
+        # releasing them. That is wrong for concurrent SlicePGs: the head PG
+        # exclusively claims the per-slice ``TPU-{pod_type}-head`` custom
+        # resource (see reserve_tpu_slice in ray/_private/accelerators/tpu.py).
+        # Releasing it frees that marker so a second SlicePG can reserve the
+        # same slice name while the first still holds worker TPU bundles,
+        # causing multi-slice contention / failed gang scheduling.
+        # handle.shutdown() releases head PGs at close(), so nothing leaks.
+        # Head PGs reserve only the custom head resource — not CPU — so they
+        # do not reduce bundle-0 CPU available to the Ray Data parent actor
+        # (num_cpus == resources_per_bundle["CPU"] == CPU floor).
+
         def close_fn() -> None:
             pg_handle = self._slice_pg_wrapper
             if pg_handle is None:
@@ -675,7 +728,6 @@ class TPUAccelerator(AcceleratorBackend):
                 placement_group_bundle_index=0,
                 placement_group_capture_child_tasks=True,
             ),
-            "runtime_env": merged_runtime_env,
         }
         return map_batches_kwargs, close_fn
 

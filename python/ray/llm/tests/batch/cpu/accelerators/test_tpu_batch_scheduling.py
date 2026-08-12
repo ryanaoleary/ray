@@ -16,13 +16,18 @@ import pytest
 
 import ray
 import ray.llm._internal.common.accelerators as accelerators
-from ray.data.llm import build_processor, vLLMEngineProcessorConfig
+from ray.data.llm import (
+    TPUConfig as PublicTPUConfig,
+    build_processor,
+    vLLMEngineProcessorConfig,
+)
 from ray.llm._internal.batch.processor import vllm_engine_proc
 from ray.llm._internal.batch.processor.base import Processor
 from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage
 from ray.llm._internal.common.accelerators import (
     DEFAULT_USER_CPU_PER_HOST,
     PARENT_ACTOR_CPU_RESERVE,
+    AcceleratorConfig,
     GPUAccelerator,
     GPUConfig,
     TPUAccelerator,
@@ -70,7 +75,7 @@ def stub_slice_pg(monkeypatch):
     monkeypatch.setattr(
         handle.placement_group, "ready", MagicMock(return_value=MagicMock())
     )
-    monkeypatch.setattr(accelerators.ray, "get", MagicMock())
+    monkeypatch.setattr(accelerators, "_wait_for_placement_group", MagicMock())
     monkeypatch.setattr(
         vllm_engine_proc, "download_model_files", lambda *a, **k: "/tmp/mock-model"
     )
@@ -90,6 +95,13 @@ def _topo_config(**kwargs):
     "kwargs, match",
     [
         ({"accelerator_type": "TPU-V6E"}, "requires accelerator_config with topology"),
+        (
+            {
+                "accelerator_type": "TPU-V6E",
+                "accelerator_config": {"kind": "tpu"},
+            },
+            "requires accelerator_config with topology",
+        ),
         (
             {
                 "accelerator_type": "TPU-V6E",
@@ -135,6 +147,19 @@ def test_omitted_accelerator_config_defaults_to_gpu():
     )
 
 
+def test_get_accelerator_backend_rejects_unknown_type():
+    class _Unknown(AcceleratorConfig):
+        kind: str = "unknown"
+
+    with pytest.raises(TypeError, match="Unsupported accelerator config"):
+        get_accelerator_backend(_Unknown())
+
+
+def test_tpu_config_reexported_from_data_llm():
+    assert PublicTPUConfig is TPUConfig
+    assert PublicTPUConfig(kind="tpu", topology="4x4").topology == "4x4"
+
+
 @pytest.mark.parametrize(
     "topology, accel, tp, chips_per_vm, strategy, expect_strategy",
     [
@@ -159,13 +184,77 @@ def test_slice_pg_kwargs(
     )
     slice_kwargs = create.call_args.kwargs
     inspect.signature(slice_placement_group).bind(**slice_kwargs)
-    assert slice_kwargs["topology"] == topology
-    assert slice_kwargs["strategy"] == expect_strategy
-    assert slice_kwargs.get("chips_per_vm") == chips_per_vm
+    expected = {
+        "topology": topology,
+        "accelerator_version": "v6e",
+        "resources_per_bundle": {"TPU": 1, "CPU": float(_CPU_FLOOR)},
+        "strategy": expect_strategy,
+        "name": f"ray-data-llm-tpu-{topology}",
+    }
+    if chips_per_vm is not None:
+        expected["chips_per_vm"] = chips_per_vm
+    assert slice_kwargs == expected
     assert kwargs["num_cpus"] == _CPU_FLOOR
-    assert kwargs["num_cpus"] == slice_kwargs["resources_per_bundle"]["CPU"]
+    assert "runtime_env" not in kwargs
     close_fn()
     handle.shutdown.assert_called_once()
+
+
+def test_default_bundle_omits_tpu(stub_slice_pg):
+    _, create = stub_slice_pg
+    _, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+    )
+    resources = create.call_args.kwargs["resources_per_bundle"]
+    assert "TPU" not in resources
+    assert resources["CPU"] == float(_CPU_FLOOR)
+    assert create.call_args.kwargs == {
+        "topology": "4x4",
+        "accelerator_version": "v6e",
+        "resources_per_bundle": {"CPU": float(_CPU_FLOOR)},
+        "strategy": "SPREAD",
+        "name": "ray-data-llm-tpu-4x4",
+    }
+    close_fn()
+
+
+def test_cpu_only_template_omits_tpu(stub_slice_pg):
+    _, create = stub_slice_pg
+    _, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+        placement_group_config={"bundle_per_worker": {"CPU": 4}},
+    )
+    resources = create.call_args.kwargs["resources_per_bundle"]
+    assert "TPU" not in resources
+    assert resources["CPU"] == 4.0
+    close_fn()
+
+
+def test_cpu_floor_warns_when_overriding_user_value(stub_slice_pg, caplog):
+    with caplog.at_level(logging.WARNING, logger=accelerators.__name__):
+        _, close_fn = _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+            placement_group_config={"bundle_per_worker": {"TPU": 1, "CPU": 1}},
+        )
+    assert any(
+        "requested CPU=1.0 per bundle, raising to 2.0" in r.message
+        for r in caplog.records
+    )
+    close_fn()
+
+
+def test_cpu_floor_no_warning_when_cpu_omitted(stub_slice_pg, caplog):
+    with caplog.at_level(logging.WARNING, logger=accelerators.__name__):
+        _, close_fn = _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+            placement_group_config={"bundle_per_worker": {"TPU": 1}},
+        )
+    assert not any("raising to" in r.message for r in caplog.records)
+    close_fn()
 
 
 def test_defaults_spread_when_strategy_unset(stub_slice_pg):
@@ -253,6 +342,8 @@ def test_gpu_stage_scheduling_uses_pack_when_unset(monkeypatch):
         {"TPU": 1.5},
         {"TPU": 0},
         {"TPU": float("nan")},
+        {"TPU": float("inf")},
+        {"TPU": -1},
         {"GPU": 1},
         {"GPU": "1"},
     ],
@@ -377,7 +468,7 @@ def test_gpu_builder_does_not_create_slice_pg(stub_slice_pg):
     processor.close()
 
 
-def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
+def test_close_retry_after_failed_shutdown(stub_slice_pg):
     handle, _ = stub_slice_pg
     cfg = _topo_config(
         engine_kwargs={"tensor_parallel_size": 16},
@@ -392,7 +483,18 @@ def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
     assert processor._close_fn is not None
     processor.close()
     assert processor._close_fn is None
+    assert handle.shutdown.call_count == 2
 
+
+def test_unclosed_finalizer_releases_slice(stub_slice_pg, caplog):
+    handle, _ = stub_slice_pg
+    cfg = _topo_config(
+        engine_kwargs={"tensor_parallel_size": 16},
+        tokenize=False,
+        detokenize=False,
+        apply_chat_template=False,
+    )
+    handle.shutdown.side_effect = None
     processor = build_processor(cfg)
     with caplog.at_level(
         logging.WARNING, logger="ray.llm._internal.batch.processor.base"
@@ -400,16 +502,43 @@ def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
         del processor
         gc.collect()
     assert any("garbage-collected without close()" in r.message for r in caplog.records)
-    assert handle.shutdown.call_count >= 3
+    handle.shutdown.assert_called_once()
+
+
+def test_close_during_call_does_not_deadlock(stub_slice_pg):
+    cfg = _topo_config(
+        engine_kwargs={"tensor_parallel_size": 16},
+        tokenize=False,
+        detokenize=False,
+        apply_chat_template=False,
+    )
+    processor = build_processor(cfg)
+    ds = MagicMock()
+
+    # __call__ must release the closed-check lock before building the Dataset
+    # graph so close() from another thread cannot deadlock.
+    held_during_map = []
+
+    def _map(*args, **kwargs):
+        held_during_map.append(processor._lock.locked())
+        return ds
+
+    ds.map = _map
+    ds.map_batches_internal = _map
+    out = processor(ds)
+    assert out is ds
+    assert held_during_map
+    assert all(not held for held in held_during_map)
+    processor.close()
 
 
 def test_eager_timeout_shuts_down(stub_slice_pg, monkeypatch):
     handle, create = stub_slice_pg
 
-    def _timeout(*args, **kwargs):
+    def _timeout(pg, timeout_s):
         raise ray.exceptions.GetTimeoutError("timed out")
 
-    monkeypatch.setattr(accelerators.ray, "get", _timeout)
+    monkeypatch.setattr(accelerators, "_wait_for_placement_group", _timeout)
     with pytest.raises(TimeoutError, match="Timed out"):
         _schedule(TPUAccelerator(TPUConfig(topology="4x4")), tensor_parallel_size=16)
     create.assert_called_once()

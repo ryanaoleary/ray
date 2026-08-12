@@ -24,7 +24,7 @@ The :ref:`ray.data.llm <llm-ref>` module enables scalable batch inference on Ray
 **Operations:**
 
 * :ref:`Troubleshooting <troubleshooting>` - GPU memory, model loading issues
-* :ref:`Advanced configuration <advanced_configuration>` - Parallelism, per-stage tuning, LoRA, batch concurrency
+* :ref:`Advanced configuration <advanced_configuration>` - Parallelism, TPU, per-stage tuning, LoRA, batch concurrency
 
 .. _vllm_quickstart:
 
@@ -504,6 +504,31 @@ You can customize the placement group configuration to control how Ray places vL
     :language: python
     :start-after: __custom_placement_group_strategy_config_example_start__
     :end-before: __custom_placement_group_strategy_config_example_end__
+
+Multi-host TPU batch inference
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For multi-host TPU slices, set ``accelerator_type`` to a TPU type and pass an
+``accelerator_config`` with ``kind: tpu`` and a physical ``topology``. Ray Data
+reserves a :class:`~ray.util.tpu.SlicePlacementGroup` whose bundle count comes
+from the topology. Under a TPU topology:
+
+- ``tensor_parallel_size`` must equal the topology chip count
+- ``concurrency`` must be ``1`` or ``(1, 1)``
+- ``pipeline_parallel_size`` and ``data_parallel_size`` must be ``1``
+- ``bundle_per_worker`` / ``bundles`` are a **per-worker template**; the bundle
+  count is derived from the topology
+- Chip accounting assumes Ray's default ``RAY_TPU_RESOURCE_PER_CHIP=1``
+
+Set ``TPU_MULTIHOST_BACKEND=ray`` in ``runtime_env`` yourself. Ray Data does
+**not** inject this variable; omitting it on multi-host leaves the engine on
+the single-host UniProc path. Materialize derived Datasets inside
+``build_processor``'s context manager so the slice placement group is released:
+
+.. literalinclude:: doc_code/working-with-llms/tpu_batch_inference_example.py
+    :language: python
+    :start-after: __tpu_batch_inference_example_start__
+    :end-before: __tpu_batch_inference_example_end__
 
 Per-stage configuration
 ~~~~~~~~~~~~~~~~~~~~~~~

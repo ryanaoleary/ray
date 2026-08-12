@@ -151,6 +151,8 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     def _normalize_accelerator_type(cls, value):
         if value is None:
             return None
+        # normalize_tpu_accelerator_type uppercases and hyphenates; GPU strings
+        # (e.g. "A100", "H100") pass through unchanged.
         normalized = normalize_tpu_accelerator_type(value)
         if normalized == CPU_ACCELERATOR_TYPE_LITERAL:
             raise ValueError(
