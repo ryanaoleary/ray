@@ -372,7 +372,6 @@ def test_gpu_builder_does_not_create_slice_pg(stub_slice_pg):
     processor = build_processor(cfg)
     create.assert_not_called()
     stage = processor.get_stage_by_name("vLLMEngineStage")
-    # Master GPU path: stage owns scheduling via ray_remote_args_fn.
     assert "ray_remote_args_fn" in stage.map_batches_kwargs
     assert "scheduling_strategy" not in stage.map_batches_kwargs
     processor.close()
