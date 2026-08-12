@@ -597,19 +597,26 @@ class TPUAccelerator(AcceleratorBackend):
                 f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
 
+        # Match GPU / Serve: device count is TP × PP (PP defaults to 1).
         tp = engine_kwargs.get("tensor_parallel_size", 1)
-        if not isinstance(tp, int) or isinstance(tp, bool) or tp <= 0:
-            raise ValueError(
-                f"tensor_parallel_size must be a positive integer; got {tp!r}."
-            )
+        pp = engine_kwargs.get("pipeline_parallel_size", 1)
+        for name, value in (
+            ("tensor_parallel_size", tp),
+            ("pipeline_parallel_size", pp),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+        num_devices = tp * pp
 
         topology = self._config.topology.strip().lower()
         total_chips = get_num_chips_from_topology(topology)
-        if tp != total_chips:
+        if num_devices != total_chips:
             raise ValueError(
-                f"tensor_parallel_size must be {total_chips} for topology "
-                f"'{topology}' on {version} ({total_chips} physical chips / "
-                f"vLLM devices); got {tp}."
+                f"tensor_parallel_size * pipeline_parallel_size must be "
+                f"{total_chips} for topology '{topology}' on {version} "
+                f"({total_chips} physical chips / vLLM devices); got "
+                f"tensor_parallel_size={tp}, pipeline_parallel_size={pp} "
+                f"(product={num_devices})."
             )
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)

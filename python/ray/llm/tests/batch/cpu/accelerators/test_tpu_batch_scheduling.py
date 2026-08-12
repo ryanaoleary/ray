@@ -136,16 +136,17 @@ def test_omitted_accelerator_config_defaults_to_gpu():
 
 
 @pytest.mark.parametrize(
-    "topology, accel, tp, chips_per_vm, strategy, expect_strategy",
+    "topology, accel, tp, pp, chips_per_vm, strategy, expect_strategy",
     [
-        ("4x4", "TPU-V6E", 16, None, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 4, "PACK", "PACK"),
-        ("2x4", "TPU-V6E", 8, 4, "SPREAD", "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 4, "STRICT_SPREAD", "STRICT_SPREAD"),
+        ("4x4", "TPU-V6E", 16, 1, None, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 8, 2, None, None, "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 1, 4, "PACK", "PACK"),
+        ("2x4", "TPU-V6E", 8, 1, 4, "SPREAD", "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 1, 4, "STRICT_SPREAD", "STRICT_SPREAD"),
     ],
 )
 def test_slice_pg_kwargs(
-    stub_slice_pg, topology, accel, tp, chips_per_vm, strategy, expect_strategy
+    stub_slice_pg, topology, accel, tp, pp, chips_per_vm, strategy, expect_strategy
 ):
     handle, create = stub_slice_pg
     pg_config = {"bundle_per_worker": {"TPU": 1}}
@@ -155,6 +156,7 @@ def test_slice_pg_kwargs(
         TPUAccelerator(TPUConfig(topology=topology, chips_per_vm=chips_per_vm)),
         accelerator_type=accel,
         tensor_parallel_size=tp,
+        pipeline_parallel_size=pp,
         placement_group_config=pg_config,
     )
     slice_kwargs = create.call_args.kwargs
@@ -296,7 +298,18 @@ def test_topology_accepts_valid(good):
     "option_kwargs, match",
     [
         ({"distributed_executor_backend": "uni"}, "distributed_executor_backend"),
-        ({"tensor_parallel_size": 8}, "tensor_parallel_size must be 16"),
+        (
+            {"tensor_parallel_size": 8},
+            r"tensor_parallel_size \* pipeline_parallel_size must be 16",
+        ),
+        (
+            {"tensor_parallel_size": 8, "pipeline_parallel_size": 3},
+            r"tensor_parallel_size \* pipeline_parallel_size must be 16",
+        ),
+        (
+            {"pipeline_parallel_size": 0},
+            "pipeline_parallel_size must be a positive integer",
+        ),
         (
             {"placement_group_config": {"bundle_per_worker": {"GPU": 1, "TPU": 1}}},
             "GPU resources are not supported",
