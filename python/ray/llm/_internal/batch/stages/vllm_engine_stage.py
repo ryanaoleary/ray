@@ -919,17 +919,6 @@ class vLLMEngineStage(StatefulStage):
         """
         map_batches_kwargs = values["map_batches_kwargs"]
         # Skip default PG construction when the builder already set scheduling.
-        # Inventory of everything after this guard (GPU / non-TPU path only):
-        # - read accelerator_type; copy into ray_remote_args when set
-        # - read engine_kwargs; compute tp*pp -> num_bundles_per_replica
-        # - setdefault distributed_executor_backend (uni vs ray)
-        # - expand placement_group_config.bundle_per_worker into bundles
-        # - for ray backend: install ray_remote_args_fn + num_gpus=0
-        # - for uni backend: set num_gpus / num_cpus / resources from bundles
-        # - map_batches_kwargs.update(ray_remote_args) and return
-        # There is no telemetry, logging, or unrelated validation after the guard.
-        # TPU builders already supply scheduling_strategy, num_gpus=0, and pin
-        # distributed_executor_backend='ray', so the early return is safe.
         if (
             "scheduling_strategy" in map_batches_kwargs
             or "ray_remote_args_fn" in map_batches_kwargs

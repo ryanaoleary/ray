@@ -17,7 +17,6 @@ from ray.llm._internal.batch.stages.configs import (
     PrepareMultimodalStageConfig as _PrepareMultimodalStageConfig,
     TokenizerStageConfig as _TokenizerStageConfig,
 )
-from ray.llm._internal.common.accelerators import TPUConfig
 from ray.util.annotations import PublicAPI
 
 logger = logging.getLogger(__name__)
@@ -155,25 +154,10 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             optional ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). When
             ``strategy`` is omitted, defaults to ``PACK``, or to ``SPREAD`` when
-            ``accelerator_config`` sets a TPU topology. Under a TPU topology,
-            ``bundle_per_worker`` / ``bundles`` are a **per-worker template** only;
-            the bundle count comes from the topology (not the length of
-            ``bundles``).
+            ``accelerator_config`` sets a TPU topology.
         accelerator_config: Hardware-specific configuration parameters for the
             chosen accelerator. The expected schema is dynamically typed based
-            on the ``kind`` discriminator. For multi-host TPU batch inference,
-            pass ``{"kind": "tpu", "topology": "<topology>"}`` (or a
-            :class:`~ray.data.llm.TPUConfig`) with ``accelerator_type`` set to a
-            TPU type such as ``"TPU-V6E"``. Constraints when topology is set:
-            ``tensor_parallel_size`` must equal the topology chip count;
-            ``concurrency`` must be ``1`` or ``(1, 1)``;
-            ``pipeline_parallel_size`` and ``data_parallel_size`` must be ``1``.
-            Chip accounting assumes Ray's default ``RAY_TPU_RESOURCE_PER_CHIP=1``;
-            non-default values are untested and unsupported by the
-            ``tensor_parallel_size == chips`` validation. Set
-            ``runtime_env={"env_vars": {"TPU_MULTIHOST_BACKEND": "ray"}}`` so the
-            vLLM-TPU engine orchestrates workers through Ray (this is
-            user-supplied; Ray Data does not inject it).
+            on the ``kind`` discriminator.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy
@@ -193,14 +177,13 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             runtime_env, num_cpus, memory, ``model_config_kwargs``,
             ``chat_template_content_format``, and ``apply_sys_msg_formatting``.
         accelerator_type: The accelerator type required for the vLLM engine workers
-            (e.g., "H100", "A100", "TPU-V6E").
+            (e.g., "H100", "A100").
         concurrency: The number of workers for data parallelism. Default to 1.
             If ``concurrency`` is a tuple ``(m, n)``, Ray creates an autoscaling
             actor pool that scales between ``m`` and ``n`` workers (``1 <= m <= n``).
             If ``concurrency`` is an ``int`` ``n``, both CPU and GPU stages use an autoscaling
             pool from ``(1, n)``.
             Stage-specific concurrency can be set via nested stage configs.
-            TPU topology configs require ``concurrency=1`` or ``(1, 1)``.
 
     Examples:
 
@@ -251,35 +234,6 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             ds = processor(ds)
             for row in ds.take_all():
                 print(row)
-
-        Multi-host TPU batch inference (requires a TPU slice and a
-        vLLM-TPU / ``tpu_inference`` image). Materialize derived Datasets
-        inside the context manager so the slice PG is released on exit:
-
-        .. testcode::
-            :skipif: True
-
-            import ray
-            from ray.data.llm import (
-                TPUConfig,
-                vLLMEngineProcessorConfig,
-                build_processor,
-            )
-
-            config = vLLMEngineProcessorConfig(
-                model_source="Qwen/Qwen3-4B-Instruct-2507",
-                accelerator_type="TPU-V6E",
-                accelerator_config=TPUConfig(kind="tpu", topology="4x4"),
-                concurrency=1,
-                engine_kwargs={"tensor_parallel_size": 16},
-                # Required for multi-host TPU: the engine orchestrates
-                # its workers through Ray. Ray Data does not inject this.
-                runtime_env={"env_vars": {"TPU_MULTIHOST_BACKEND": "ray"}},
-            )
-
-            with build_processor(config) as processor:
-                ds = processor(ray.data.range(32))
-                ds.write_parquet("/tmp/tpu-batch-out")
     """
 
     pass
@@ -800,6 +754,5 @@ __all__ = [
     "PrepareMultimodalStageConfig",
     "TokenizerStageConfig",
     "HttpRequestStageConfig",
-    "TPUConfig",
     "build_processor",
 ]
