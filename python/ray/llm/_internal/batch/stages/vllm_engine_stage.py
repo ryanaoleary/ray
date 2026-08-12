@@ -918,6 +918,7 @@ class vLLMEngineStage(StatefulStage):
             The updated values.
         """
         map_batches_kwargs = values["map_batches_kwargs"]
+        # Skip default PG construction when the builder already set scheduling.
         if (
             "scheduling_strategy" in map_batches_kwargs
             or "ray_remote_args_fn" in map_batches_kwargs
