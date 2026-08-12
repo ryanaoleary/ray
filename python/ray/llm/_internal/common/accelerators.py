@@ -4,12 +4,10 @@ import copy
 import logging
 import os
 from abc import ABC, abstractmethod
-from collections import Counter
 from enum import Enum
-from functools import partial
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
 import ray
@@ -98,27 +96,6 @@ def infer_hardware_kind_from_bundles(
     return "cpu"
 
 
-def _expected_vllm_tensor_parallel_size(
-    topology: str, accelerator_version: str
-) -> Optional[int]:
-    """Expected vLLM ``tensor_parallel_size`` for a topology, if we can assert it.
-
-    For every generation except Ironwood (v7x), vLLM TP equals the physical
-    chip count in the topology (``total_devices == total_chips``). Serve's
-    ``default_bundles`` already treats ``num_devices`` (TP*PP) as that chip
-    count when packing hosts.
-
-    Ironwood may expose one or two framework devices per physical chip
-    depending on runtime wiring. Hard-coding a 2x multiplier would reject
-    valid configs, so we return ``None`` and skip equality checks — users may
-    set whatever TP vLLM needs. Ray scheduling still uses physical chips
-    (and optional ``RAY_TPU_RESOURCE_PER_CHIP``) via SlicePlacementGroup.
-    """
-    if accelerator_version.strip().lower() == "v7x":
-        return None
-    return get_num_chips_from_topology(topology)
-
-
 class AcceleratorConfig(BaseModel):
     kind: str
 
@@ -134,26 +111,6 @@ class GPUConfig(AcceleratorConfig):
 class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
     topology: Optional[str] = None
-    chips_per_vm: Optional[int] = None
-
-    @field_validator("chips_per_vm", mode="before")
-    @classmethod
-    def _reject_bool_chips_per_vm(cls, value):
-        # bool is a subclass of int; reject before Pydantic coerces True to 1.
-        if isinstance(value, bool):
-            raise ValueError(f"chips_per_vm must be a positive integer; got {value!r}.")
-        return value
-
-    @model_validator(mode="after")
-    def _validate_chips_per_vm(self) -> "TPUConfig":
-        if self.chips_per_vm is not None and not self.topology:
-            raise ValueError("chips_per_vm requires topology to be specified.")
-        if self.chips_per_vm is not None and self.chips_per_vm <= 0:
-            raise ValueError(
-                "chips_per_vm must be a positive integer; "
-                f"got {self.chips_per_vm!r}."
-            )
-        return self
 
 
 AnyAcceleratorConfig = Annotated[
@@ -281,106 +238,6 @@ class GPUAccelerator(AcceleratorBackend):
             options["accelerator_type"] = accelerator_type_str
         return options
 
-    def build_batch_scheduling_options(
-        self,
-        *,
-        accelerator_type: Optional[str],
-        engine_kwargs: Dict[str, Any],
-        placement_group_config: Optional[Dict[str, Any]],
-        runtime_env: Optional[Dict[str, Any]],
-    ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        ray_remote_args: Dict[str, Any] = {}
-        if accelerator_type:
-            ray_remote_args["accelerator_type"] = accelerator_type
-
-        tp = engine_kwargs.get("tensor_parallel_size", 1)
-        pp = engine_kwargs.get("pipeline_parallel_size", 1)
-        num_bundles_per_replica = tp * pp
-        pg_config = (
-            copy.deepcopy(placement_group_config) if placement_group_config else None
-        )
-        if pg_config is not None:
-            bundle_per_worker = pg_config.pop("bundle_per_worker", None)
-            if bundle_per_worker is not None:
-                pg_config["bundles"] = [
-                    bundle_per_worker.copy() for _ in range(num_bundles_per_replica)
-                ]
-
-        engine_kwargs.setdefault(
-            "distributed_executor_backend",
-            # "uni": single-process executor for single-GPU inference.
-            # "ray": Ray executor for multi-GPU (TP/PP > 1) with placement control.
-            "uni" if num_bundles_per_replica == 1 else "ray",
-        )
-        executor_backend = engine_kwargs["distributed_executor_backend"]
-
-        map_batches_kwargs: Dict[str, Any] = {
-            "runtime_env": copy.deepcopy(runtime_env),
-        }
-
-        if executor_backend == "ray":
-            map_batches_kwargs["ray_remote_args_fn"] = partial(
-                _gpu_ray_scheduling_strategy_fn,
-                num_bundles_per_replica,
-                accelerator_type,
-                pg_config,
-                self,
-            )
-            ray_remote_args["num_gpus"] = 0
-        elif not pg_config:
-            ray_remote_args["num_gpus"] = num_bundles_per_replica
-        else:
-            bundles = pg_config["bundles"]
-            resource_counter = Counter()
-            for bundle in bundles:
-                resource_counter.update(bundle)
-            total_cpus = resource_counter.pop("CPU", 0)
-            total_gpus = resource_counter.pop("GPU", 0)
-            if total_cpus:
-                ray_remote_args["num_cpus"] = total_cpus
-            if total_gpus:
-                ray_remote_args["num_gpus"] = total_gpus
-            if resource_counter:
-                ray_remote_args["resources"] = dict(resource_counter)
-
-        map_batches_kwargs.update(ray_remote_args)
-        return map_batches_kwargs, None
-
-
-def _gpu_ray_scheduling_strategy_fn(
-    num_bundles_per_replica: int,
-    accelerator_type: Optional[str],
-    placement_group_config: Optional[Dict[str, Any]],
-    backend: GPUAccelerator,
-) -> Dict[str, Any]:
-    """Create a PACK placement group for multi-GPU batch engine actors."""
-    if placement_group_config:
-        placement_group_config = copy.deepcopy(placement_group_config)
-        bundles = placement_group_config.get("bundles") or []
-        if accelerator_type:
-            accel_resource = format_ray_accelerator_resource(accelerator_type)
-            for bundle in bundles:
-                bundle[accel_resource] = 0.001
-        pg = backend.create_placement_group(
-            bundles=bundles,
-            strategy=placement_group_config.get("strategy") or "PACK",
-            name="",
-        )
-    else:
-        bundle: Dict[str, float] = {"GPU": 1, "CPU": 1}
-        if accelerator_type:
-            bundle[format_ray_accelerator_resource(accelerator_type)] = 0.001
-        pg = backend.create_placement_group(
-            bundles=[bundle] * num_bundles_per_replica,
-            strategy="PACK",
-            name="",
-        )
-    return {
-        "scheduling_strategy": PlacementGroupSchedulingStrategy(
-            pg, placement_group_capture_child_tasks=True
-        )
-    }
-
 
 class TPUAccelerator(AcceleratorBackend):
     """TPU backend shared by Ray Serve and Ray Data batch inference."""
@@ -407,11 +264,7 @@ class TPUAccelerator(AcceleratorBackend):
             )
         topology = self._config.topology.strip().lower()
         version = get_tpu_version_from_type(accelerator_type_str)
-        chips_per_host = (
-            self._config.chips_per_vm
-            if self._config.chips_per_vm is not None
-            else get_chips_per_host(topology, version)
-        )
+        chips_per_host = get_chips_per_host(topology, version)
         if chips_per_host <= 0:
             raise ValueError(
                 f"Resolved chips per host must be positive, got {chips_per_host}"
@@ -506,8 +359,6 @@ class TPUAccelerator(AcceleratorBackend):
             "strategy": strategy or "PACK",
             "name": name,
         }
-        if self._config.chips_per_vm is not None:
-            slice_kwargs["chips_per_vm"] = self._config.chips_per_vm
         self._slice_pg_wrapper = slice_placement_group(**slice_kwargs)
         return self._slice_pg_wrapper
 
@@ -698,11 +549,11 @@ class TPUAccelerator(AcceleratorBackend):
         )
 
         topology = self._config.topology.strip().lower()
-        expected_tp = _expected_vllm_tensor_parallel_size(topology, version)
-        if expected_tp is not None and tp != expected_tp:
+        total_chips = get_num_chips_from_topology(topology)
+        if tp != total_chips:
             raise ValueError(
-                f"tensor_parallel_size must be {expected_tp} for topology "
-                f"'{topology}' on {version} ({expected_tp} physical chips / "
+                f"tensor_parallel_size must be {total_chips} for topology "
+                f"'{topology}' on {version} ({total_chips} physical chips / "
                 f"vLLM devices); got {tp}."
             )
         if pp != 1:
