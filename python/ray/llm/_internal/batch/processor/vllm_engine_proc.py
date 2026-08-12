@@ -118,11 +118,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
-        description=(
-            "Hardware-specific settings selected by 'kind'. For TPU multi-host "
-            "batch, use e.g. {'kind': 'tpu', 'topology': '4x4'} "
-            "(optional 'chips_per_vm')."
-        ),
+        description="Hardware-specific settings selected by 'kind'.",
     )
 
     @model_validator(mode="before")
@@ -182,8 +178,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
                 self.accelerator_config.topology
             ):
                 raise ValueError(
-                    "TPU batch inference requires accelerator_config with topology "
-                    "(e.g. {'kind': 'tpu', 'topology': '4x4'}); "
+                    "TPU batch inference requires accelerator_config with topology; "
                     f"got {self.accelerator_config!r}."
                 )
             conc = self.concurrency
@@ -341,7 +336,7 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Telemetry before reserving accelerator resources (e.g. a TPU slice).
+    # Telemetry before reserving accelerator resources.
     # We download the config files here so that we can report the underlying
     # architecture to the telemetry system. This should be a lightweight operation.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,

@@ -184,10 +184,7 @@ class LLMConfig(BaseModelExtended):
 
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
-        description=(
-            "Hardware-specific settings selected by 'kind' "
-            "(e.g. {'kind': 'tpu', 'topology': '4x4'})."
-        ),
+        description="Hardware-specific settings selected by 'kind'.",
     )
 
     placement_group_config: Optional[Dict[str, Any]] = Field(

@@ -102,16 +102,16 @@ class TPUConfig(AcceleratorConfig):
     topology: Optional[str] = Field(
         default=None,
         description=(
-            "TPU slice topology (e.g. '4x4', '2x4'). Required for multi-host "
-            "batch inference and for Serve deferred slice placement."
+            "TPU slice topology. Required for multi-host batch inference and "
+            "for Serve deferred slice placement."
         ),
     )
     chips_per_vm: Optional[int] = Field(
         default=None,
         description=(
-            "Optional chips-per-VM override for ambiguous topologies. Example: v6e "
-            "'2x4' defaults to one 8-chip VM; set chips_per_vm=4 for two 4-chip VMs. "
-            "When unset, Ray's get_chips_per_host default is used."
+            "Optional chips-per-VM override for ambiguous topologies. On v6e "
+            "'2x4', the default is one 8-chip VM; set chips_per_vm=4 for two "
+            "4-chip VMs. When unset, Ray's get_chips_per_host default is used."
         ),
     )
 
@@ -439,7 +439,7 @@ class TPUAccelerator(AcceleratorBackend):
         return options
 
     def shutdown(self) -> None:
-        """Shut down the slice placement group if present. Swallows errors (Serve teardown)."""
+        """Shut down the slice placement group if present. Swallows errors during Serve teardown."""
         if self._slice_pg_wrapper is None:
             return
         try:
@@ -582,9 +582,7 @@ class TPUAccelerator(AcceleratorBackend):
             )
 
         if not accelerator_type:
-            raise ValueError(
-                "`accelerator_type` (e.g. 'TPU-V6E') is required for TPU batch inference."
-            )
+            raise ValueError("`accelerator_type` is required for TPU batch inference.")
         canonical_accel = validate_tpu_accelerator_type(accelerator_type)
         version = get_tpu_version_from_type(canonical_accel)
 

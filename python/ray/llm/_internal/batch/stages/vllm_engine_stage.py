@@ -918,8 +918,7 @@ class vLLMEngineStage(StatefulStage):
             The updated values.
         """
         map_batches_kwargs = values["map_batches_kwargs"]
-        # Skip default placement-group setup when scheduling is already configured
-        # (e.g. multi-host TPU batch).
+        # Skip default placement-group setup when scheduling is already configured.
         if (
             "scheduling_strategy" in map_batches_kwargs
             or "ray_remote_args_fn" in map_batches_kwargs

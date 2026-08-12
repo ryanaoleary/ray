@@ -310,8 +310,7 @@ class Processor:
     processing stages, and finally a postprocess stage. We use processor as a
     paradigm for processing data using LLMs.
 
-    When ``close_fn`` is set (for example to release a reserved TPU slice
-    placement group), call ``close()`` or use as a context manager after
+    When ``close_fn`` is set, call ``close()`` or use as a context manager after
     derived Datasets have been fully consumed.
 
     Args:
@@ -388,9 +387,8 @@ class Processor:
         try:
             logger.warning(
                 "%s was garbage-collected without close(). Reserved resources "
-                "(e.g. a placement group) may still be held. Call close() or use "
-                "a context manager after materializing derived Datasets. "
-                "Attempting release now.",
+                "may still be held. Call close() or use a context manager after "
+                "materializing derived Datasets. Attempting release now.",
                 cls_name,
             )
             close_fn()
