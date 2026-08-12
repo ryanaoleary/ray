@@ -662,7 +662,6 @@ class TPUAccelerator(AcceleratorBackend):
             raise
 
         def close_fn() -> None:
-            # Prefer this over shutdown(): batch needs failures to propagate for retry.
             pg_handle = self._slice_pg_wrapper
             if pg_handle is None:
                 return
@@ -671,7 +670,7 @@ class TPUAccelerator(AcceleratorBackend):
             self._slice_pg_wrapper = None
 
         map_batches_kwargs = {
-            # Bundle 0 CPU covers the Ray Data actor (vLLM TPU workers use num_cpus=0).
+            # Bundle 0 CPU covers the Ray Data actor.
             "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
             "num_gpus": 0,
             "resources": {},
