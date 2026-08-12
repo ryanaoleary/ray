@@ -505,41 +505,6 @@ You can customize the placement group configuration to control how Ray places vL
     :start-after: __custom_placement_group_strategy_config_example_start__
     :end-before: __custom_placement_group_strategy_config_example_end__
 
-Topology-backed TPU batch inference
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For multi-host TPU slices, set ``accelerator_type`` to a TPU type and pass
-``accelerator_config`` with a topology. Ray reserves one topology-backed slice
-placement group when you call ``build_processor``.
-
-- ``accelerator_config``: ``{"kind": "tpu", "topology": "4x4"}``. For ambiguous
-  topologies such as v6e ``2x4`` (1×8-chip VM vs 2×4-chip VMs), set
-  ``chips_per_vm`` (e.g. ``4``) to select the packing.
-- ``engine_kwargs["tensor_parallel_size"]`` must equal the topology chip count.
-- Topology-backed Batch currently requires ``concurrency=1`` (or ``(1, 1)``),
-  ``pipeline_parallel_size=1``, and ``data_parallel_size=1``.
-- Always materialize derived Datasets **before** exiting the processor context
-  (or before ``close()``); the slice is released on close.
-
-.. code-block:: python
-
-    from ray.data.llm import vLLMEngineProcessorConfig, build_processor
-
-    config = vLLMEngineProcessorConfig(
-        model_source="...",
-        accelerator_type="TPU-V6E",
-        accelerator_config={"kind": "tpu", "topology": "4x4"},
-        engine_kwargs={
-            "tensor_parallel_size": 16,
-            "pipeline_parallel_size": 1,
-            "data_parallel_size": 1,
-        },
-        concurrency=1,
-    )
-    with build_processor(config) as processor:
-        ds = processor(ds)
-        ds.write_parquet("/tmp/out")  # materialize BEFORE exiting the block
-
 Per-stage configuration
 ~~~~~~~~~~~~~~~~~~~~~~~
 
