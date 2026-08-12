@@ -201,8 +201,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         if value is None:
             return None
         # Validate through PlacementGroupConfig, then dump back to dict.
-        # Pop schema-default strategy when the user omitted the key so
-        # _resolve_placement_strategy can choose PACK vs SPREAD.
+        # Pop strategy when omitted so _resolve_placement_strategy can set the default.
         validated = PlacementGroupConfig(**value)
         dumped = validated.model_dump()
         if isinstance(value, dict) and "strategy" not in value:
@@ -211,16 +210,16 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
 
     @model_validator(mode="after")
     def _resolve_placement_strategy(self) -> "vLLMEngineProcessorConfig":
-        """Fill omitted strategy: SPREAD for TPU topology, else PACK."""
+        """Default omitted strategy to SPREAD with TPU topology, otherwise PACK."""
         pg = self.placement_group_config
         if pg is None or "strategy" in pg:
             return self
-        topology_backed = isinstance(self.accelerator_config, TPUConfig) and bool(
+        has_tpu_topology = isinstance(self.accelerator_config, TPUConfig) and bool(
             self.accelerator_config.topology
         )
         self.placement_group_config = {
             **pg,
-            "strategy": "SPREAD" if topology_backed else "PACK",
+            "strategy": "SPREAD" if has_tpu_topology else "PACK",
         }
         return self
 
@@ -336,9 +335,8 @@ def build_vllm_engine_processor(
             )
         )
 
-    # Telemetry before reserving accelerator resources.
-    # We download the config files here so that we can report the underlying
-    # architecture to the telemetry system. This should be a lightweight operation.
+    # We download the config files here so that we can report the underlying architecture to the telemetry system.
+    # This should be a lightweight operation.
     # Use EXCLUDE_SAFETENSORS for streaming formats or trust_remote_code models,
     # since custom model architectures require Python config files to be downloaded.
     if config.engine_kwargs.get(
@@ -417,8 +415,6 @@ def build_vllm_engine_processor(
 
     close_fn = None
     if isinstance(config.accelerator_config, TPUConfig):
-        # Reserve a TPU slice via the accelerator backend. Stage post_init skips
-        # its own placement group when scheduling_strategy is already set.
         engine_kwargs = dict(config.engine_kwargs)
         backend = get_accelerator_backend(config.accelerator_config)
         tpu_map_kwargs, close_fn = backend.build_batch_scheduling_options(
@@ -433,7 +429,6 @@ def build_vllm_engine_processor(
         map_batches_kwargs.update(tpu_map_kwargs)
 
     try:
-        # Build compute after slice reservation so failures still run close_fn.
         # The number of running replicas. This is a deprecated field, but
         # we need to set `max_tasks_in_flight_per_actor` through `compute`,
         # which initiates enough many overlapping UDF calls per actor, to

@@ -354,7 +354,6 @@ class Processor:
         self._lock = threading.Lock()
         self._finalizer = None
         if close_fn is not None:
-            # Avoid capturing self in the finalizer.
             self._finalizer = weakref.finalize(
                 self, Processor._warn_unclosed, close_fn, type(self).__name__
             )
@@ -396,15 +395,14 @@ class Processor:
             try:
                 logger.exception("Failed to release resources during finalization.")
             except Exception:
-                # Interpreter shutdown can tear down logging before this runs.
+                # Logging may already be torn down during interpreter shutdown.
                 pass
 
     def close(self) -> None:
-        """Mark closed and run ``close_fn``.
+        """Release ``close_fn`` resources and mark this processor closed.
 
         Materialize derived Datasets before calling close(). ``_close_fn`` is
-        cleared only after a successful call so shutdown can be retried. The
-        processor stays closed even if ``close_fn`` fails.
+        cleared only after a successful call so shutdown can be retried.
         """
         with self._lock:
             self._closed = True
