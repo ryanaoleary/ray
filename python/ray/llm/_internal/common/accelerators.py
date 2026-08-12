@@ -644,7 +644,7 @@ class TPUAccelerator(AcceleratorBackend):
             raise ValueError("runtime_env['env_vars'] must be a dictionary.")
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)
-        # Default SPREAD for multi-host TPU Batch; override via placement_group_config.
+        # Topology-backed path: SPREAD when unset (ProcessorConfig resolves the same).
         strategy = (placement_group_config or {}).get("strategy") or "SPREAD"
 
         handle = self._create_slice_pg_handle(
@@ -654,7 +654,9 @@ class TPUAccelerator(AcceleratorBackend):
         )
         try:
             try:
-                ray.get(handle.placement_group.ready(), timeout=DEFAULT_PG_READY_TIMEOUT_S)
+                ray.get(
+                    handle.placement_group.ready(), timeout=DEFAULT_PG_READY_TIMEOUT_S
+                )
             except ray.exceptions.GetTimeoutError as exc:
                 raise TimeoutError(
                     f"Timed out after {DEFAULT_PG_READY_TIMEOUT_S}s waiting for TPU "

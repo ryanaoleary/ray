@@ -355,7 +355,7 @@ class Processor:
         self._lock = threading.Lock()
         self._finalizer = None
         if close_fn is not None:
-            # Do not close over self — that would make the object immortal.
+            # Finalize must not capture self (creates a reference cycle).
             self._finalizer = weakref.finalize(
                 self, Processor._warn_unclosed, close_fn, type(self).__name__
             )

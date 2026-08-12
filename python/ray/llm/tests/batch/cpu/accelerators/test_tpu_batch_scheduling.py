@@ -178,8 +178,8 @@ def test_defaults_spread_when_strategy_unset(stub_slice_pg):
         detokenize=False,
         apply_chat_template=False,
     )
-    # Omitted strategy is absent from the dumped dict (not the schema default PACK).
-    assert "strategy" not in cfg.placement_group_config
+    # TPU topology + omitted strategy → SPREAD.
+    assert cfg.placement_group_config["strategy"] == "SPREAD"
     processor = build_processor(cfg)
     assert create.call_args.kwargs["strategy"] == "SPREAD"
     processor.close()
@@ -187,7 +187,7 @@ def test_defaults_spread_when_strategy_unset(stub_slice_pg):
 
 
 def test_gpu_placement_group_config_unset_strategy():
-    """Unset strategy is omitted; other dump keys match master model_dump()."""
+    """Unset strategy resolves to PACK (PlacementGroupConfig default)."""
     cfg = vLLMEngineProcessorConfig(
         model_source="m",
         placement_group_config={"bundle_per_worker": {"CPU": 1, "GPU": 1}},
@@ -195,13 +195,11 @@ def test_gpu_placement_group_config_unset_strategy():
         detokenize=False,
         apply_chat_template=False,
     )
-    # Master embedded strategy='PACK' via field default. We omit the key so TPU
-    # Batch can default SPREAD; GPU scheduling still resolves to PACK.
     assert cfg.placement_group_config == {
         "bundle_per_worker": {"CPU": 1.0, "GPU": 1.0},
         "bundles": None,
+        "strategy": "PACK",
     }
-    assert "strategy" not in cfg.placement_group_config
 
 
 def test_gpu_explicit_strategy_preserved():
@@ -229,7 +227,6 @@ def test_gpu_stage_scheduling_uses_pack_when_unset(monkeypatch):
         "ray.llm._internal.batch.stages.vllm_engine_stage.ray.util.placement_group",
         fake_pg,
     )
-    # Dump shape when user omitted strategy: key absent (not schema default PACK).
     stage = vLLMEngineStage(
         fn_constructor_kwargs=dict(
             model="m",
@@ -238,13 +235,13 @@ def test_gpu_stage_scheduling_uses_pack_when_unset(monkeypatch):
             placement_group_config={
                 "bundle_per_worker": {"CPU": 1.0, "GPU": 1.0},
                 "bundles": None,
+                "strategy": "PACK",
             },
         ),
         map_batches_kwargs=dict(accelerator_type="A100"),
     )
     stage.map_batches_kwargs["ray_remote_args_fn"]()
-    # Missing strategy → Ray placement_group defaults to PACK.
-    assert captured.get("strategy") in (None, "PACK")
+    assert captured.get("strategy") == "PACK"
     assert len(captured["bundles"]) == 2
 
 

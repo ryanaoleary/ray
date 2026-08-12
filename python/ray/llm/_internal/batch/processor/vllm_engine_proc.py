@@ -63,15 +63,14 @@ DEFAULT_MODEL_ARCHITECTURE = "UNKNOWN_MODEL_ARCHITECTURE"
 
 
 def _release_close_fn(close_fn) -> None:
-    """Best-effort release of builder-owned resources."""
+    """Best-effort invocation of the processor close callback (e.g. SlicePG shutdown)."""
     if close_fn is None:
         return
     try:
         close_fn()
     except Exception:
         logger.exception(
-            "Failed to release builder-owned resources after processor "
-            "construction failed."
+            "Failed to release processor resources after construction failed."
         )
 
 
@@ -113,8 +112,8 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         "Can specify either 'bundle_per_worker' (auto-replicated by tp*pp) or 'bundles' "
         "(full list of resource dicts). Optionally include 'strategy' key "
         "('PACK', 'STRICT_PACK', 'SPREAD', or 'STRICT_SPREAD'). "
-        "When strategy is omitted it is absent from the stored dict (same idea as Serve "
-        "exclude_unset); GPU scheduling resolves absence to PACK, TPU Batch to SPREAD. "
+        "When strategy is omitted, defaults to PACK, or to SPREAD when "
+        "accelerator_config sets a TPU topology. "
         "Example with bundle_per_worker: {'bundle_per_worker': {'CPU': 1, 'GPU': 1}, 'strategy': 'SPREAD'}. "
         "Example with bundles: {'bundles': [{'CPU': 1, 'GPU': 1}] * 4, 'strategy': 'SPREAD'}.",
     )
@@ -208,15 +207,28 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         if value is None:
             return None
         # Validate through PlacementGroupConfig, then dump back to dict.
-        # PlacementGroupConfig.strategy defaults to PACK. Pop it when the user
-        # omitted the key so Batch TPU can default to SPREAD while GPU/Serve
-        # still resolve absence to PACK. Explicit strategy is preserved.
-        # Readers must use .get("strategy") or a default — never ["strategy"].
+        # Pop schema-default strategy when the user omitted the key so
+        # _resolve_placement_strategy can choose PACK vs SPREAD.
         validated = PlacementGroupConfig(**value)
         dumped = validated.model_dump()
         if isinstance(value, dict) and "strategy" not in value:
             dumped.pop("strategy", None)
         return dumped
+
+    @model_validator(mode="after")
+    def _resolve_placement_strategy(self) -> "vLLMEngineProcessorConfig":
+        """Fill omitted strategy: SPREAD for TPU topology, else PACK."""
+        pg = self.placement_group_config
+        if pg is None or "strategy" in pg:
+            return self
+        topology_backed = isinstance(self.accelerator_config, TPUConfig) and bool(
+            self.accelerator_config.topology
+        )
+        self.placement_group_config = {
+            **pg,
+            "strategy": "SPREAD" if topology_backed else "PACK",
+        }
+        return self
 
 
 def build_vllm_engine_processor(
