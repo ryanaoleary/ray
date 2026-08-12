@@ -110,10 +110,33 @@ class GPUConfig(AcceleratorConfig):
 
 class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
-    topology: Optional[str] = None
-    # Optional override for ambiguous topologies (e.g. v6e 2x4 can be 1x8 or
-    # 2x4 chips/VM). When unset, Ray's get_chips_per_host default is used.
-    chips_per_vm: Optional[int] = None
+    topology: Optional[str] = Field(
+        default=None,
+        description=(
+            "TPU slice topology (e.g. '4x4', '2x4'). Required for topology-backed "
+            "Batch and for deferred Serve SlicePG placement."
+        ),
+    )
+    chips_per_vm: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional chips-per-VM override for ambiguous topologies. Example: v6e "
+            "'2x4' defaults to one 8-chip VM; set chips_per_vm=4 for two 4-chip VMs. "
+            "When unset, Ray's get_chips_per_host default is used."
+        ),
+    )
+
+    @field_validator("topology", mode="before")
+    @classmethod
+    def _normalize_topology(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"topology must be a string; got {value!r}.")
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("topology must be a non-empty string.")
+        return normalized
 
     @field_validator("chips_per_vm", mode="before")
     @classmethod
@@ -132,6 +155,13 @@ class TPUConfig(AcceleratorConfig):
                 "chips_per_vm must be a positive integer; "
                 f"got {self.chips_per_vm!r}."
             )
+        if self.chips_per_vm is not None and self.topology is not None:
+            total_chips = get_num_chips_from_topology(self.topology)
+            if total_chips % self.chips_per_vm != 0:
+                raise ValueError(
+                    f"chips_per_vm ({self.chips_per_vm}) must divide the topology "
+                    f"chip count ({total_chips} for '{self.topology}')."
+                )
         return self
 
 
@@ -490,11 +520,13 @@ class TPUAccelerator(AcceleratorBackend):
             worker_bundle = dict(source_bundles[0])
             if any(b != source_bundles[0] for b in source_bundles):
                 raise ValueError(
-                    "Heterogeneous TPU bundles are not supported when `topology` is set."
+                    "Heterogeneous TPU bundles are not supported when `topology` is set. "
+                    "Use `bundle_per_worker` in `placement_group_config` for a uniform "
+                    "per-worker resource template."
                 )
         else:
-            # No positive TPU: preserve CPU/custom resources and add TPU:1 so
-            # topology placement still materializes chip-bearing bundles.
+            # No positive TPU: keep CPU/custom resources and omit TPU so
+            # SlicePlacementGroup fills chips-per-VM (same as the default path).
             cleaned = [
                 {k: v for k, v in b.items() if v != 0 and v != 0.0}
                 for b in source_bundles
@@ -504,7 +536,7 @@ class TPUAccelerator(AcceleratorBackend):
                     "Heterogeneous placement_group_config bundles are not supported "
                     f"when `topology` is set; got {source_bundles!r}."
                 )
-            worker_bundle = {**cleaned[0], "TPU": 1}
+            worker_bundle = cleaned[0]
 
         out = {k: v for k, v in worker_bundle.items() if v != 0 and v != 0.0}
         out["CPU"] = max(float(out.get("CPU", 0.0)), cpu_floor)

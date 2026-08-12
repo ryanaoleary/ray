@@ -99,6 +99,28 @@ def _topo_config(**kwargs):
             },
             "concurrency=1",
         ),
+        (
+            {
+                "accelerator_type": "TPU-V6E",
+                "accelerator_config": {"kind": "gpu"},
+            },
+            "GPUConfig cannot be used with TPU accelerator_type",
+        ),
+        (
+            {
+                "accelerator_type": "A100",
+                "accelerator_config": {"kind": "tpu", "topology": "4x4"},
+            },
+            "TPUConfig requires a TPU accelerator_type",
+        ),
+        (
+            {"accelerator_config": {"kind": "cpu"}},
+            "CPUConfig is not supported",
+        ),
+        (
+            {"accelerator_type": "TPU-NOTAREAL"},
+            "Unknown or unsupported TPU accelerator type",
+        ),
     ],
 )
 def test_processor_config_rejects_invalid_tpu(kwargs, match):
@@ -192,6 +214,33 @@ def test_chips_per_vm_requires_topology():
 def test_chips_per_vm_rejects_invalid_values(bad):
     with pytest.raises(ValueError, match="chips_per_vm must be a positive integer"):
         TPUConfig(topology="2x4", chips_per_vm=bad)
+
+
+def test_chips_per_vm_must_divide_topology_chips():
+    with pytest.raises(ValueError, match="must divide the topology chip count"):
+        TPUConfig(topology="2x4", chips_per_vm=3)
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "\t"])
+def test_topology_rejects_blank_strings(bad):
+    with pytest.raises(ValueError, match="topology must be a non-empty string"):
+        TPUConfig(topology=bad)
+
+
+def test_cpu_only_bundle_template_omits_tpu_for_default_packing(stub_slice_pg):
+    """CPU-only templates must not force TPU:1; Core fills chips-per-VM."""
+    _, create = stub_slice_pg
+    _, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="2x4", chips_per_vm=4)),
+        tensor_parallel_size=8,
+        placement_group_config={"bundle_per_worker": {"CPU": 4}, "strategy": "PACK"},
+    )
+    resources = create.call_args.kwargs["resources_per_bundle"]
+    assert "TPU" not in resources
+    assert resources["CPU"] == 4.0
+    assert create.call_args.kwargs["strategy"] == "PACK"
+    assert create.call_args.kwargs["chips_per_vm"] == 4
+    close_fn()
 
 
 def test_topology_merges_runtime_env_and_releases_head(stub_slice_pg):

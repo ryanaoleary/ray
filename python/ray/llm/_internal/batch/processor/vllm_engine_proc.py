@@ -114,8 +114,9 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
         description=(
-            "Hardware-specific configuration parameters for the chosen accelerator. "
-            "The expected schema is dynamically typed based on the 'kind' discriminator."
+            "Hardware-specific configuration. Use {'kind': 'tpu', 'topology': '4x4'} "
+            "for topology-backed TPU Batch (optional chips_per_vm for ambiguous "
+            "topologies such as v6e 2x4). Omit or use GPUConfig for GPU scheduling."
         ),
     )
 
@@ -375,15 +376,6 @@ def build_vllm_engine_processor(
     )
 
     close_fn = None
-    compute = ray.data.ActorPoolStrategy(
-        # The number of running replicas. This is a deprecated field, but
-        # we need to set `max_tasks_in_flight_per_actor` through `compute`,
-        # which initiates enough many overlapping UDF calls per actor, to
-        # saturate `max_concurrency`.
-        **config.get_concurrency(autoscaling_enabled=True),
-        max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
-    )
-
     if isinstance(config.accelerator_config, TPUConfig):
         # Topology-backed TPU: backend owns SlicePG lifecycle and map kwargs.
         # Copy engine_kwargs so accelerator defaults do not mutate the caller.
@@ -408,12 +400,24 @@ def build_vllm_engine_processor(
         )
         stage_map_batches_kwargs = dict(
             zero_copy_batch=True,
-            compute=compute,
+            # The number of running replicas. This is a deprecated field, but
+            # we need to set `max_tasks_in_flight_per_actor` through `compute`,
+            # which initiates enough many overlapping UDF calls per actor, to
+            # saturate `max_concurrency`.
+            compute=ray.data.ActorPoolStrategy(
+                **config.get_concurrency(autoscaling_enabled=True),
+                max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
+            ),
+            # The number of running batches "per actor" in Ray Core level.
+            # This is used to make sure we overlap batches to avoid the tail
+            # latency of each batch.
             max_concurrency=config.max_concurrent_batches,
             **map_batches_kwargs,
         )
     else:
-        # GPU path matches master: stage post_init owns scheduling.
+        # GPU: stage post_init owns scheduling (same as master).
+        # placement_group_config may omit strategy when dumped with
+        # exclude_unset=True; Ray/stage still default omitted strategy to PACK.
         fn_constructor_kwargs = dict(
             batch_size=config.batch_size,
             max_concurrent_batches=config.max_concurrent_batches,
@@ -428,7 +432,17 @@ def build_vllm_engine_processor(
         )
         stage_map_batches_kwargs = dict(
             zero_copy_batch=True,
-            compute=compute,
+            # The number of running replicas. This is a deprecated field, but
+            # we need to set `max_tasks_in_flight_per_actor` through `compute`,
+            # which initiates enough many overlapping UDF calls per actor, to
+            # saturate `max_concurrency`.
+            compute=ray.data.ActorPoolStrategy(
+                **config.get_concurrency(autoscaling_enabled=True),
+                max_tasks_in_flight_per_actor=config.max_tasks_in_flight_per_actor,
+            ),
+            # The number of running batches "per actor" in Ray Core level.
+            # This is used to make sure we overlap batches to avoid the tail
+            # latency of each batch.
             max_concurrency=config.max_concurrent_batches,
             accelerator_type=config.accelerator_type,
             runtime_env=config.runtime_env,

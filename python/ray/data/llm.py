@@ -157,9 +157,10 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             topology determines the resulting bundle count. Optionally include
             ``strategy``
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``).
-        accelerator_config: Hardware-specific configuration parameters for the
-            chosen accelerator. The expected schema is dynamically typed based
-            on the ``kind`` discriminator.
+        accelerator_config: Hardware-specific configuration. For topology-backed
+            TPU Batch use ``{'kind': 'tpu', 'topology': '4x4'}`` (optional
+            ``chips_per_vm`` for ambiguous topologies such as v6e ``2x4``).
+            Omit or use a GPU config for GPU scheduling.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

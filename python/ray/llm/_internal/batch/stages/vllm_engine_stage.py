@@ -322,7 +322,6 @@ class vLLMEngineWrapper:
                 "Metrics will be available at Ray's Prometheus endpoint."
             )
 
-        # Reuse the actor's current placement group in the distributed executor.
         self.engine = vllm.AsyncLLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )
