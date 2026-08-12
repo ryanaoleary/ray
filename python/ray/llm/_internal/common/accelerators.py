@@ -1,6 +1,7 @@
 """Shared accelerator configurations and backend abstractions for LLM serving and batch inference."""
 
 import math
+import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -594,25 +595,29 @@ class TPUAccelerator(AcceleratorBackend):
                 f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
 
-        # Match GPU / Serve: device count is TP × PP (PP defaults to 1).
+        # Unlike GPU (which sizes a PG to tp*pp), the TPU slice size is fixed by
+        # topology, so equality must count every device dimension including DP.
         tp = engine_kwargs.get("tensor_parallel_size", 1)
         pp = engine_kwargs.get("pipeline_parallel_size", 1)
+        dp = engine_kwargs.get("data_parallel_size", 1)
         for name, value in (
             ("tensor_parallel_size", tp),
             ("pipeline_parallel_size", pp),
+            ("data_parallel_size", dp),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer; got {value!r}.")
-        num_devices = tp * pp
+        num_devices = tp * pp * dp
 
         topology = self._config.topology.strip().lower()
         total_chips = get_num_chips_from_topology(topology)
         if num_devices != total_chips:
             raise ValueError(
-                f"tensor_parallel_size * pipeline_parallel_size must be "
-                f"{total_chips} for topology '{topology}' on {version} "
-                f"({total_chips} physical chips / vLLM devices); got "
-                f"tensor_parallel_size={tp}, pipeline_parallel_size={pp} "
+                f"tensor_parallel_size * pipeline_parallel_size * "
+                f"data_parallel_size must be {total_chips} for topology "
+                f"'{topology}' on {version} ({total_chips} physical chips / "
+                f"vLLM devices); got tensor_parallel_size={tp}, "
+                f"pipeline_parallel_size={pp}, data_parallel_size={dp} "
                 f"(product={num_devices})."
             )
 
@@ -623,7 +628,7 @@ class TPUAccelerator(AcceleratorBackend):
             accelerator_type=canonical_accel,
             resources_per_bundle=resources_per_bundle,
             strategy=strategy,
-            name=f"ray-data-llm-tpu-{topology}",
+            name=f"ray-data-llm-tpu-{topology}-{uuid.uuid4().hex[:8]}",
         )
         try:
             # Retain head PGs until shutdown(): releasing TPU-{pod}-head early

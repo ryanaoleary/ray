@@ -919,7 +919,9 @@ class vLLMEngineStage(StatefulStage):
         """
         map_batches_kwargs = values["map_batches_kwargs"]
         # Skip default PG construction when the builder already set scheduling.
+        # Still consume placement_group_config; the UDF does not accept it.
         if "scheduling_strategy" in map_batches_kwargs:
+            values["fn_constructor_kwargs"].pop("placement_group_config", None)
             return values
         accelerator_type = map_batches_kwargs.get("accelerator_type", "")
         fn_constructor_kwargs = values["fn_constructor_kwargs"]

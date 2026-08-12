@@ -386,19 +386,24 @@ class Processor:
     @staticmethod
     def _warn_unclosed(close_fn: Callable[[], None], cls_name: str) -> None:
         try:
-            logger.warning(
-                "%s was garbage-collected without close(). Reserved resources "
-                "may still be held. Call close() or use a context manager after "
-                "materializing derived Datasets. Attempting release now.",
-                cls_name,
-            )
+            # Release first: logging may already be torn down at interpreter exit.
             close_fn()
         except Exception:
             try:
                 logger.exception("Failed to release resources during finalization.")
             except Exception:
-                # Logging may already be torn down during interpreter shutdown.
                 pass
+            return
+        try:
+            logger.warning(
+                "%s was garbage-collected without close(). Reserved resources "
+                "may still be held. Call close() or use a context manager after "
+                "materializing derived Datasets.",
+                cls_name,
+            )
+        except Exception:
+            # Logging may already be torn down during interpreter shutdown.
+            pass
 
     def close(self) -> None:
         """Release ``close_fn`` resources and mark this processor closed.

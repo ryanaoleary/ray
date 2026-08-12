@@ -118,17 +118,18 @@ def test_rejects_invalid_processor_config(kwargs, match):
 
 
 @pytest.mark.parametrize(
-    "topology, accel, tp, pp, chips_per_vm, strategy, expect_strategy",
+    "topology, accel, tp, pp, dp, chips_per_vm, strategy, expect_strategy",
     [
-        ("4x4", "TPU-V6E", 16, 1, None, None, "SPREAD"),
-        ("4x4", "TPU-V6E", 8, 2, None, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 1, 4, "PACK", "PACK"),
-        ("2x4", "TPU-V6E", 8, 1, 4, "SPREAD", "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 1, 4, "STRICT_SPREAD", "STRICT_SPREAD"),
+        ("4x4", "TPU-V6E", 16, 1, 1, None, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 8, 2, 1, None, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 8, 1, 2, None, None, "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 1, 1, 4, "PACK", "PACK"),
+        ("2x4", "TPU-V6E", 8, 1, 1, 4, "SPREAD", "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 1, 1, 4, "STRICT_SPREAD", "STRICT_SPREAD"),
     ],
 )
 def test_slice_pg_kwargs(
-    stub_slice_pg, topology, accel, tp, pp, chips_per_vm, strategy, expect_strategy
+    stub_slice_pg, topology, accel, tp, pp, dp, chips_per_vm, strategy, expect_strategy
 ):
     handle, create = stub_slice_pg
     pg_config = {"bundle_per_worker": {"TPU": 1}}
@@ -139,6 +140,7 @@ def test_slice_pg_kwargs(
         accelerator_type=accel,
         tensor_parallel_size=tp,
         pipeline_parallel_size=pp,
+        data_parallel_size=dp,
         placement_group_config=pg_config,
     )
     slice_kwargs = create.call_args.kwargs
@@ -150,6 +152,98 @@ def test_slice_pg_kwargs(
     assert kwargs["num_cpus"] == slice_kwargs["resources_per_bundle"]["CPU"]
     close_fn()
     handle.shutdown.assert_called_once()
+
+
+def test_dp_fill_matches_tp_only_slice_kwargs(stub_slice_pg):
+    """tp*pp*dp fill uses the same per-bundle template as tp-only fill."""
+    _, create = stub_slice_pg
+    kwargs_dp, close_dp = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+        data_parallel_size=2,
+    )
+    resources_dp = create.call_args.kwargs["resources_per_bundle"]
+    close_dp()
+    kwargs_tp, close_tp = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+    )
+    resources_tp = create.call_args.kwargs["resources_per_bundle"]
+    close_tp()
+    assert resources_dp == resources_tp
+    assert kwargs_dp["num_cpus"] == kwargs_tp["num_cpus"]
+
+
+def test_placement_group_names_are_unique(stub_slice_pg):
+    _, create = stub_slice_pg
+    closes = []
+    for _ in range(2):
+        _, close_fn = _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+        )
+        closes.append(close_fn)
+    names = [c.kwargs["name"] for c in create.call_args_list]
+    assert len(names) == 2
+    assert names[0] != names[1]
+    assert names[0].startswith("ray-data-llm-tpu-4x4-")
+    assert names[1].startswith("ray-data-llm-tpu-4x4-")
+    for close_fn in closes:
+        close_fn()
+
+
+def test_default_bundle_omits_tpu(stub_slice_pg):
+    _, create = stub_slice_pg
+    _, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+    )
+    resources = create.call_args.kwargs["resources_per_bundle"]
+    assert resources == {"CPU": float(_CPU_FLOOR)}
+    assert "TPU" not in resources
+    close_fn()
+
+
+def test_cpu_only_template_omits_tpu(stub_slice_pg):
+    _, create = stub_slice_pg
+    _, close_fn = _schedule(
+        TPUAccelerator(TPUConfig(topology="4x4")),
+        tensor_parallel_size=16,
+        placement_group_config={"bundle_per_worker": {"CPU": 4}},
+    )
+    resources = create.call_args.kwargs["resources_per_bundle"]
+    assert "TPU" not in resources
+    assert resources["CPU"] == 4.0
+    close_fn()
+
+
+def test_cpu_floor_warns_on_override(stub_slice_pg, caplog):
+    _, create = stub_slice_pg
+    with caplog.at_level(logging.WARNING, logger=accelerators.logger.name):
+        _, close_fn = _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+            placement_group_config={"bundle_per_worker": {"TPU": 1, "CPU": 1}},
+        )
+    resources = create.call_args.kwargs["resources_per_bundle"]
+    assert resources["CPU"] == float(_CPU_FLOOR)
+    assert any(
+        "Raising placement_group_config CPU" in r.message for r in caplog.records
+    )
+    close_fn()
+
+
+def test_default_bundle_does_not_warn_cpu_floor(stub_slice_pg, caplog):
+    with caplog.at_level(logging.WARNING, logger=accelerators.logger.name):
+        _, close_fn = _schedule(
+            TPUAccelerator(TPUConfig(topology="4x4")),
+            tensor_parallel_size=16,
+        )
+    assert not any(
+        "Raising placement_group_config CPU" in r.message for r in caplog.records
+    )
+    close_fn()
 
 
 def test_defaults_spread_when_strategy_unset(stub_slice_pg):
@@ -253,7 +347,7 @@ def test_bundle_resource_type_validation(stub_slice_pg, bundle):
 
 
 def test_multi_bundle_list_warns(stub_slice_pg, caplog):
-    with caplog.at_level(logging.WARNING, logger=accelerators.__name__):
+    with caplog.at_level(logging.WARNING, logger=accelerators.logger.name):
         _, close_fn = _schedule(
             TPUAccelerator(TPUConfig(topology="4x4")),
             tensor_parallel_size=16,
@@ -281,16 +375,26 @@ def test_topology_normalizes_case_and_whitespace():
         ({"distributed_executor_backend": "uni"}, "distributed_executor_backend"),
         (
             {"tensor_parallel_size": 8},
-            r"tensor_parallel_size \* pipeline_parallel_size must be 16",
+            r"tensor_parallel_size \* pipeline_parallel_size \* "
+            r"data_parallel_size must be 16",
         ),
         (
             {"tensor_parallel_size": 8, "pipeline_parallel_size": 3},
-            r"tensor_parallel_size \* pipeline_parallel_size must be 16",
+            r"tensor_parallel_size \* pipeline_parallel_size \* "
+            r"data_parallel_size must be 16",
+        ),
+        (
+            {"tensor_parallel_size": 16, "data_parallel_size": 2},
+            r"tensor_parallel_size \* pipeline_parallel_size \* "
+            r"data_parallel_size must be 16",
         ),
         (
             {"pipeline_parallel_size": 0},
             "pipeline_parallel_size must be a positive integer",
         ),
+        ({"data_parallel_size": 0}, "data_parallel_size must be a positive integer"),
+        ({"data_parallel_size": True}, "data_parallel_size must be a positive integer"),
+        ({"data_parallel_size": "2"}, "data_parallel_size must be a positive integer"),
         (
             {"placement_group_config": {"bundle_per_worker": {"GPU": 1, "TPU": 1}}},
             "GPU resources are not supported",
@@ -331,6 +435,7 @@ def test_builder_lifecycle(stub_slice_pg, monkeypatch):
         assert stage.map_batches_kwargs["num_gpus"] == 0
         assert stage.map_batches_kwargs["resources"] == {}
         assert "ray_remote_args_fn" not in stage.map_batches_kwargs
+        assert "placement_group_config" not in stage.fn_constructor_kwargs
         rebuilt = vLLMEngineStage(
             fn_constructor_kwargs=dict(stage.fn_constructor_kwargs),
             map_batches_kwargs=dict(stage.map_batches_kwargs),
@@ -339,6 +444,7 @@ def test_builder_lifecycle(stub_slice_pg, monkeypatch):
             rebuilt.map_batches_kwargs["scheduling_strategy"]
             is stage.map_batches_kwargs["scheduling_strategy"]
         )
+        assert "placement_group_config" not in rebuilt.fn_constructor_kwargs
     handle.shutdown.assert_called_once()
 
     # Construction failure after slice acquisition releases the slice.
@@ -377,7 +483,7 @@ def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
         detokenize=False,
         apply_chat_template=False,
     )
-    handle.shutdown.side_effect = [RuntimeError("boom"), None]
+    handle.shutdown.side_effect = [RuntimeError("boom"), None, None]
     processor = build_processor(cfg)
     with pytest.raises(RuntimeError, match="boom"):
         processor.close()
@@ -385,6 +491,7 @@ def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
     processor.close()
     assert processor._close_fn is None
 
+    shutdown_before_finalizer = handle.shutdown.call_count
     processor = build_processor(cfg)
     with caplog.at_level(
         logging.WARNING, logger="ray.llm._internal.batch.processor.base"
@@ -392,7 +499,7 @@ def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
         del processor
         gc.collect()
     assert any("garbage-collected without close()" in r.message for r in caplog.records)
-    assert handle.shutdown.call_count >= 3
+    assert handle.shutdown.call_count == shutdown_before_finalizer + 1
 
 
 def test_eager_timeout_shuts_down(stub_slice_pg, monkeypatch):

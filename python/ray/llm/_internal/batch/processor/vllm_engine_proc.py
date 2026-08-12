@@ -121,10 +121,12 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         description=(
             "Hardware-specific configuration for the chosen accelerator, "
             "discriminated by 'kind'. For TPU batch inference, set kind='tpu' "
-            "with a topology; tensor_parallel_size * pipeline_parallel_size "
-            "must equal the topology chip count, and concurrency must be 1 "
-            "or (1, 1). Call Processor.close() (or use a context manager) "
-            "after materializing derived Datasets to release the slice."
+            "with a topology; tensor_parallel_size * pipeline_parallel_size * "
+            "data_parallel_size must equal the topology chip count "
+            "(pipeline_parallel_size and data_parallel_size default to 1), "
+            "and concurrency must be 1 or (1, 1). Call Processor.close() "
+            "(or use a context manager) after materializing derived Datasets "
+            "to release the slice."
         ),
     )
 
@@ -430,7 +432,6 @@ def build_vllm_engine_processor(
             placement_group_config=config.placement_group_config,
         )
         fn_constructor_kwargs["engine_kwargs"] = engine_kwargs
-        fn_constructor_kwargs.pop("placement_group_config")
         map_batches_kwargs.pop("accelerator_type")
         map_batches_kwargs.update(tpu_map_kwargs)
 
