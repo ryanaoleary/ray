@@ -597,20 +597,11 @@ class TPUAccelerator(AcceleratorBackend):
                 f"got {engine_kwargs['distributed_executor_backend']!r}."
             )
 
-        def _positive_int(value: Any, name: str) -> int:
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer; got {value!r}.")
-            return value
-
-        tp = _positive_int(
-            engine_kwargs.get("tensor_parallel_size", 1), "tensor_parallel_size"
-        )
-        pp = _positive_int(
-            engine_kwargs.get("pipeline_parallel_size", 1), "pipeline_parallel_size"
-        )
-        dp = _positive_int(
-            engine_kwargs.get("data_parallel_size", 1), "data_parallel_size"
-        )
+        tp = engine_kwargs.get("tensor_parallel_size", 1)
+        if not isinstance(tp, int) or isinstance(tp, bool) or tp <= 0:
+            raise ValueError(
+                f"tensor_parallel_size must be a positive integer; got {tp!r}."
+            )
 
         topology = self._config.topology.strip().lower()
         total_chips = get_num_chips_from_topology(topology)
@@ -619,16 +610,6 @@ class TPUAccelerator(AcceleratorBackend):
                 f"tensor_parallel_size must be {total_chips} for topology "
                 f"'{topology}' on {version} ({total_chips} physical chips / "
                 f"vLLM devices); got {tp}."
-            )
-        if pp != 1:
-            raise ValueError(
-                "TPU batch inference currently supports pipeline_parallel_size=1; "
-                f"got {pp}."
-            )
-        if dp != 1:
-            raise ValueError(
-                "TPU batch inference currently supports data_parallel_size=1; "
-                f"got {dp}."
             )
 
         resources_per_bundle = self._resolve_batch_worker_bundle(placement_group_config)

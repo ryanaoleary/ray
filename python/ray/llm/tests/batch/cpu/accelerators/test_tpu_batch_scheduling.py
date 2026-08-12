@@ -296,8 +296,6 @@ def test_topology_accepts_valid(good):
     "option_kwargs, match",
     [
         ({"distributed_executor_backend": "uni"}, "distributed_executor_backend"),
-        ({"pipeline_parallel_size": 2}, "pipeline_parallel_size"),
-        ({"data_parallel_size": 2}, "data_parallel_size"),
         ({"tensor_parallel_size": 8}, "tensor_parallel_size must be 16"),
         (
             {"placement_group_config": {"bundle_per_worker": {"GPU": 1, "TPU": 1}}},
