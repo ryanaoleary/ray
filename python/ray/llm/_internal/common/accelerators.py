@@ -327,22 +327,21 @@ class GPUAccelerator(AcceleratorBackend):
                 self,
             )
             ray_remote_args["num_gpus"] = 0
+        elif not pg_config:
+            ray_remote_args["num_gpus"] = num_bundles_per_replica
         else:
-            if not pg_config:
-                ray_remote_args["num_gpus"] = num_bundles_per_replica
-            else:
-                bundles = pg_config["bundles"]
-                resource_counter = Counter()
-                for bundle in bundles:
-                    resource_counter.update(bundle)
-                total_cpus = resource_counter.pop("CPU", 0)
-                total_gpus = resource_counter.pop("GPU", 0)
-                if total_cpus:
-                    ray_remote_args["num_cpus"] = total_cpus
-                if total_gpus:
-                    ray_remote_args["num_gpus"] = total_gpus
-                if resource_counter:
-                    ray_remote_args["resources"] = dict(resource_counter)
+            bundles = pg_config["bundles"]
+            resource_counter = Counter()
+            for bundle in bundles:
+                resource_counter.update(bundle)
+            total_cpus = resource_counter.pop("CPU", 0)
+            total_gpus = resource_counter.pop("GPU", 0)
+            if total_cpus:
+                ray_remote_args["num_cpus"] = total_cpus
+            if total_gpus:
+                ray_remote_args["num_gpus"] = total_gpus
+            if resource_counter:
+                ray_remote_args["resources"] = dict(resource_counter)
 
         map_batches_kwargs.update(ray_remote_args)
         return map_batches_kwargs, None
@@ -350,51 +349,36 @@ class GPUAccelerator(AcceleratorBackend):
 
 def _gpu_ray_scheduling_strategy_fn(
     num_bundles_per_replica: int,
-    accelerator_type: Optional[str] = None,
-    placement_group_config: Optional[Dict[str, Any]] = None,
-    backend: Optional[GPUAccelerator] = None,
+    accelerator_type: Optional[str],
+    placement_group_config: Optional[Dict[str, Any]],
+    backend: GPUAccelerator,
 ) -> Dict[str, Any]:
-    """Helper function for legacy GPU dynamic placement group creation."""
-
-    def _get_bundle() -> Dict[str, float]:
-        bundle = {"GPU": 1, "CPU": 1}
-        if accelerator_type:
-            bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-        return bundle
-
+    """Create a PACK placement group for multi-GPU batch engine actors."""
     if placement_group_config:
         placement_group_config = copy.deepcopy(placement_group_config)
         bundles = placement_group_config.get("bundles") or []
         if accelerator_type:
             for bundle in bundles:
                 bundle[f"accelerator_type:{accelerator_type}"] = 0.001
-        if backend is not None:
-            pg = backend.create_placement_group(
-                bundles=bundles,
-                strategy=placement_group_config.get("strategy") or "PACK",
-                name="",
-            )
-        else:
-            placement_group_config["bundles"] = bundles
-            pg = ray.util.placement_group(**placement_group_config)
+        pg = backend.create_placement_group(
+            bundles=bundles,
+            strategy=placement_group_config.get("strategy") or "PACK",
+            name="",
+        )
     else:
-        bundles = [_get_bundle()] * num_bundles_per_replica
-        if backend is not None:
-            pg = backend.create_placement_group(
-                bundles=bundles,
-                strategy="PACK",
-                name="",
-            )
-        else:
-            pg = ray.util.placement_group(
-                bundles,
-                strategy="PACK",
-            )
-    return dict(
-        scheduling_strategy=PlacementGroupSchedulingStrategy(
+        bundle: Dict[str, float] = {"GPU": 1, "CPU": 1}
+        if accelerator_type:
+            bundle[f"accelerator_type:{accelerator_type}"] = 0.001
+        pg = backend.create_placement_group(
+            bundles=[bundle] * num_bundles_per_replica,
+            strategy="PACK",
+            name="",
+        )
+    return {
+        "scheduling_strategy": PlacementGroupSchedulingStrategy(
             pg, placement_group_capture_child_tasks=True
         )
-    )
+    }
 
 
 class TPUAccelerator(AcceleratorBackend):
@@ -552,15 +536,17 @@ class TPUAccelerator(AcceleratorBackend):
             }
         return options
 
-    def shutdown(self):
-        if self._slice_pg_wrapper is not None:
-            try:
-                logger.info("Shutting down TPU slice PG for server replica.")
-                self._slice_pg_wrapper.shutdown()
-            except Exception as e:
-                logger.warning(f"Failed to shut down TPU slice PG: {e}")
-            finally:
-                self._slice_pg_wrapper = None
+    def shutdown(self) -> None:
+        """Release the owned SlicePG. Swallows errors for Serve replica teardown."""
+        if self._slice_pg_wrapper is None:
+            return
+        try:
+            logger.info("Shutting down TPU slice PG for server replica.")
+            self._slice_pg_wrapper.shutdown()
+        except Exception as e:
+            logger.warning(f"Failed to shut down TPU slice PG: {e}")
+        finally:
+            self._slice_pg_wrapper = None
 
     def _resolve_batch_worker_bundle(
         self,
@@ -652,30 +638,19 @@ class TPUAccelerator(AcceleratorBackend):
         placement_group_config: Optional[Dict[str, Any]],
         runtime_env: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Eagerly reserve one topology-backed TPU placement group for Batch."""
+        """Eagerly reserve one topology-backed TPU placement group for Batch.
+
+        Validates config, waits for SlicePG readiness, releases head PGs, and
+        returns map kwargs plus a ``close_fn`` that tears down the slice.
+        Do not use ``self.shutdown`` as ``close_fn``: that path swallows errors
+        for Serve replica teardown, while Batch must surface failures so
+        ``Processor.close()`` can retry.
+        """
         if not self._config.topology:
             raise ValueError(
                 "TPU batch inference requires accelerator_config.topology. "
                 "Omit accelerator_config (or use GPUConfig) for GPU scheduling."
             )
-        return self._build_topology_batch_scheduling_options(
-            accelerator_type=accelerator_type,
-            engine_kwargs=engine_kwargs,
-            placement_group_config=placement_group_config,
-            runtime_env=runtime_env,
-        )
-
-    def _build_topology_batch_scheduling_options(
-        self,
-        *,
-        accelerator_type: Optional[str],
-        engine_kwargs: Dict[str, Any],
-        placement_group_config: Optional[Dict[str, Any]],
-        runtime_env: Optional[Dict[str, Any]],
-    ) -> Tuple[Dict[str, Any], Optional[Callable[[], None]]]:
-        """Eagerly reserve one topology-backed TPU placement group for Batch."""
-        tpu_config = self._config
-        assert tpu_config.topology is not None
 
         raw_driver_rpc = os.environ.get(RAY_TPU_RESOURCE_PER_CHIP_ENV_VAR, "1")
         try:
@@ -721,7 +696,7 @@ class TPUAccelerator(AcceleratorBackend):
             engine_kwargs.get("data_parallel_size", 1), "data_parallel_size"
         )
 
-        topology = tpu_config.topology.strip().lower()
+        topology = self._config.topology.strip().lower()
         expected_tp = _expected_vllm_tensor_parallel_size(topology, version)
         if expected_tp is not None and tp != expected_tp:
             raise ValueError(
@@ -757,18 +732,14 @@ class TPUAccelerator(AcceleratorBackend):
         # Topology-backed Batch defaults to SPREAD (matches SlicePlacementGroup
         # and JaxTrainer TPU examples). Serve keeps its own PACK default.
         # Users can still override via placement_group_config["strategy"].
-        strategy = (
-            placement_group_config.get("strategy") if placement_group_config else None
-        ) or "SPREAD"
+        strategy = (placement_group_config or {}).get("strategy") or "SPREAD"
 
-        handle = None
-        success = False
+        handle = self._create_slice_pg_handle(
+            accelerator_type=canonical_accel,
+            resources_per_bundle=resources_per_bundle,
+            strategy=strategy,
+        )
         try:
-            handle = self._create_slice_pg_handle(
-                accelerator_type=canonical_accel,
-                resources_per_bundle=resources_per_bundle,
-                strategy=strategy,
-            )
             try:
                 _wait_for_placement_group(
                     handle.placement_group, DEFAULT_PG_READY_TIMEOUT_S
@@ -780,32 +751,39 @@ class TPUAccelerator(AcceleratorBackend):
                     f"topology={topology} ({handle.num_hosts} hosts, "
                     f"{handle.num_bundles} bundles)."
                 ) from exc
-
             handle.release_head_pgs()
-            map_batches_kwargs = {
-                "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
-                "num_gpus": 0,
-                "resources": {},
-                "scheduling_strategy": PlacementGroupSchedulingStrategy(
-                    placement_group=handle.placement_group,
-                    placement_group_bundle_index=0,
-                    placement_group_capture_child_tasks=True,
-                ),
-                "runtime_env": merged_runtime_env,
-            }
-            success = True
-            return map_batches_kwargs, handle.shutdown
-        finally:
-            if handle is not None and not success:
-                try:
-                    handle.shutdown()
-                except Exception:
-                    logger.exception(
-                        "Failed to clean up TPU slice after batch scheduling "
-                        "construction failed."
-                    )
-                finally:
-                    self._slice_pg_wrapper = None
+        except Exception:
+            try:
+                handle.shutdown()
+            except Exception:
+                logger.exception(
+                    "Failed to clean up TPU slice after batch scheduling "
+                    "construction failed."
+                )
+            finally:
+                self._slice_pg_wrapper = None
+            raise
+
+        def close_fn() -> None:
+            owned = self._slice_pg_wrapper
+            if owned is None:
+                return
+            # Clear only after a successful shutdown so a failed close can retry.
+            owned.shutdown()
+            self._slice_pg_wrapper = None
+
+        map_batches_kwargs = {
+            "num_cpus": PARENT_ACTOR_CPU_RESERVE + DEFAULT_USER_CPU_PER_HOST,
+            "num_gpus": 0,
+            "resources": {},
+            "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                placement_group=handle.placement_group,
+                placement_group_bundle_index=0,
+                placement_group_capture_child_tasks=True,
+            ),
+            "runtime_env": merged_runtime_env,
+        }
+        return map_batches_kwargs, close_fn
 
 
 def get_accelerator_backend(
