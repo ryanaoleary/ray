@@ -312,8 +312,6 @@ class Processor:
 
     When ``close_fn`` is set, call ``close()`` or use as a context manager after
     derived Datasets have been fully consumed so reserved resources are released.
-    ``close()`` / ``__exit__`` mark the processor closed even when ``close_fn``
-    is unset.
 
     Args:
         config: The processor config.
@@ -396,9 +394,9 @@ class Processor:
             return
         try:
             logger.warning(
-                "%s was garbage-collected without close(). Reserved resources "
-                "may still be held. Call close() or use a context manager after "
-                "materializing derived Datasets.",
+                "%s was garbage-collected without close(); released reserved "
+                "resources during finalization. Call close() or use a context "
+                "manager after materializing derived Datasets.",
                 cls_name,
             )
         except Exception:

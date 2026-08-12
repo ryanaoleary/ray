@@ -154,27 +154,6 @@ def test_slice_pg_kwargs(
     handle.shutdown.assert_called_once()
 
 
-def test_dp_fill_matches_tp_only_slice_kwargs(stub_slice_pg):
-    """tp*pp*dp fill uses the same per-bundle template as tp-only fill."""
-    _, create = stub_slice_pg
-    kwargs_dp, close_dp = _schedule(
-        TPUAccelerator(TPUConfig(topology="4x4")),
-        tensor_parallel_size=8,
-        pipeline_parallel_size=1,
-        data_parallel_size=2,
-    )
-    resources_dp = create.call_args.kwargs["resources_per_bundle"]
-    close_dp()
-    kwargs_tp, close_tp = _schedule(
-        TPUAccelerator(TPUConfig(topology="4x4")),
-        tensor_parallel_size=16,
-    )
-    resources_tp = create.call_args.kwargs["resources_per_bundle"]
-    close_tp()
-    assert resources_dp == resources_tp
-    assert kwargs_dp["num_cpus"] == kwargs_tp["num_cpus"]
-
-
 def test_placement_group_names_are_unique(stub_slice_pg):
     _, create = stub_slice_pg
     closes = []

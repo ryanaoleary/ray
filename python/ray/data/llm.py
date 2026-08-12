@@ -158,7 +158,7 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
         accelerator_config: Hardware-specific configuration parameters for the
             chosen accelerator. The expected schema is dynamically typed based
             on the ``kind`` discriminator. For TPU batch inference, set
-            ``kind="tpu"`` with a ``topology`` (for example ``"4x4"``); engine
+            ``kind="tpu"`` with a ``topology``; engine
             ``tensor_parallel_size * pipeline_parallel_size * data_parallel_size``
             must equal the topology chip count (``pipeline_parallel_size`` and
             ``data_parallel_size`` default to 1), and ``concurrency`` must be
