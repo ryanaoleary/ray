@@ -118,7 +118,10 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     )
     accelerator_config: Optional[AnyAcceleratorConfig] = Field(
         default=None,
-        description="Hardware-specific settings selected by 'kind'.",
+        description=(
+            "Hardware-specific configuration parameters for the chosen accelerator. "
+            "The expected schema is dynamically typed based on the 'kind' discriminator."
+        ),
     )
 
     @model_validator(mode="before")
@@ -200,7 +203,7 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     def validate_placement_group_config(cls, value):
         if value is None:
             return None
-        # Validate through PlacementGroupConfig, then dump back to dict.
+        # Validate through PlacementGroupConfig, then dump back to dict
         # Pop strategy when omitted so _resolve_placement_strategy can set the default.
         validated = PlacementGroupConfig(**value)
         dumped = validated.model_dump()

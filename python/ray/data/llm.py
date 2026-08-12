@@ -155,7 +155,9 @@ class vLLMEngineProcessorConfig(_vLLMEngineProcessorConfig, ProcessorConfig):
             (``PACK``/``STRICT_PACK``/``SPREAD``/``STRICT_SPREAD``). When
             ``strategy`` is omitted, defaults to ``PACK``, or to ``SPREAD`` when
             ``accelerator_config`` sets a TPU topology.
-        accelerator_config: Hardware-specific settings selected by ``kind``.
+        accelerator_config: Hardware-specific configuration parameters for the
+            chosen accelerator. The expected schema is dynamically typed based
+            on the ``kind`` discriminator.
         chat_template_stage: Chat templating stage config (bool | dict | ChatTemplateStageConfig).
             Defaults to True. Use nested config for per-stage control over batch_size,
             concurrency, runtime_env, num_cpus, memory, and model_source. Legacy

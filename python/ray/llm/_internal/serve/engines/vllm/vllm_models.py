@@ -106,7 +106,7 @@ class VLLMEngineConfig(BaseModelExtended):
                 "CPU-only configurations. Either remove accelerator_type, or provide an accelerator_config."
             )
 
-        # LLMConfig has already resolved and validated accelerator_config.
+        # LLMConfig has already resolved and validated accelerator_config
         self._accelerator = get_accelerator_backend(cfg or GPUConfig())
         return self
 
@@ -278,7 +278,7 @@ class VLLMEngineConfig(BaseModelExtended):
             for bundle_dict in explicit_bundles:
                 bundle = bundle_dict.copy()
                 if self.accelerator_type:
-                    # Don't override an explicit accelerator resource hint.
+                    # Use setdefault to add accelerator hint WITHOUT overriding explicit user values
                     res_key = format_ray_accelerator_resource(self.accelerator_type)
                     bundle.setdefault(res_key, 0.001)
                 bundles.append(bundle)

@@ -81,7 +81,7 @@ def infer_hardware_kind_from_bundles(
     if any(b.get("GPU", 0) > 0 for b in all_bundles):
         return "gpu"
 
-    # If a config was provided but lacks GPUs or TPUs, it is a CPU deployment.
+    # If a config was provided but lacks GPUs or TPUs, it is a CPU deployment
     return "cpu"
 
 
@@ -99,13 +99,7 @@ class GPUConfig(AcceleratorConfig):
 
 class TPUConfig(AcceleratorConfig):
     kind: Literal["tpu"] = "tpu"
-    topology: Optional[str] = Field(
-        default=None,
-        description=(
-            "TPU slice topology. Required for multi-host batch inference and "
-            "for Serve deferred slice placement."
-        ),
-    )
+    topology: Optional[str] = None
     chips_per_vm: Optional[int] = Field(
         default=None,
         description=(
@@ -300,11 +294,13 @@ class TPUAccelerator(AcceleratorBackend):
         self, *, num_devices: int, accelerator_type_str: Optional[str] = None
     ):
         if not self._config.topology:
+            # Fallback to per-chip bundles if no topology is specified
             bundle = {"TPU": 1}
             if accelerator_type_str:
                 bundle[format_ray_accelerator_resource(accelerator_type_str)] = 0.001
             return [bundle.copy() for _ in range(num_devices)]
 
+        # Topology is specified, compute per-host bundles
         if not accelerator_type_str:
             raise ValueError(
                 "`accelerator_type` must be specified when `topology` is present "
@@ -352,7 +348,7 @@ class TPUAccelerator(AcceleratorBackend):
                 "accelerator_type must be provided for TPU slice provisioning."
             )
 
-        # Prefer an explicit homogeneous TPU bundle; otherwise default to TPU:1.
+        # Filter for bundles that actually specify TPU resources
         if bundles:
             tpu_bundles = [b for b in bundles if b.get("TPU", 0) > 0]
             if not tpu_bundles:
@@ -366,6 +362,7 @@ class TPUAccelerator(AcceleratorBackend):
                         "Please use `bundle_per_worker` in `placement_group_config` to define uniform worker resources."
                     )
         else:
+            # Default to 1 TPU per bundle.
             worker_bundle = {"TPU": 1}
 
         self._create_slice_pg_handle(
@@ -394,8 +391,7 @@ class TPUAccelerator(AcceleratorBackend):
             )
         if self._slice_pg_wrapper is not None:
             logger.debug(
-                "Existing TPU slice placement group found; shutting it down "
-                "before creating a new one."
+                "Existing TPU slice PG found. Shutting it down before creating a new one."
             )
             self.shutdown()
 
@@ -415,10 +411,11 @@ class TPUAccelerator(AcceleratorBackend):
 
     @property
     def requires_deferred_placement_group(self) -> bool:
-        """Defer placement-group creation when a TPU topology is configured.
-
-        The Serve replica then provisions a slice placement group at runtime so
-        multi-host TPU slices are gang-scheduled by physical topology.
+        """
+        If a TPU topology is specified, we defer PG creation so the replica can
+        provision a `SlicePlacementGroup` at runtime. This ensures multi-host
+        TPU slices are gang-scheduled atomically according to their physical
+        topology rather than fragmented across the cluster.
         """
         return bool(self._config.topology)
 
@@ -439,14 +436,13 @@ class TPUAccelerator(AcceleratorBackend):
         return options
 
     def shutdown(self) -> None:
-        """Shut down the slice placement group if present. Swallows errors during Serve teardown."""
         if self._slice_pg_wrapper is None:
             return
         try:
-            logger.info("Shutting down TPU slice placement group.")
+            logger.info("Shutting down TPU slice PG for server replica.")
             self._slice_pg_wrapper.shutdown()
         except Exception as e:
-            logger.warning(f"Failed to shut down TPU slice placement group: {e}")
+            logger.warning(f"Failed to shut down TPU slice PG: {e}")
         finally:
             self._slice_pg_wrapper = None
 
