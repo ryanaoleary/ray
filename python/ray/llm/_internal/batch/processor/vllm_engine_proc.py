@@ -203,9 +203,11 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
     def validate_placement_group_config(cls, value):
         if value is None:
             return None
-        # Validate through PlacementGroupConfig, then dump back to dict
+        # Validate through PlacementGroupConfig, then dump back to dict.
+        # strategy defaults to None (unset); GPU/Serve resolve to PACK and
+        # topology-backed Batch resolves to SPREAD at the consumption site.
         validated = PlacementGroupConfig(**value)
-        return validated.model_dump(exclude_unset=True)
+        return validated.model_dump()
 
 
 def build_vllm_engine_processor(
@@ -416,8 +418,8 @@ def build_vllm_engine_processor(
         )
     else:
         # GPU: stage post_init owns scheduling (same as master).
-        # placement_group_config may omit strategy when dumped with
-        # exclude_unset=True; Ray/stage still default omitted strategy to PACK.
+        # placement_group_config.strategy may be None when unset; Ray's
+        # placement_group treats None as PACK.
         fn_constructor_kwargs = dict(
             batch_size=config.batch_size,
             max_concurrent_batches=config.max_concurrent_batches,

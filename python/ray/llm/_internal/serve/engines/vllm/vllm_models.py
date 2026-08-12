@@ -249,9 +249,11 @@ class VLLMEngineConfig(BaseModelExtended):
 
     @property
     def placement_strategy(self) -> str:
-        # Use custom strategy if placement_group_config is provided
+        # Use custom strategy if placement_group_config is provided.
+        # None / missing means unset → PACK (PlacementGroupConfig.strategy
+        # is Optional; absence must not be confused with an explicit choice).
         if self.placement_group_config:
-            return self.placement_group_config.get("strategy", "PACK")
+            return self.placement_group_config.get("strategy") or "PACK"
         # Default to PACK (cross-node best-effort placement)
         # DP deployments overridden to STRICT_PACK in Serve config
         return "PACK"

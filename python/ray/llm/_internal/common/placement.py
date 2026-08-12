@@ -58,9 +58,11 @@ class PlacementGroupConfig(BaseModelExtended):
     bundles: Optional[List[BundleConfig]] = Field(
         default=None, description="List of resource bundles"
     )
-    strategy: Literal["PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"] = Field(
-        default="PACK", description="Placement group strategy"
-    )
+    # None means the caller did not choose a strategy. Consumers must resolve:
+    # Serve/GPU → PACK, topology-backed Batch TPU → SPREAD.
+    strategy: Optional[
+        Literal["PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"]
+    ] = Field(default=None, description="Placement group strategy")
 
     @model_validator(mode="after")
     def validate_bundle_options(self):

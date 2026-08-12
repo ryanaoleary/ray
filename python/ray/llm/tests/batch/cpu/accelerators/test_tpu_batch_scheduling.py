@@ -272,11 +272,12 @@ def test_bundle_per_worker_applies_cpu_floor(stub_slice_pg):
     close_fn()
 
 
-def test_tpu_bundle_per_worker_only_defaults_spread_after_exclude_unset(stub_slice_pg):
-    """PlacementGroupConfig defaults strategy=PACK, but exclude_unset omits it.
+def test_tpu_defaults_spread_when_strategy_unset(stub_slice_pg):
+    """Unset strategy dumps as None; topology-backed Batch resolves SPREAD.
 
-    Topology-backed Batch must still resolve SPREAD when only bundle_per_worker
-    is set on the public config.
+    PlacementGroupConfig.strategy is Optional and defaults to None so Batch can
+    distinguish "user chose PACK" from "user said nothing" without
+    exclude_unset=True (which would also drop bundles: None on the GPU path).
     """
     handle, create = stub_slice_pg
     cfg = _topo_config(
@@ -286,14 +287,97 @@ def test_tpu_bundle_per_worker_only_defaults_spread_after_exclude_unset(stub_sli
         detokenize=False,
         apply_chat_template=False,
     )
-    assert "strategy" not in cfg.placement_group_config
-    assert "bundles" not in cfg.placement_group_config
+    assert cfg.placement_group_config.get("strategy") is None
+    assert cfg.placement_group_config.get("bundles") is None
     processor = build_processor(cfg)
     assert create.call_args.kwargs["strategy"] == "SPREAD"
     assert create.call_args.kwargs["resources_per_bundle"]["TPU"] == 1.0
     assert create.call_args.kwargs["resources_per_bundle"]["CPU"] == float(_CPU_FLOOR)
     processor.close()
     handle.shutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# WP-01 GPU-path characterization (master scheduling must stay PACK on unset)
+# Master dump for the same input was:
+#   {'bundle_per_worker': {'CPU': 1.0, 'GPU': 1.0}, 'bundles': None, 'strategy': 'PACK'}
+# After Optional strategy=None, dump uses strategy=None; Ray still resolves PACK
+# (placement_group.py _derive_node_level_strategy: None → PACK).
+# ---------------------------------------------------------------------------
+
+# Locked master dump shape for fields other than strategy; strategy is now None
+# when unset (FINDINGS R-01 / WP-01 Option A).
+_MASTER_GPU_PG_INPUT = {"bundle_per_worker": {"CPU": 1, "GPU": 1}}
+_GPU_PG_DUMP_UNSET_STRATEGY = {
+    "bundle_per_worker": {"CPU": 1.0, "GPU": 1.0},
+    "bundles": None,
+    "strategy": None,
+}
+
+
+def test_gpu_placement_group_config_roundtrip_unchanged():
+    """GPU placement_group_config dump keeps bundles key; unset strategy is None."""
+    cfg = vLLMEngineProcessorConfig(
+        model_source="m",
+        placement_group_config=dict(_MASTER_GPU_PG_INPUT),
+        tokenize=False,
+        detokenize=False,
+        apply_chat_template=False,
+    )
+    assert cfg.placement_group_config == _GPU_PG_DUMP_UNSET_STRATEGY
+
+
+def test_gpu_stage_scheduling_strategy_unchanged(monkeypatch):
+    """Unset strategy still schedules with Ray's PACK default (master behavior)."""
+    from ray.llm._internal.batch.stages import vllm_engine_stage as stage_mod
+    from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage
+
+    captured = {}
+
+    def fake_pg(**kwargs):
+        captured.update(kwargs)
+        pg = MagicMock(name="pg")
+        pg.bundle_specs = kwargs.get("bundles")
+        return pg
+
+    monkeypatch.setattr(stage_mod.ray.util, "placement_group", fake_pg)
+
+    # tp>1 selects distributed_executor_backend=ray (same as master GPU PG path).
+    stage = vLLMEngineStage(
+        fn_constructor_kwargs=dict(
+            model="m",
+            engine_kwargs={"tensor_parallel_size": 2},
+            task_type="generate",
+            placement_group_config=dict(_GPU_PG_DUMP_UNSET_STRATEGY),
+        ),
+        map_batches_kwargs=dict(accelerator_type="A100"),
+    )
+    remote_fn = stage.map_batches_kwargs["ray_remote_args_fn"]
+    remote_fn()
+    # Master passed strategy='PACK' via field default; Optional None is equivalent
+    # because ray.util.placement_group resolves None → PACK.
+    assert captured.get("strategy") in (None, "PACK")
+    assert len(captured["bundles"]) == 2
+    for bundle in captured["bundles"]:
+        assert bundle["CPU"] == 1.0
+        assert bundle["GPU"] == 1.0
+        assert bundle.get("accelerator_type:A100") == 0.001
+
+
+def test_gpu_explicit_strategy_preserved():
+    cfg = vLLMEngineProcessorConfig(
+        model_source="m",
+        placement_group_config={
+            "bundles": [{"CPU": 1, "GPU": 1}],
+            "strategy": "STRICT_PACK",
+        },
+        tokenize=False,
+        detokenize=False,
+        apply_chat_template=False,
+    )
+    assert cfg.placement_group_config["strategy"] == "STRICT_PACK"
+    assert cfg.placement_group_config["bundles"] == [{"CPU": 1.0, "GPU": 1.0}]
+    assert cfg.placement_group_config["bundle_per_worker"] is None
 
 
 def test_builder_does_not_mutate_caller_engine_kwargs(stub_slice_pg):
