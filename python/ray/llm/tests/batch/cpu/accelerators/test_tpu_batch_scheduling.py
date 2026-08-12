@@ -335,6 +335,9 @@ def test_builder_lifecycle(stub_slice_pg, monkeypatch):
         strategy = stage.map_batches_kwargs["scheduling_strategy"]
         assert isinstance(strategy, PlacementGroupSchedulingStrategy)
         assert strategy.placement_group_bundle_index == 0
+        assert strategy.placement_group_capture_child_tasks is True
+        assert stage.map_batches_kwargs["num_gpus"] == 0
+        assert stage.map_batches_kwargs["resources"] == {}
         assert "ray_remote_args_fn" not in stage.map_batches_kwargs
         rebuilt = vLLMEngineStage(
             fn_constructor_kwargs=dict(stage.fn_constructor_kwargs),
@@ -355,6 +358,24 @@ def test_builder_lifecycle(stub_slice_pg, monkeypatch):
     with pytest.raises(RuntimeError, match="bad pool"):
         build_processor(cfg)
     assert handle.shutdown.call_count == 2
+
+
+def test_gpu_builder_does_not_create_slice_pg(stub_slice_pg):
+    _, create = stub_slice_pg
+    cfg = vLLMEngineProcessorConfig(
+        model_source="m",
+        engine_kwargs={"tensor_parallel_size": 2},
+        tokenize=False,
+        detokenize=False,
+        apply_chat_template=False,
+    )
+    processor = build_processor(cfg)
+    create.assert_not_called()
+    stage = processor.get_stage_by_name("vLLMEngineStage")
+    # Master GPU path: stage owns scheduling via ray_remote_args_fn.
+    assert "ray_remote_args_fn" in stage.map_batches_kwargs
+    assert "scheduling_strategy" not in stage.map_batches_kwargs
+    processor.close()
 
 
 def test_close_retry_and_unclosed_finalizer(stub_slice_pg, caplog):
