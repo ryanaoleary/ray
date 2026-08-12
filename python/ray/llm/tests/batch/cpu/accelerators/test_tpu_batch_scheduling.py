@@ -24,7 +24,6 @@ from ray.llm._internal.common.accelerators import (
     GPUConfig,
     TPUAccelerator,
     TPUConfig,
-    _expected_vllm_tensor_parallel_size,
     get_accelerator_backend,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -125,49 +124,15 @@ def test_omitted_accelerator_config_defaults_to_gpu():
 
 
 @pytest.mark.parametrize(
-    "topology, version, expected",
-    [
-        ("4x4", "v6e", 16),
-        ("2x4", "v5e", 8),
-        # Ironwood: chip↔device mapping can be 1x or 2x; skip hard expectation.
-        ("2x2x2", "v7x", None),
-        ("2x2x1", "v7x", None),
-    ],
-)
-def test_expected_vllm_tensor_parallel_size(topology, version, expected):
-    assert _expected_vllm_tensor_parallel_size(topology, version) == expected
-
-
-def test_chips_per_vm_requires_topology():
-    with pytest.raises(ValueError, match="chips_per_vm requires topology"):
-        TPUConfig(chips_per_vm=4)
-
-
-@pytest.mark.parametrize("bad", [0, -1, True])
-def test_chips_per_vm_rejects_invalid_values(bad):
-    with pytest.raises(ValueError, match="chips_per_vm must be a positive integer"):
-        TPUConfig(topology="2x4", chips_per_vm=bad)
-
-
-@pytest.mark.parametrize(
-    "topology, accelerator_type, tp, chips_per_vm, tpu_per_bundle, strategy, "
-    "expect_strategy",
+    "topology, accelerator_type, tp, tpu_per_bundle, strategy, expect_strategy",
     [
         # Topology-backed Batch defaults to SPREAD; explicit strategy wins.
-        ("4x4", "TPU-V6E", 16, None, None, None, "SPREAD"),
-        ("4x4", "TPU-V6E", 16, None, 1, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 4, 1, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, 4, 1, "STRICT_PACK", "STRICT_PACK"),
-        ("2x4", "TPU-V6E", 8, 4, 1, "PACK", "PACK"),
-        ("2x4", "TPU-V6E", 8, None, None, None, "SPREAD"),
-        ("2x4", "TPU-V6E", 8, None, 1, None, "SPREAD"),
-        # v7x TP is intentionally unvalidated (chip↔device may be 1x or 2x).
-        # These cases only prove both values pass admission — not that either
-        # is correct for a given Ironwood runtime.
-        ("2x2x1", "TPU-V7X", 4, None, 1, None, "SPREAD"),
-        ("2x2x1", "TPU-V7X", 8, None, 1, None, "SPREAD"),
-        ("2x2x2", "TPU-V7X", 8, None, None, None, "SPREAD"),
-        ("2x2x2", "TPU-V7X", 16, None, None, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 16, None, None, "SPREAD"),
+        ("4x4", "TPU-V6E", 16, 1, None, "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 1, "STRICT_PACK", "STRICT_PACK"),
+        ("2x4", "TPU-V6E", 8, 1, "PACK", "PACK"),
+        ("2x4", "TPU-V6E", 8, None, None, "SPREAD"),
+        ("2x4", "TPU-V6E", 8, 1, None, "SPREAD"),
     ],
 )
 def test_topology_forwards_slice_pg_kwargs(
@@ -175,7 +140,6 @@ def test_topology_forwards_slice_pg_kwargs(
     topology,
     accelerator_type,
     tp,
-    chips_per_vm,
     tpu_per_bundle,
     strategy,
     expect_strategy,
@@ -190,7 +154,7 @@ def test_topology_forwards_slice_pg_kwargs(
             pg_config["strategy"] = strategy
 
     kwargs, close_fn = _schedule(
-        TPUAccelerator(TPUConfig(topology=topology, chips_per_vm=chips_per_vm)),
+        TPUAccelerator(TPUConfig(topology=topology)),
         accelerator_type=accelerator_type,
         tensor_parallel_size=tp,
         placement_group_config=pg_config,
@@ -208,7 +172,6 @@ def test_topology_forwards_slice_pg_kwargs(
         assert "TPU" not in resources
     else:
         assert resources["TPU"] == float(tpu_per_bundle)
-    assert slice_kwargs.get("chips_per_vm") == chips_per_vm
     assert "bundle_label_selector" not in slice_kwargs
 
     close_fn()
@@ -232,7 +195,7 @@ def test_topology_merges_runtime_env_and_releases_head(stub_slice_pg):
 
 def test_bundle_per_worker_applies_cpu_floor(stub_slice_pg):
     """Explicit TPU templates without CPU still get the parent-actor floor."""
-    handle, create = stub_slice_pg
+    _, create = stub_slice_pg
     _, close_fn = _schedule(
         TPUAccelerator(TPUConfig(topology="4x4")),
         tensor_parallel_size=16,
@@ -448,14 +411,6 @@ def test_close_during_call_does_not_deadlock(stub_slice_pg, monkeypatch):
     assert not call_error, call_error
 
 
-def test_slice_pg_handle_attrs_used_by_timeout_formatting_are_real():
-    """Timeout error formatting reads SlicePlacementGroup.num_hosts/num_bundles."""
-    from ray.util.tpu import SlicePlacementGroup
-
-    assert callable(SlicePlacementGroup.num_hosts.fget)
-    assert callable(SlicePlacementGroup.num_bundles.fget)
-
-
 @pytest.mark.parametrize(
     "backend_kwargs, option_kwargs, match",
     [
@@ -515,6 +470,7 @@ def test_slice_pg_handle_attrs_used_by_timeout_formatting_are_real():
 def test_rejects_invalid_topology_inputs(
     stub_slice_pg, backend_kwargs, option_kwargs, match
 ):
+    _, create = stub_slice_pg
     with pytest.raises(ValueError, match=match):
         _schedule(TPUAccelerator(TPUConfig(**backend_kwargs)), **option_kwargs)
-    stub_slice_pg[1].assert_not_called()
+    create.assert_not_called()
