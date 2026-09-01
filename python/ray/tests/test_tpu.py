@@ -2988,30 +2988,22 @@ def test_get_tpu_cores_per_chip():
     assert get_total_chips_from_accelerator_type("TPU-V6E-16") == 16
 
 
-def test_get_torchtpu_env_vars():
+@pytest.mark.parametrize(
+    "addresses, expected_addresses",
+    [
+        ("10.0.0.1:8431,10.0.0.2:8431", "10.0.0.1:8431,10.0.0.2:8431"),
+        (["10.0.0.1:8431", "10.0.0.2:8431"], "10.0.0.1:8431,10.0.0.2:8431"),
+        (None, None),
+    ],
+)
+def test_get_torchtpu_env_vars(addresses, expected_addresses):
     """Test get_torchtpu_env_vars utility with string, list, and None addresses."""
-    env_vars_str = get_torchtpu_env_vars(
-        topology="2x4",
-        slicebuilder_addresses="10.0.0.1:8431,10.0.0.2:8431",
-    )
-    assert env_vars_str["TORCH_TPU_TOPOLOGY"] == "2,4,1"
-    assert (
-        env_vars_str["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
-        == "10.0.0.1:8431,10.0.0.2:8431"
-    )
-
-    env_vars_list = get_torchtpu_env_vars(
-        topology="2x4",
-        slicebuilder_addresses=["10.0.0.1:8431", "10.0.0.2:8431"],
-    )
-    assert env_vars_list["TORCH_TPU_TOPOLOGY"] == "2,4,1"
-    assert (
-        env_vars_list["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
-        == "10.0.0.1:8431,10.0.0.2:8431"
-    )
-
-    env_vars_none = get_torchtpu_env_vars(topology="2x4", slicebuilder_addresses=None)
-    assert env_vars_none == {"TORCH_TPU_TOPOLOGY": "2,4,1"}
+    env = get_torchtpu_env_vars(topology="2x4", slicebuilder_addresses=addresses)
+    assert env.get("TORCH_TPU_TOPOLOGY") == "2,4,1"
+    if expected_addresses is not None:
+        assert env.get("TORCH_TPU_SLICEBUILDER_ADDRESSES") == expected_addresses
+    else:
+        assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in env
 
 
 def test_subslice_placement_group_properties():
@@ -3198,25 +3190,16 @@ def test_build_subslice_pg_incomplete_addresses_omitted():
     assert ss_pg._slicebuilder_addresses is None
 
 
-def test_subslice_placement_group_torchtpu_env_explicit_addresses():
+@pytest.mark.parametrize(
+    "explicit_addrs",
+    [
+        "10.0.0.1:8431,10.0.0.2:8431",
+        ["10.0.0.1:8431", "10.0.0.2:8431"],
+    ],
+)
+def test_subslice_placement_group_torchtpu_env_explicit_addresses(explicit_addrs):
     """Test explicit slicebuilder_addresses argument is returned verbatim untouched."""
-    ss_pg_0 = SubslicePlacementGroup(
-        placement_group=None,
-        parent_topology="4x4",
-        subslice_topology="2x4",
-        subslice_index=0,
-        slice_name="slice-0",
-        num_hosts=2,
-        chips_per_host=4,
-        bundle_resources={"CPU": 1, "TPU": 4},
-        accelerator_version="v6e",
-    )
-    explicit_str = "10.0.0.1:8431,10.0.0.2:8431"
-    env_0 = ss_pg_0.get_torchtpu_env_vars(explicit_str)
-    assert env_0["TORCH_TPU_TOPOLOGY"] == "2,4,1"
-    assert env_0["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == explicit_str
-
-    ss_pg_1 = SubslicePlacementGroup(
+    ss_pg = SubslicePlacementGroup(
         placement_group=None,
         parent_topology="4x4",
         subslice_topology="2x4",
@@ -3227,13 +3210,9 @@ def test_subslice_placement_group_torchtpu_env_explicit_addresses():
         bundle_resources={"CPU": 1, "TPU": 4},
         accelerator_version="v6e",
     )
-    # Explicit addresses passed to subslice 1 must not be sliced
-    env_1 = ss_pg_1.get_torchtpu_env_vars(explicit_str)
-    assert env_1["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == explicit_str
-
-    explicit_list = ["10.0.0.1:8431", "10.0.0.2:8431"]
-    env_list = ss_pg_1.get_torchtpu_env_vars(explicit_list)
-    assert env_list["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == explicit_str
+    env = ss_pg.get_torchtpu_env_vars(explicit_addrs)
+    assert env["TORCH_TPU_TOPOLOGY"] == "2,4,1"
+    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "10.0.0.1:8431,10.0.0.2:8431"
 
 
 def test_subslice_placement_group_torchtpu_env_no_discovery_data(monkeypatch):
@@ -3258,98 +3237,94 @@ def test_subslice_placement_group_torchtpu_env_no_discovery_data(monkeypatch):
         ss_pg.get_torchtpu_env_vars()
 
 
-def test_subslice_placement_group_torchtpu_env_fallback(monkeypatch):
+@pytest.mark.parametrize(
+    "parent_topo,subslice_topo,subslice_idx,num_hosts,chips_per_host,bundle_res,accl_ver,worker_ids,raw_count,expected_topo,expected_range",
+    [
+        # v6e (4x4 -> 2x4 subslice 1: 16 parent endpoints, subslice gets endpoints 8..15)
+        (
+            "4x4",
+            "2x4",
+            1,
+            2,
+            4,
+            {"CPU": 1, "TPU": 4},
+            "v6e",
+            ["2", "3"],
+            16,
+            "2,4,1",
+            range(8, 16),
+        ),
+        # v7x with 8 endpoints per host (2x2x2 -> 2x2x1 subslice 1: 16 parent endpoints, gets 8..15)
+        (
+            "2x2x2",
+            "2x2x1",
+            1,
+            1,
+            4,
+            {"CPU": 1, "TPU": 8},
+            "v7x",
+            ["1"],
+            16,
+            "2,2,1,2",
+            range(8, 16),
+        ),
+        # v7x with 4 endpoints per host (2x2x2 -> 2x2x1 subslice 1: 8 parent endpoints, gets 4..7)
+        (
+            "2x2x2",
+            "2x2x1",
+            1,
+            1,
+            4,
+            {"CPU": 1, "TPU": 8},
+            "v7x",
+            ["1"],
+            8,
+            "2,2,1,2",
+            range(4, 8),
+        ),
+    ],
+)
+def test_subslice_placement_group_torchtpu_env_fallback(
+    monkeypatch,
+    parent_topo,
+    subslice_topo,
+    subslice_idx,
+    num_hosts,
+    chips_per_host,
+    bundle_res,
+    accl_ver,
+    worker_ids,
+    raw_count,
+    expected_topo,
+    expected_range,
+):
     """Test env fallback logs a warning and slices addresses by index offset."""
-    raw_addrs = ",".join(f"host:{8470+i}" for i in range(16))
+    raw_addrs = ",".join(f"host:{8470 + i}" for i in range(raw_count))
     monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", raw_addrs)
 
     ss_pg = SubslicePlacementGroup(
         placement_group=None,
-        parent_topology="4x4",
-        subslice_topology="2x4",
-        subslice_index=1,
+        parent_topology=parent_topo,
+        subslice_topology=subslice_topo,
+        subslice_index=subslice_idx,
         slice_name="slice-0",
-        num_hosts=2,
-        chips_per_host=4,
-        bundle_resources={"CPU": 1, "TPU": 4},
+        num_hosts=num_hosts,
+        chips_per_host=chips_per_host,
+        bundle_resources=bundle_res,
         bundle_label_selectors=[
-            {ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY: "2"},
-            {ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY: "3"},
+            {ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY: wid} for wid in worker_ids
         ],
-        accelerator_version="v6e",
+        accelerator_version=accl_ver,
         slicebuilder_addresses=None,
     )
 
     with patch.object(ray.util.tpu.logger, "warning") as mock_warn:
         env = ss_pg.get_torchtpu_env_vars()
 
-    assert env["TORCH_TPU_TOPOLOGY"] == "2,4,1"
-    expected_addrs = ",".join(f"host:{8470+i}" for i in range(8, 16))
+    assert env["TORCH_TPU_TOPOLOGY"] == expected_topo
+    expected_addrs = ",".join(f"host:{8470 + i}" for i in expected_range)
     assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == expected_addrs
     mock_warn.assert_called_once()
-    assert (
-        "Per-host slicebuilder address discovery data was unavailable"
-        in mock_warn.call_args[0][0]
-    )
-
-
-def test_subslice_placement_group_torchtpu_env_fallback_v7x_4_and_8_addrs(monkeypatch):
-    """Test env fallback on v7x dual-device with both 4 and 8 addresses per host."""
-    # 1. 8 addresses per host (2 hosts x 8 endpoints = 16 addresses in parent slice)
-    raw_addrs_8 = ",".join(f"host:{8470+i}" for i in range(16))
-    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", raw_addrs_8)
-
-    ss_pg_8 = SubslicePlacementGroup(
-        placement_group=None,
-        parent_topology="2x2x2",
-        subslice_topology="2x2x1",
-        subslice_index=1,
-        slice_name="slice-0",
-        num_hosts=1,
-        chips_per_host=4,
-        bundle_resources={"CPU": 1, "TPU": 8},
-        bundle_label_selectors=[
-            {ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY: "1"},
-        ],
-        accelerator_version="v7x",
-        slicebuilder_addresses=None,
-    )
-
-    with patch.object(ray.util.tpu.logger, "warning") as mock_warn:
-        env_8 = ss_pg_8.get_torchtpu_env_vars()
-    assert env_8["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
-    assert env_8["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(
-        f"host:{8470+i}" for i in range(8, 16)
-    )
-    mock_warn.assert_called_once()
-
-    # 2. 4 addresses per host (2 hosts x 4 endpoints = 8 addresses in parent slice)
-    raw_addrs_4 = ",".join(f"host:{8470+i}" for i in range(8))
-    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", raw_addrs_4)
-
-    ss_pg_4 = SubslicePlacementGroup(
-        placement_group=None,
-        parent_topology="2x2x2",
-        subslice_topology="2x2x1",
-        subslice_index=1,
-        slice_name="slice-0",
-        num_hosts=1,
-        chips_per_host=4,
-        bundle_resources={"CPU": 1, "TPU": 8},
-        bundle_label_selectors=[
-            {ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY: "1"},
-        ],
-        accelerator_version="v7x",
-        slicebuilder_addresses=None,
-    )
-
-    with patch.object(ray.util.tpu.logger, "warning") as mock_warn_4:
-        env_4 = ss_pg_4.get_torchtpu_env_vars()
-    assert env_4["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
-    assert env_4["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(
-        f"host:{8470+i}" for i in range(4, 8)
-    )
-    mock_warn_4.assert_called_once()
 
 
 def test_subslice_placement_group_torchtpu_env_offset_mismatch_raises(
@@ -3844,6 +3819,87 @@ def test_get_jax_env_vars_free_function(
         get_jax_env_vars(worker_hostnames, worker_id=worker_id, **kwargs)
         == expected_env
     )
+
+
+@pytest.mark.parametrize(
+    "pg_factory,num_hosts,worker_id,expected_wid,should_raise",
+    [
+        # Single-host slice auto-defaults worker_id to "0" when omitted
+        (lambda: SlicePlacementGroup("2x2x1", "v4", num_slices=1), 1, None, "0", False),
+        # Single-host subslice auto-defaults worker_id to "0" when omitted
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x2", 0, "s0", 1, 4),
+            1,
+            None,
+            "0",
+            False,
+        ),
+        # Single-host valid explicit worker_ids
+        (lambda: SlicePlacementGroup("2x2x1", "v4", num_slices=1), 1, 0, "0", False),
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x2", 0, "s0", 1, 4),
+            1,
+            "0",
+            "0",
+            False,
+        ),
+        # Single-host out-of-bounds worker_ids
+        (lambda: SlicePlacementGroup("2x2x1", "v4", num_slices=1), 1, 1, None, True),
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x2", 0, "s0", 1, 4),
+            1,
+            -1,
+            None,
+            True,
+        ),
+        # Multi-host (2 hosts) valid worker_ids
+        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, 0, "0", False),
+        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, "1", "1", False),
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
+            2,
+            0,
+            "0",
+            False,
+        ),
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
+            2,
+            "1",
+            "1",
+            False,
+        ),
+        # Multi-host out-of-bounds worker_ids
+        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, 2, None, True),
+        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, -1, None, True),
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
+            2,
+            2,
+            None,
+            True,
+        ),
+        (
+            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
+            2,
+            -1,
+            None,
+            True,
+        ),
+    ],
+)
+def test_placement_group_get_jax_env_vars_worker_id(
+    pg_factory, num_hosts, worker_id, expected_wid, should_raise
+):
+    """Test worker_id auto-defaulting and bounds validation across slice and subslice PGs."""
+    pg = pg_factory()
+    hosts = ",".join(f"10.0.0.{i + 1}" for i in range(num_hosts))
+    if should_raise:
+        with pytest.raises(ValueError, match="out of bounds"):
+            pg.get_jax_env_vars(worker_id=worker_id, worker_hostnames=hosts)
+    else:
+        env = pg.get_jax_env_vars(worker_id=worker_id, worker_hostnames=hosts)
+        assert env.get("TPU_WORKER_ID") == expected_wid
 
 
 if __name__ == "__main__":

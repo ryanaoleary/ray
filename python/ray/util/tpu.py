@@ -553,12 +553,10 @@ def _get_pg_bundle_node_ips(
     bundle_indices: Sequence[int],
     nodes: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Optional[str]]:
-    """Look up the NodeManagerAddress (IP) for multiple bundles of a placement group.
+    """Look up the NodeManagerAddress (IP) for placement group bundles.
 
-    Performs a single placement_group_table lookup and resolves all bundle indices
-    against node addresses in O(1) time per bundle.
-
-    Returns None for any unplaced, unscheduled, or unresolvable bundle.
+    Resolves bundle indices against node addresses using placement_group_table.
+    Returns None for any unplaced or unresolvable bundle.
     """
     if pg is None or not ray.is_initialized():
         return [None] * len(bundle_indices)
@@ -1239,9 +1237,23 @@ class SlicePlacementGroup:
         Raises:
             ValueError: If slice_index is out of range.
         """
+        bundles_per_slice = self._num_bundles // self._num_slices
+        if worker_id is None and bundles_per_slice == 1:
+            worker_id = 0
+        elif worker_id is not None:
+            try:
+                wid_int = int(worker_id)
+                if wid_int < 0 or wid_int >= bundles_per_slice:
+                    raise ValueError(
+                        f"worker_id {wid_int} is out of bounds for TPU slice "
+                        f"with {bundles_per_slice} host(s) (expected 0 to {bundles_per_slice - 1})."
+                    )
+            except ValueError as e:
+                if "out of bounds" in str(e):
+                    raise
+
         if worker_hostnames is None:
             slice_addrs = self.get_worker_addrs(slice_index)
-            bundles_per_slice = self._num_bundles // self._num_slices
             placed = [a for a in slice_addrs if a is not None]
             if len(placed) == bundles_per_slice:
                 worker_hostnames = placed
@@ -2542,11 +2554,20 @@ class SubslicePlacementGroup:
         Raises:
             RuntimeError: If worker hostnames cannot be resolved.
         """
-        # Resolution order for worker hostnames:
-        # 1. Explicit `worker_hostnames` passed by caller.
-        # 2. Placed placement group bundle node IPs (when fully placed).
-        # 3. Fallback: local TPU_WORKER_HOSTNAMES environment variable.
-        # 4. If unresolvable, raise a RuntimeError.
+        if worker_id is None and self._num_hosts == 1:
+            worker_id = 0
+        elif worker_id is not None:
+            try:
+                wid_int = int(worker_id)
+                if wid_int < 0 or wid_int >= self._num_hosts:
+                    raise ValueError(
+                        f"worker_id {wid_int} is out of bounds for subslice "
+                        f"with {self._num_hosts} host(s) (expected 0 to {self._num_hosts - 1})."
+                    )
+            except ValueError as e:
+                if "out of bounds" in str(e):
+                    raise
+
         if worker_hostnames is None:
             placed_addrs = [a for a in self.worker_addrs if a is not None]
             if len(placed_addrs) == self._num_hosts:
