@@ -3821,85 +3821,115 @@ def test_get_jax_env_vars_free_function(
     )
 
 
-@pytest.mark.parametrize(
-    "pg_factory,num_hosts,worker_id,expected_wid,should_raise",
-    [
-        # Single-host slice auto-defaults worker_id to "0" when omitted
-        (lambda: SlicePlacementGroup("2x2x1", "v4", num_slices=1), 1, None, "0", False),
-        # Single-host subslice auto-defaults worker_id to "0" when omitted
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x2", 0, "s0", 1, 4),
-            1,
-            None,
-            "0",
-            False,
-        ),
-        # Single-host valid explicit worker_ids
-        (lambda: SlicePlacementGroup("2x2x1", "v4", num_slices=1), 1, 0, "0", False),
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x2", 0, "s0", 1, 4),
-            1,
-            "0",
-            "0",
-            False,
-        ),
-        # Single-host out-of-bounds worker_ids
-        (lambda: SlicePlacementGroup("2x2x1", "v4", num_slices=1), 1, 1, None, True),
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x2", 0, "s0", 1, 4),
-            1,
-            -1,
-            None,
-            True,
-        ),
-        # Multi-host (2 hosts) valid worker_ids
-        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, 0, "0", False),
-        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, "1", "1", False),
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
-            2,
-            0,
-            "0",
-            False,
-        ),
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
-            2,
-            "1",
-            "1",
-            False,
-        ),
-        # Multi-host out-of-bounds worker_ids
-        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, 2, None, True),
-        (lambda: SlicePlacementGroup("2x2x2", "v4", num_slices=1), 2, -1, None, True),
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
-            2,
-            2,
-            None,
-            True,
-        ),
-        (
-            lambda: SubslicePlacementGroup(None, "4x4", "2x4", 0, "s0", 2, 4),
-            2,
-            -1,
-            None,
-            True,
-        ),
-    ],
-)
-def test_placement_group_get_jax_env_vars_worker_id(
-    pg_factory, num_hosts, worker_id, expected_wid, should_raise
-):
-    """Test worker_id auto-defaulting and bounds validation across slice and subslice PGs."""
-    pg = pg_factory()
-    hosts = ",".join(f"10.0.0.{i + 1}" for i in range(num_hosts))
-    if should_raise:
-        with pytest.raises(ValueError, match="out of bounds"):
-            pg.get_jax_env_vars(worker_id=worker_id, worker_hostnames=hosts)
-    else:
-        env = pg.get_jax_env_vars(worker_id=worker_id, worker_hostnames=hosts)
-        assert env.get("TPU_WORKER_ID") == expected_wid
+def test_single_host_slice_placement_group_worker_id(ray_single_host_tpu_cluster):
+    """Test worker_id auto-defaulting, integer validation, and bounds checking on single-host SlicePlacementGroup."""
+    spg = ray.util.tpu.slice_placement_group(
+        topology="2x2x1",
+        accelerator_version="tpu7x",
+    )
+    # Auto-defaults to "0" when omitted
+    assert spg.get_jax_env_vars().get("TPU_WORKER_ID") == "0"
+    assert spg.get_jax_runtime_env()["env_vars"].get("TPU_WORKER_ID") == "0"
+    # Explicit valid worker_id
+    assert spg.get_jax_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
+    assert spg.get_jax_env_vars(worker_id="0").get("TPU_WORKER_ID") == "0"
+    # Out of bounds
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_jax_env_vars(worker_id=1)
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_jax_env_vars(worker_id=-1)
+    # Invalid non-integer
+    with pytest.raises(ValueError, match="must be an integer"):
+        spg.get_jax_env_vars(worker_id="invalid")
+    with pytest.raises(ValueError, match="must be an integer"):
+        spg.get_jax_env_vars(worker_id="")
+
+
+def test_multi_host_slice_placement_group_worker_id(ray_tpu_cluster):
+    """Test worker_id validation and bounds checking on multi-host SlicePlacementGroup."""
+    spg = ray.util.tpu.slice_placement_group(
+        topology="2x2x2",
+        accelerator_version="v4",
+    )
+    # Valid worker_ids
+    assert spg.get_jax_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
+    assert spg.get_jax_env_vars(worker_id="1").get("TPU_WORKER_ID") == "1"
+    assert (
+        spg.get_jax_runtime_env(worker_id="1")["env_vars"].get("TPU_WORKER_ID") == "1"
+    )
+    # Out of bounds
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_jax_env_vars(worker_id=2)
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_jax_env_vars(worker_id=-1)
+    # Invalid non-integer
+    with pytest.raises(ValueError, match="must be an integer"):
+        spg.get_jax_env_vars(worker_id="foo")
+
+
+def test_subslice_placement_group_worker_id():
+    """Test worker_id auto-defaulting, integer validation, and bounds checking on SubslicePlacementGroup."""
+    # Single-host subslice (num_hosts=1)
+    ss_single = SubslicePlacementGroup(
+        placement_group=None,
+        parent_topology="4x4",
+        subslice_topology="2x2",
+        subslice_index=0,
+        slice_name="s0",
+        num_hosts=1,
+        chips_per_host=4,
+        bundle_resources={"CPU": 1, "TPU": 4},
+        accelerator_version="v6e",
+    )
+    assert (
+        ss_single.get_jax_env_vars(worker_hostnames="10.0.0.1").get("TPU_WORKER_ID")
+        == "0"
+    )
+    assert (
+        ss_single.get_jax_runtime_env(worker_hostnames="10.0.0.1")["env_vars"].get(
+            "TPU_WORKER_ID"
+        )
+        == "0"
+    )
+    assert (
+        ss_single.get_jax_env_vars(worker_id=0, worker_hostnames="10.0.0.1").get(
+            "TPU_WORKER_ID"
+        )
+        == "0"
+    )
+    with pytest.raises(ValueError, match="out of bounds"):
+        ss_single.get_jax_env_vars(worker_id=1, worker_hostnames="10.0.0.1")
+    with pytest.raises(ValueError, match="must be an integer"):
+        ss_single.get_jax_env_vars(worker_id="invalid", worker_hostnames="10.0.0.1")
+
+    # Multi-host subslice (num_hosts=2)
+    ss_multi = SubslicePlacementGroup(
+        placement_group=None,
+        parent_topology="4x4",
+        subslice_topology="2x4",
+        subslice_index=0,
+        slice_name="s0",
+        num_hosts=2,
+        chips_per_host=4,
+        bundle_resources={"CPU": 1, "TPU": 4},
+        accelerator_version="v6e",
+    )
+    assert (
+        ss_multi.get_jax_env_vars(
+            worker_id=0, worker_hostnames="10.0.0.1,10.0.0.2"
+        ).get("TPU_WORKER_ID")
+        == "0"
+    )
+    assert (
+        ss_multi.get_jax_env_vars(
+            worker_id="1", worker_hostnames="10.0.0.1,10.0.0.2"
+        ).get("TPU_WORKER_ID")
+        == "1"
+    )
+    with pytest.raises(ValueError, match="out of bounds"):
+        ss_multi.get_jax_env_vars(worker_id=2, worker_hostnames="10.0.0.1,10.0.0.2")
+    with pytest.raises(ValueError, match="must be an integer"):
+        ss_multi.get_jax_env_vars(worker_id="bar", worker_hostnames="10.0.0.1,10.0.0.2")
 
 
 if __name__ == "__main__":

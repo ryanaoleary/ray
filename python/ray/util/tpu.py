@@ -576,7 +576,12 @@ def _get_pg_bundle_node_ips(
         }
 
         return [
-            node_id_to_ip.get(bundles_to_node_id.get(idx)) for idx in bundle_indices
+            node_id_to_ip.get(
+                bundles_to_node_id.get(idx)
+                if idx in bundles_to_node_id
+                else bundles_to_node_id.get(str(idx))
+            )
+            for idx in bundle_indices
         ]
     except Exception as e:
         logger.debug(
@@ -1227,6 +1232,8 @@ class SlicePlacementGroup:
         Args:
             slice_index: The 0-based index of the TPU slice.
             worker_id: Optional integer or string ID of the worker within the slice.
+                For single-host slices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             worker_hostnames: Optional comma-separated string or list of host IP
                 addresses or DNS hostnames. If omitted, resolved from placement
                 group bundles in this slice.
@@ -1235,7 +1242,8 @@ class SlicePlacementGroup:
             A dictionary mapping JAX TPU environment variables to their values.
 
         Raises:
-            ValueError: If slice_index is out of range.
+            ValueError: If slice_index is out of range, worker_id is not an integer,
+                or worker_id is out of bounds.
         """
         bundles_per_slice = self._num_bundles // self._num_slices
         if worker_id is None and bundles_per_slice == 1:
@@ -1243,14 +1251,15 @@ class SlicePlacementGroup:
         elif worker_id is not None:
             try:
                 wid_int = int(worker_id)
-                if wid_int < 0 or wid_int >= bundles_per_slice:
-                    raise ValueError(
-                        f"worker_id {wid_int} is out of bounds for TPU slice "
-                        f"with {bundles_per_slice} host(s) (expected 0 to {bundles_per_slice - 1})."
-                    )
-            except ValueError as e:
-                if "out of bounds" in str(e):
-                    raise
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"worker_id must be an integer, but got {worker_id!r}."
+                )
+            if wid_int < 0 or wid_int >= bundles_per_slice:
+                raise ValueError(
+                    f"worker_id {wid_int} is out of bounds for TPU slice "
+                    f"with {bundles_per_slice} host(s) (expected 0 to {bundles_per_slice - 1})."
+                )
 
         if worker_hostnames is None:
             slice_addrs = self.get_worker_addrs(slice_index)
@@ -1277,6 +1286,8 @@ class SlicePlacementGroup:
         Args:
             slice_index: The 0-based index of the TPU slice.
             worker_id: Optional integer or string ID of the worker within the slice.
+                For single-host slices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             worker_hostnames: Optional comma-separated string or list of host IP
                 addresses or DNS hostnames. If omitted, resolved from placement
                 group bundles in this slice.
@@ -1285,7 +1296,8 @@ class SlicePlacementGroup:
             A Ray RuntimeEnv configured with JAX TPU environment variables.
 
         Raises:
-            ValueError: If slice_index is out of range.
+            ValueError: If slice_index is out of range, worker_id is not an integer,
+                or worker_id is out of bounds.
         """
         env_vars = self.get_jax_env_vars(
             slice_index=slice_index,
@@ -2543,7 +2555,9 @@ class SubslicePlacementGroup:
         4. If unresolvable, raises a ``RuntimeError``.
 
         Args:
-            worker_id: Optional integer or string ID of the worker within the sub-slice (0 to num_hosts - 1).
+            worker_id: Optional integer or string ID of the worker within the sub-slice.
+                For single-host subslices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             worker_hostnames: Optional comma-separated string or list of host IP
                 addresses or DNS hostnames for this sub-slice. If omitted, resolved
                 from placement group bundle node IPs.
@@ -2552,6 +2566,7 @@ class SubslicePlacementGroup:
             A dictionary mapping JAX TPU environment variables to their values.
 
         Raises:
+            ValueError: If worker_id is not an integer or is out of bounds.
             RuntimeError: If worker hostnames cannot be resolved.
         """
         if worker_id is None and self._num_hosts == 1:
@@ -2559,14 +2574,15 @@ class SubslicePlacementGroup:
         elif worker_id is not None:
             try:
                 wid_int = int(worker_id)
-                if wid_int < 0 or wid_int >= self._num_hosts:
-                    raise ValueError(
-                        f"worker_id {wid_int} is out of bounds for subslice "
-                        f"with {self._num_hosts} host(s) (expected 0 to {self._num_hosts - 1})."
-                    )
-            except ValueError as e:
-                if "out of bounds" in str(e):
-                    raise
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"worker_id must be an integer, but got {worker_id!r}."
+                )
+            if wid_int < 0 or wid_int >= self._num_hosts:
+                raise ValueError(
+                    f"worker_id {wid_int} is out of bounds for subslice "
+                    f"with {self._num_hosts} host(s) (expected 0 to {self._num_hosts - 1})."
+                )
 
         if worker_hostnames is None:
             placed_addrs = [a for a in self.worker_addrs if a is not None]
@@ -2615,12 +2631,18 @@ class SubslicePlacementGroup:
 
         Args:
             worker_id: Optional integer or string ID of the worker within the sub-slice.
+                For single-host subslices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             worker_hostnames: Optional comma-separated string or list of host IP
                 addresses or DNS hostnames. If omitted, resolved from placement
                 group bundles.
 
         Returns:
             A Ray RuntimeEnv configured with JAX TPU environment variables.
+
+        Raises:
+            ValueError: If worker_id is not an integer or is out of bounds.
+            RuntimeError: If worker hostnames cannot be resolved.
         """
         env_vars = self.get_jax_env_vars(
             worker_id=worker_id,
