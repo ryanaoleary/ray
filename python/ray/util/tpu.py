@@ -861,6 +861,13 @@ class SlicePlacementGroup:
                     )
                     # Slice reservation and accelerator type labels take precedence; user labels fill in the rest.
                     merged_labels = {**user_labels, **slice_required_labels}
+                    if (
+                        not is_single_host
+                        and ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY not in merged_labels
+                    ):
+                        merged_labels[ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY] = str(
+                            bundle_idx
+                        )
                     self._bundle_label_selector.append(merged_labels)
                     slice_bundle_label_selector.append(merged_labels)
 

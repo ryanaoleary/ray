@@ -3851,6 +3851,13 @@ def test_multi_host_slice_placement_group_worker_id(ray_tpu_cluster):
         topology="2x2x2",
         accelerator_version="v4",
     )
+    # Verify deterministic bundle-to-worker mapping for MPMD
+    assert (
+        spg.bundle_label_selector[0].get(ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY) == "0"
+    )
+    assert (
+        spg.bundle_label_selector[1].get(ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY) == "1"
+    )
     # Valid worker_ids
     assert spg.get_jax_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
     assert spg.get_jax_env_vars(worker_id="1").get("TPU_WORKER_ID") == "1"
