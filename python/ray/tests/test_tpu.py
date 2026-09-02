@@ -3919,6 +3919,50 @@ def test_multi_host_slice_placement_group_worker_id(ray_tpu_cluster):
         spg.get_torchtpu_env_vars(slice_index=99)
 
 
+def test_multi_host_slice_placement_group_multi_bundle_per_host(ray_tpu_cluster):
+    """Test worker_id assignment and address resolution when there are multiple bundles per host."""
+    spg = ray.util.tpu.slice_placement_group(
+        topology="2x2x2",
+        accelerator_version="v4",
+        resources_per_bundle={"CPU": 0, "TPU": 1},
+    )
+    # 8 bundles across 2 hosts -> bundles 0..3 map to host 0, bundles 4..7 map to host 1
+    assert len(spg.bundle_label_selector) == 8
+    for i in range(4):
+        assert (
+            spg.bundle_label_selector[i].get(ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY)
+            == "0"
+        )
+    for i in range(4, 8):
+        assert (
+            spg.bundle_label_selector[i].get(ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY)
+            == "1"
+        )
+
+    # Valid worker_ids are 0 and 1 (based on num_hosts, not num_bundles)
+    assert spg.get_jax_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
+    assert spg.get_torchtpu_env_vars(worker_id=1).get("TPU_WORKER_ID") == "1"
+
+    # Out of bounds: worker_id=2 (fails even though num_bundles=8 because num_hosts=2)
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_jax_env_vars(worker_id=2)
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_torchtpu_env_vars(worker_id=2)
+
+    # Wait for placement group to schedule all bundles across the cluster
+    ray.get(spg.placement_group.ready(), timeout=10)
+
+    # Address resolution returns 1 address per host (2 addresses total)
+    torch_env = spg.get_torchtpu_env_vars(worker_id=0)
+    assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" in torch_env
+    assert len(torch_env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 2
+    jax_env = spg.get_jax_env_vars(worker_id=0)
+    assert "TPU_WORKER_HOSTNAMES" in jax_env
+    assert len(jax_env["TPU_WORKER_HOSTNAMES"].split(",")) == 2
+
+    ray.util.remove_placement_group(spg.placement_group)
+
+
 def test_subslice_placement_group_worker_id():
     """Test worker_id auto-defaulting, integer validation, and bounds checking on SubslicePlacementGroup."""
     # Single-host subslice (num_hosts=1)

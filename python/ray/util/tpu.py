@@ -796,6 +796,12 @@ class SlicePlacementGroup:
         self._bundle_label_selector = []
         all_bundles = []
         bundles_per_slice = self._num_bundles // self._num_slices
+        hosts_per_slice = self._num_hosts // self._num_slices
+        bundles_per_host = (
+            bundles_per_slice // hosts_per_slice
+            if hosts_per_slice > 0 and bundles_per_slice % hosts_per_slice == 0
+            else None
+        )
 
         total_chips = get_num_chips_from_topology(self._topology)
         is_single_host = total_chips <= self._chips_per_host
@@ -867,10 +873,11 @@ class SlicePlacementGroup:
                     merged_labels = {**user_labels, **slice_required_labels}
                     if (
                         not is_single_host
+                        and bundles_per_host is not None
                         and ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY not in merged_labels
                     ):
                         merged_labels[ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY] = str(
-                            bundle_idx
+                            bundle_idx // bundles_per_host
                         )
                     self._bundle_label_selector.append(merged_labels)
                     slice_bundle_label_selector.append(merged_labels)
@@ -1173,6 +1180,38 @@ class SlicePlacementGroup:
                 f"slice_index {slice_index} is out of range for {num_slices} slice(s)."
             )
 
+        hosts_per_slice = (
+            getattr(self, "_num_hosts", None) // num_slices
+            if getattr(self, "_num_hosts", None) is not None
+            else None
+        )
+        if hosts_per_slice is None:
+            if hasattr(self, "_topology"):
+                try:
+                    total_chips = get_num_chips_from_topology(self._topology)
+                    chips_per_host = getattr(self, "_chips_per_host", 4)
+                    hosts_per_slice = max(1, total_chips // chips_per_host)
+                except Exception:
+                    hosts_per_slice = 1
+            else:
+                hosts_per_slice = 1
+
+        if worker_id is None and hosts_per_slice == 1:
+            worker_id = 0
+        elif worker_id is not None:
+            try:
+                wid_int = int(worker_id)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"worker_id must be an integer, but got {worker_id!r}."
+                )
+            if wid_int < 0 or wid_int >= hosts_per_slice:
+                raise ValueError(
+                    f"worker_id {wid_int} is out of bounds for TPU slice "
+                    f"with {hosts_per_slice} host(s) (expected 0 to {hosts_per_slice - 1})."
+                )
+            worker_id = wid_int
+
         if hasattr(self, "_num_bundles"):
             bundles_per_slice = self._num_bundles // num_slices
         elif hasattr(self, "_topology"):
@@ -1183,21 +1222,6 @@ class SlicePlacementGroup:
                 bundles_per_slice = 1
         else:
             bundles_per_slice = 1
-        if worker_id is None and bundles_per_slice == 1:
-            worker_id = 0
-        elif worker_id is not None:
-            try:
-                wid_int = int(worker_id)
-            except (ValueError, TypeError):
-                raise ValueError(
-                    f"worker_id must be an integer, but got {worker_id!r}."
-                )
-            if wid_int < 0 or wid_int >= bundles_per_slice:
-                raise ValueError(
-                    f"worker_id {wid_int} is out of bounds for TPU slice "
-                    f"with {bundles_per_slice} host(s) (expected 0 to {bundles_per_slice - 1})."
-                )
-            worker_id = wid_int
 
         if slicebuilder_addresses is None:
             slicebuilder_addresses = os.environ.get(
@@ -1206,8 +1230,16 @@ class SlicePlacementGroup:
             if not slicebuilder_addresses:
                 slice_addrs = self.get_worker_addrs(slice_index)
                 placed = [a for a in slice_addrs if a is not None]
-                if len(placed) == bundles_per_slice:
-                    slicebuilder_addresses = [f"{a}:8471" for a in placed]
+                if (
+                    placed
+                    and len(placed) == bundles_per_slice
+                    and len(placed) >= hosts_per_slice
+                ):
+                    bundles_per_host = max(1, bundles_per_slice // hosts_per_slice)
+                    host_addrs = [
+                        placed[h * bundles_per_host] for h in range(hosts_per_slice)
+                    ]
+                    slicebuilder_addresses = [f"{a}:8471" for a in host_addrs]
 
         return get_torchtpu_env_vars(
             topology=self._topology,
@@ -1351,6 +1383,38 @@ class SlicePlacementGroup:
                 f"slice_index {slice_index} is out of range for {num_slices} slice(s)."
             )
 
+        hosts_per_slice = (
+            getattr(self, "_num_hosts", None) // num_slices
+            if getattr(self, "_num_hosts", None) is not None
+            else None
+        )
+        if hosts_per_slice is None:
+            if hasattr(self, "_topology"):
+                try:
+                    total_chips = get_num_chips_from_topology(self._topology)
+                    chips_per_host = getattr(self, "_chips_per_host", 4)
+                    hosts_per_slice = max(1, total_chips // chips_per_host)
+                except Exception:
+                    hosts_per_slice = 1
+            else:
+                hosts_per_slice = 1
+
+        if worker_id is None and hosts_per_slice == 1:
+            worker_id = 0
+        elif worker_id is not None:
+            try:
+                wid_int = int(worker_id)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"worker_id must be an integer, but got {worker_id!r}."
+                )
+            if wid_int < 0 or wid_int >= hosts_per_slice:
+                raise ValueError(
+                    f"worker_id {wid_int} is out of bounds for TPU slice "
+                    f"with {hosts_per_slice} host(s) (expected 0 to {hosts_per_slice - 1})."
+                )
+            worker_id = wid_int
+
         if hasattr(self, "_num_bundles"):
             bundles_per_slice = self._num_bundles // num_slices
         elif hasattr(self, "_topology"):
@@ -1361,26 +1425,19 @@ class SlicePlacementGroup:
                 bundles_per_slice = 1
         else:
             bundles_per_slice = 1
-        if worker_id is None and bundles_per_slice == 1:
-            worker_id = 0
-        elif worker_id is not None:
-            try:
-                wid_int = int(worker_id)
-            except (ValueError, TypeError):
-                raise ValueError(
-                    f"worker_id must be an integer, but got {worker_id!r}."
-                )
-            if wid_int < 0 or wid_int >= bundles_per_slice:
-                raise ValueError(
-                    f"worker_id {wid_int} is out of bounds for TPU slice "
-                    f"with {bundles_per_slice} host(s) (expected 0 to {bundles_per_slice - 1})."
-                )
 
         if worker_hostnames is None:
             slice_addrs = self.get_worker_addrs(slice_index)
             placed = [a for a in slice_addrs if a is not None]
-            if len(placed) == bundles_per_slice:
-                worker_hostnames = placed
+            if (
+                placed
+                and len(placed) == bundles_per_slice
+                and len(placed) >= hosts_per_slice
+            ):
+                bundles_per_host = max(1, bundles_per_slice // hosts_per_slice)
+                worker_hostnames = [
+                    placed[h * bundles_per_host] for h in range(hosts_per_slice)
+                ]
             else:
                 worker_hostnames = os.environ.get(TPU_WORKER_HOSTNAMES_ENV_VAR, "")
 
