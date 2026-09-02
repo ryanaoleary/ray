@@ -254,6 +254,62 @@ def test_get_current_node_tpu_worker_id(mock_os, mock_request, test_case):
     assert TPUAcceleratorManager.get_current_node_tpu_worker_id() == expected_value
 
 
+def test_get_current_node_tpu_worker_id_hardware_discovery(monkeypatch):
+    """Verify that physical hardware coordinate discovery via libtpu takes precedence."""
+
+    class MockChipCoordinate:
+        def __init__(self, x, y):
+            self._coords = (x, y)
+
+        def coordinates(self):
+            return self._coords
+
+    mock_sdk = mock.MagicMock()
+    # 4 chips for worker 0 in a 4x4 parent topology
+    mock_sdk.slice.get_chip_coordinates.return_value = [
+        MockChipCoordinate(0, 0),
+        MockChipCoordinate(0, 1),
+        MockChipCoordinate(0, 2),
+        MockChipCoordinate(0, 3),
+    ]
+
+    mock_libtpu = mock.MagicMock()
+    mock_libtpu.sdk = mock_sdk
+
+    monkeypatch.setitem(sys.modules, "libtpu", mock_libtpu)
+    monkeypatch.setenv("TPU_TOPOLOGY", "4x4")
+    # Even if environment variable has a conflicting logical worker ID, hardware discovery wins
+    monkeypatch.setenv("TPU_WORKER_ID", "99")
+
+    worker_id = TPUAcceleratorManager.get_current_node_tpu_worker_id()
+    assert worker_id == 0
+
+    # Test worker 1 coords (wx=1, wy=0 -> x in [2, 3], y in [0, 1])
+    mock_sdk.slice.get_chip_coordinates.return_value = [
+        MockChipCoordinate(2, 0),
+        MockChipCoordinate(2, 1),
+        MockChipCoordinate(3, 0),
+        MockChipCoordinate(3, 1),
+    ]
+    worker_id = TPUAcceleratorManager.get_current_node_tpu_worker_id()
+    assert worker_id == 1
+
+
+def test_get_current_node_tpu_worker_id_hardware_discovery_fallback(monkeypatch):
+    """When hardware discovery fails (e.g. empty coords or exception), fall back to env var."""
+    mock_sdk = mock.MagicMock()
+    mock_sdk.slice.get_chip_coordinates.return_value = []
+    mock_libtpu = mock.MagicMock()
+    mock_libtpu.sdk = mock_sdk
+
+    monkeypatch.setitem(sys.modules, "libtpu", mock_libtpu)
+    monkeypatch.setenv("TPU_TOPOLOGY", "4x4")
+    monkeypatch.setenv("TPU_WORKER_ID", "3")
+
+    worker_id = TPUAcceleratorManager.get_current_node_tpu_worker_id()
+    assert worker_id == 3
+
+
 @pytest.mark.parametrize(
     "test_case",
     [

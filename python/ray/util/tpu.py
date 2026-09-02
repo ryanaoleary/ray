@@ -281,6 +281,7 @@ def get_torchtpu_env_vars(
     topology: str,
     slicebuilder_addresses: Optional[Union[str, List[str]]] = None,
     tpu_resource_per_chip: int = 1,
+    worker_id: Optional[Union[int, str]] = None,
 ) -> Dict[str, str]:
     """Returns environment variables required for PyTorch TPU slice or sub-slice execution.
 
@@ -288,6 +289,7 @@ def get_torchtpu_env_vars(
         topology: The target TPU topology string (e.g. "4x4", "2x4", or "4,4,1").
         slicebuilder_addresses: Optional comma-separated string or list of address:port strings.
         tpu_resource_per_chip: Logical TPU resources per physical chip (defaults to 1).
+        worker_id: Optional integer or string ID of the worker (0-indexed).
 
     Returns:
         A dictionary mapping PyTorch TPU environment variables to their values.
@@ -296,6 +298,8 @@ def get_torchtpu_env_vars(
     env_vars = {
         TORCH_TPU_TOPOLOGY_ENV_VAR: normalized_topology,
     }
+    if worker_id is not None:
+        env_vars[TPU_WORKER_ID_ENV_VAR] = str(worker_id)
     if slicebuilder_addresses:
         if isinstance(slicebuilder_addresses, list):
             env_vars[TORCH_TPU_SLICEBUILDER_ADDRESSES_ENV_VAR] = ",".join(
@@ -1130,43 +1134,128 @@ class SlicePlacementGroup:
     @PublicAPI(stability="alpha")
     def get_torchtpu_env_vars(
         self,
+        slice_index: int = 0,
+        worker_id: Optional[Union[int, str]] = None,
         slicebuilder_addresses: Optional[Union[str, List[str]]] = None,
     ) -> Dict[str, str]:
         """Returns the PyTorch TPU environment variables for this slice.
 
         Args:
+            slice_index: The 0-based index of the TPU slice.
+            worker_id: Optional integer or string ID of the worker within the slice.
+                For single-host slices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             slicebuilder_addresses: Optional explicit comma-separated string or list
                 of address:port strings for this slice.
 
         Returns:
             A dictionary mapping PyTorch TPU environment variables to their values.
+
+        Raises:
+            ValueError: If slice_index is out of range, worker_id is not an integer,
+                or worker_id is out of bounds.
         """
+        if slice_index is None:
+            slice_index = 0
+        elif slicebuilder_addresses is None and (
+            isinstance(slice_index, (list, tuple))
+            or (
+                isinstance(slice_index, str)
+                and (":" in slice_index or "," in slice_index)
+            )
+        ):
+            slicebuilder_addresses = slice_index
+            slice_index = 0
+
+        num_slices = getattr(self, "_num_slices", 1)
+        if slice_index < 0 or slice_index >= num_slices:
+            raise ValueError(
+                f"slice_index {slice_index} is out of range for {num_slices} slice(s)."
+            )
+
+        if hasattr(self, "_num_bundles"):
+            bundles_per_slice = self._num_bundles // num_slices
+        elif hasattr(self, "_topology"):
+            try:
+                total_chips = get_num_chips_from_topology(self._topology)
+                bundles_per_slice = max(1, total_chips // 4)
+            except Exception:
+                bundles_per_slice = 1
+        else:
+            bundles_per_slice = 1
+        if worker_id is None and bundles_per_slice == 1:
+            worker_id = 0
+        elif worker_id is not None:
+            try:
+                wid_int = int(worker_id)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"worker_id must be an integer, but got {worker_id!r}."
+                )
+            if wid_int < 0 or wid_int >= bundles_per_slice:
+                raise ValueError(
+                    f"worker_id {wid_int} is out of bounds for TPU slice "
+                    f"with {bundles_per_slice} host(s) (expected 0 to {bundles_per_slice - 1})."
+                )
+            worker_id = wid_int
+
         if slicebuilder_addresses is None:
             slicebuilder_addresses = os.environ.get(
                 TORCH_TPU_SLICEBUILDER_ADDRESSES_ENV_VAR
             )
+            if not slicebuilder_addresses:
+                slice_addrs = self.get_worker_addrs(slice_index)
+                placed = [a for a in slice_addrs if a is not None]
+                if len(placed) == bundles_per_slice:
+                    slicebuilder_addresses = [f"{a}:8471" for a in placed]
+
         return get_torchtpu_env_vars(
             topology=self._topology,
             slicebuilder_addresses=slicebuilder_addresses,
             tpu_resource_per_chip=self._tpu_resource_per_chip,
+            worker_id=worker_id,
         )
 
     @PublicAPI(stability="alpha")
     def get_torchtpu_runtime_env(
         self,
+        slice_index: int = 0,
+        worker_id: Optional[Union[int, str]] = None,
         slicebuilder_addresses: Optional[Union[str, List[str]]] = None,
     ) -> RuntimeEnv:
         """Returns a Ray RuntimeEnv populated with PyTorch TPU environment variables.
 
         Args:
+            slice_index: The 0-based index of the TPU slice.
+            worker_id: Optional integer or string ID of the worker within the slice.
+                For single-host slices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             slicebuilder_addresses: Optional explicit comma-separated string or list
                 of address:port strings for this slice.
 
         Returns:
             A Ray RuntimeEnv populated with PyTorch TPU environment variables.
+
+        Raises:
+            ValueError: If slice_index is out of range, worker_id is not an integer,
+                or worker_id is out of bounds.
         """
+        if slice_index is None:
+            slice_index = 0
+        elif slicebuilder_addresses is None and (
+            isinstance(slice_index, (list, tuple))
+            or (
+                isinstance(slice_index, str)
+                and (":" in slice_index or "," in slice_index)
+            )
+        ):
+            slicebuilder_addresses = slice_index
+            slice_index = 0
+
         env_vars = self.get_torchtpu_env_vars(
-            slicebuilder_addresses=slicebuilder_addresses
+            slice_index=slice_index,
+            worker_id=worker_id,
+            slicebuilder_addresses=slicebuilder_addresses,
         )
         return RuntimeEnv(env_vars=env_vars)
 
@@ -1187,25 +1276,29 @@ class SlicePlacementGroup:
         Raises:
             ValueError: If slice_index is out of range.
         """
-        if slice_index < 0 or slice_index >= self._num_slices:
+        num_slices = getattr(self, "_num_slices", 1)
+        if slice_index < 0 or slice_index >= num_slices:
             raise ValueError(
-                f"slice_index {slice_index} is out of range for {self._num_slices} slice(s)."
+                f"slice_index {slice_index} is out of range for {num_slices} slice(s)."
             )
 
-        bundles_per_slice = self._num_bundles // self._num_slices
-        if self._pg_per_slice:
-            if not self._managed_pgs or slice_index >= len(self._managed_pgs):
+        num_bundles = getattr(self, "_num_bundles", 1)
+        bundles_per_slice = num_bundles // num_slices
+        pg_per_slice = getattr(self, "_pg_per_slice", False)
+        managed_pgs = getattr(self, "_managed_pgs", [])
+        if pg_per_slice:
+            if not managed_pgs or slice_index >= len(managed_pgs):
                 return [None] * bundles_per_slice
-            pg = self._managed_pgs[slice_index]
+            pg = managed_pgs[slice_index]
             return _get_pg_bundle_node_ips(
                 pg,
                 range(bundles_per_slice),
                 nodes=nodes,
             )
         else:
-            if not self._managed_pgs or self._managed_pgs[0] is None:
+            if not managed_pgs or managed_pgs[0] is None:
                 return [None] * bundles_per_slice
-            pg = self._managed_pgs[0]
+            pg = managed_pgs[0]
             start = slice_index * bundles_per_slice
             return _get_pg_bundle_node_ips(
                 pg,
@@ -1252,7 +1345,22 @@ class SlicePlacementGroup:
             ValueError: If slice_index is out of range, worker_id is not an integer,
                 or worker_id is out of bounds.
         """
-        bundles_per_slice = self._num_bundles // self._num_slices
+        num_slices = getattr(self, "_num_slices", 1)
+        if slice_index < 0 or slice_index >= num_slices:
+            raise ValueError(
+                f"slice_index {slice_index} is out of range for {num_slices} slice(s)."
+            )
+
+        if hasattr(self, "_num_bundles"):
+            bundles_per_slice = self._num_bundles // num_slices
+        elif hasattr(self, "_topology"):
+            try:
+                total_chips = get_num_chips_from_topology(self._topology)
+                bundles_per_slice = max(1, total_chips // 4)
+            except Exception:
+                bundles_per_slice = 1
+        else:
+            bundles_per_slice = 1
         if worker_id is None and bundles_per_slice == 1:
             worker_id = 0
         elif worker_id is not None:
@@ -2448,6 +2556,7 @@ class SubslicePlacementGroup:
     @PublicAPI(stability="alpha")
     def get_torchtpu_env_vars(
         self,
+        worker_id: Optional[Union[int, str]] = None,
         slicebuilder_addresses: Optional[Union[str, List[str]]] = None,
     ) -> Dict[str, str]:
         """Returns the PyTorch TPU environment variables for this sub-slice.
@@ -2456,10 +2565,14 @@ class SubslicePlacementGroup:
 
         1. Explicit ``slicebuilder_addresses`` argument passed by caller (used verbatim).
         2. Per-host discovery data cached during subslice placement group creation.
-        3. Fallback: local ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` environment variable with positional index slicing (emits a warning).
-        4. If no addresses can be resolved, raises a ``RuntimeError``.
+        3. Placed placement group bundle node IPs (when all bundles are placed).
+        4. Fallback: local ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` environment variable with positional index slicing (emits a warning).
+        5. If no addresses can be resolved, raises a ``RuntimeError``.
 
         Args:
+            worker_id: Optional integer or string ID of the worker within the sub-slice.
+                For single-host subslices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
             slicebuilder_addresses: Optional explicit comma-separated string or list
                 of address:port strings for this sub-slice.
 
@@ -2467,10 +2580,32 @@ class SubslicePlacementGroup:
             A dictionary mapping PyTorch TPU environment variables to their values.
 
         Raises:
+            ValueError: If worker_id is not an integer or is out of bounds.
             RuntimeError: If slicebuilder addresses cannot be resolved.
-            ValueError: If positional address slicing in the fallback yields a count that
-                cannot match the sub-slice topology.
         """
+        if slicebuilder_addresses is None and (
+            isinstance(worker_id, (list, tuple))
+            or (isinstance(worker_id, str) and (":" in worker_id or "," in worker_id))
+        ):
+            slicebuilder_addresses = worker_id
+            worker_id = None
+
+        if worker_id is None and self._num_hosts == 1:
+            worker_id = 0
+        elif worker_id is not None:
+            try:
+                wid_int = int(worker_id)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"worker_id must be an integer, but got {worker_id!r}."
+                )
+            if wid_int < 0 or wid_int >= self._num_hosts:
+                raise ValueError(
+                    f"worker_id {wid_int} is out of bounds for subslice "
+                    f"with {self._num_hosts} host(s) (expected 0 to {self._num_hosts - 1})."
+                )
+            worker_id = wid_int
+
         resolved_addrs: Optional[List[str]] = None
 
         # 1. Caller passed explicit addresses -> use verbatim without offset slicing.
@@ -2486,7 +2621,11 @@ class SubslicePlacementGroup:
         elif self._slicebuilder_addresses:
             resolved_addrs = self._slicebuilder_addresses
 
-        # 3. Fallback: local env var with positional index slicing.
+        # 3. Placed placement group bundle node IPs (when all bundles are placed).
+        elif len([a for a in self.worker_addrs if a is not None]) == self._num_hosts:
+            resolved_addrs = [f"{a}:8471" for a in self.worker_addrs if a is not None]
+
+        # 4. Fallback: local env var with positional index slicing.
         elif TORCH_TPU_SLICEBUILDER_ADDRESSES_ENV_VAR in os.environ:
             raw_env_addrs = os.environ.get(TORCH_TPU_SLICEBUILDER_ADDRESSES_ENV_VAR)
             if raw_env_addrs:
@@ -2516,16 +2655,41 @@ class SubslicePlacementGroup:
             topology=self._subslice_topology,
             slicebuilder_addresses=resolved_addrs,
             tpu_resource_per_chip=self._tpu_resource_per_chip,
+            worker_id=worker_id,
         )
 
     @PublicAPI(stability="alpha")
     def get_torchtpu_runtime_env(
         self,
+        worker_id: Optional[Union[int, str]] = None,
         slicebuilder_addresses: Optional[Union[str, List[str]]] = None,
     ) -> RuntimeEnv:
-        """Returns a Ray RuntimeEnv with sub-slice TPU environment variables."""
+        """Returns a Ray RuntimeEnv with sub-slice TPU environment variables.
+
+        Args:
+            worker_id: Optional integer or string ID of the worker within the sub-slice.
+                For single-host subslices, defaults to "0" if omitted. Must be between
+                0 and num_hosts - 1.
+            slicebuilder_addresses: Optional explicit comma-separated string or list
+                of address:port strings for this sub-slice.
+
+        Returns:
+            A Ray RuntimeEnv configured with sub-slice TorchTPU environment variables.
+
+        Raises:
+            ValueError: If worker_id is not an integer or is out of bounds.
+            RuntimeError: If slicebuilder addresses cannot be resolved.
+        """
+        if slicebuilder_addresses is None and (
+            isinstance(worker_id, (list, tuple))
+            or (isinstance(worker_id, str) and (":" in worker_id or "," in worker_id))
+        ):
+            slicebuilder_addresses = worker_id
+            worker_id = None
+
         env_vars = self.get_torchtpu_env_vars(
-            slicebuilder_addresses=slicebuilder_addresses
+            worker_id=worker_id,
+            slicebuilder_addresses=slicebuilder_addresses,
         )
         return RuntimeEnv(env_vars=env_vars)
 

@@ -962,9 +962,67 @@ class TPUAcceleratorManager(AcceleratorManager):
             return None
 
     @staticmethod
+    def _get_physical_worker_id_from_hardware(
+        parent_topology: Optional[str] = None,
+    ) -> Optional[int]:
+        """Query local TPU chip coordinates via libtpu and return the physical worker ID.
+
+        Queries the physical (x, y, z) coordinates of the local TPU ASICs directly
+        from hardware registers. If libtpu is installed and devices are accessible,
+        converts the coordinate into a linear physical rank (0 to N-1) where
+        adjacent indices represent physically adjacent hosts on the ICI mesh.
+
+        Args:
+            parent_topology: Optional parent TPU topology (e.g. "4x4"). If omitted,
+                resolved from current node environment or metadata.
+
+        Returns:
+            The integer physical worker index (0 to N-1), or None if hardware
+            coordinates are unavailable or unresolvable.
+        """
+        try:
+            from libtpu import sdk  # type: ignore[import-untyped]
+        except ImportError:
+            logger.debug("libtpu is not installed; skipping hardware discovery.")
+            return None
+        except Exception as e:
+            # Native C++ driver failures may surface as OSError or RuntimeError
+            # during module import on the Ray startup path.
+            logger.debug("Failed to import libtpu: %s", e)
+            return None
+
+        try:
+            coords = sdk.slice.get_chip_coordinates()
+        except Exception as e:
+            logger.debug("Failed to query TPU chip coordinates: %s", e)
+            return None
+
+        if not coords:
+            return None
+
+        if not parent_topology:
+            parent_topology = TPUAcceleratorManager.get_current_node_tpu_topology()
+        if not parent_topology:
+            return None
+
+        coords_list = [
+            list(c.coordinates()) if hasattr(c, "coordinates") else list(c[2])
+            for c in coords
+        ]
+        try:
+            return _get_physical_worker_id_from_coords(coords_list, parent_topology)
+        except Exception as e:
+            logger.debug("Could not resolve physical worker ID from hardware: %s", e)
+            return None
+
+    @staticmethod
     def get_current_node_tpu_worker_id() -> Optional[int]:
         """Return the worker index of the TPU pod."""
         try:
+            hardware_id = TPUAcceleratorManager._get_physical_worker_id_from_hardware()
+            if hardware_id is not None:
+                return hardware_id
+
             # Start with GKE-based check
             worker_id = os.getenv(TPU_WORKER_ID_ENV_VAR, None)
             if not worker_id:

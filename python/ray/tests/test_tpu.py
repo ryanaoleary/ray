@@ -3830,19 +3830,34 @@ def test_single_host_slice_placement_group_worker_id(ray_single_host_tpu_cluster
     # Auto-defaults to "0" when omitted
     assert spg.get_jax_env_vars().get("TPU_WORKER_ID") == "0"
     assert spg.get_jax_runtime_env()["env_vars"].get("TPU_WORKER_ID") == "0"
+    assert spg.get_torchtpu_env_vars().get("TPU_WORKER_ID") == "0"
+    assert spg.get_torchtpu_runtime_env()["env_vars"].get("TPU_WORKER_ID") == "0"
+
     # Explicit valid worker_id
     assert spg.get_jax_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
     assert spg.get_jax_env_vars(worker_id="0").get("TPU_WORKER_ID") == "0"
+    assert spg.get_torchtpu_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
+    assert spg.get_torchtpu_env_vars(worker_id="0").get("TPU_WORKER_ID") == "0"
+
     # Out of bounds
     with pytest.raises(ValueError, match="out of bounds"):
         spg.get_jax_env_vars(worker_id=1)
     with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_torchtpu_env_vars(worker_id=1)
+    with pytest.raises(ValueError, match="out of bounds"):
         spg.get_jax_env_vars(worker_id=-1)
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_torchtpu_env_vars(worker_id=-1)
+
     # Invalid non-integer
     with pytest.raises(ValueError, match="must be an integer"):
         spg.get_jax_env_vars(worker_id="invalid")
     with pytest.raises(ValueError, match="must be an integer"):
+        spg.get_torchtpu_env_vars(worker_id="invalid")
+    with pytest.raises(ValueError, match="must be an integer"):
         spg.get_jax_env_vars(worker_id="")
+    with pytest.raises(ValueError, match="must be an integer"):
+        spg.get_torchtpu_env_vars(worker_id="")
 
 
 def test_multi_host_slice_placement_group_worker_id(ray_tpu_cluster):
@@ -3858,20 +3873,50 @@ def test_multi_host_slice_placement_group_worker_id(ray_tpu_cluster):
     assert (
         spg.bundle_label_selector[1].get(ray._raylet.RAY_NODE_TPU_WORKER_ID_KEY) == "1"
     )
-    # Valid worker_ids
+
+    # Valid worker_ids for both JAX and TorchTPU
     assert spg.get_jax_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
     assert spg.get_jax_env_vars(worker_id="1").get("TPU_WORKER_ID") == "1"
     assert (
         spg.get_jax_runtime_env(worker_id="1")["env_vars"].get("TPU_WORKER_ID") == "1"
     )
+
+    assert spg.get_torchtpu_env_vars(worker_id=0).get("TPU_WORKER_ID") == "0"
+    assert spg.get_torchtpu_env_vars(worker_id="1").get("TPU_WORKER_ID") == "1"
+    assert (
+        spg.get_torchtpu_runtime_env(worker_id="1")["env_vars"].get("TPU_WORKER_ID")
+        == "1"
+    )
+
+    # Automatic address resolution from placed bundle IPs when addresses are omitted
+    torch_env = spg.get_torchtpu_env_vars(worker_id=0)
+    assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" in torch_env
+    assert all(
+        ":8471" in addr
+        for addr in torch_env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")
+    )
+
     # Out of bounds
     with pytest.raises(ValueError, match="out of bounds"):
         spg.get_jax_env_vars(worker_id=2)
     with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_torchtpu_env_vars(worker_id=2)
+    with pytest.raises(ValueError, match="out of bounds"):
         spg.get_jax_env_vars(worker_id=-1)
+    with pytest.raises(ValueError, match="out of bounds"):
+        spg.get_torchtpu_env_vars(worker_id=-1)
+
     # Invalid non-integer
     with pytest.raises(ValueError, match="must be an integer"):
         spg.get_jax_env_vars(worker_id="foo")
+    with pytest.raises(ValueError, match="must be an integer"):
+        spg.get_torchtpu_env_vars(worker_id="foo")
+
+    # Slice index out of range
+    with pytest.raises(ValueError, match="out of range"):
+        spg.get_jax_env_vars(slice_index=99)
+    with pytest.raises(ValueError, match="out of range"):
+        spg.get_torchtpu_env_vars(slice_index=99)
 
 
 def test_subslice_placement_group_worker_id():
@@ -3888,6 +3933,7 @@ def test_subslice_placement_group_worker_id():
         bundle_resources={"CPU": 1, "TPU": 4},
         accelerator_version="v6e",
     )
+    # Single-host auto-defaults to worker 0
     assert (
         ss_single.get_jax_env_vars(worker_hostnames="10.0.0.1").get("TPU_WORKER_ID")
         == "0"
@@ -3904,10 +3950,32 @@ def test_subslice_placement_group_worker_id():
         )
         == "0"
     )
+    assert (
+        ss_single.get_torchtpu_env_vars(slicebuilder_addresses="10.0.0.1:8471").get(
+            "TPU_WORKER_ID"
+        )
+        == "0"
+    )
+    assert (
+        ss_single.get_torchtpu_runtime_env(slicebuilder_addresses="10.0.0.1:8471")[
+            "env_vars"
+        ].get("TPU_WORKER_ID")
+        == "0"
+    )
+
+    # Single-host bounds and type validation
     with pytest.raises(ValueError, match="out of bounds"):
         ss_single.get_jax_env_vars(worker_id=1, worker_hostnames="10.0.0.1")
+    with pytest.raises(ValueError, match="out of bounds"):
+        ss_single.get_torchtpu_env_vars(
+            worker_id=1, slicebuilder_addresses="10.0.0.1:8471"
+        )
     with pytest.raises(ValueError, match="must be an integer"):
         ss_single.get_jax_env_vars(worker_id="invalid", worker_hostnames="10.0.0.1")
+    with pytest.raises(ValueError, match="must be an integer"):
+        ss_single.get_torchtpu_env_vars(
+            worker_id="invalid", slicebuilder_addresses="10.0.0.1:8471"
+        )
 
     # Multi-host subslice (num_hosts=2)
     ss_multi = SubslicePlacementGroup(
@@ -3928,15 +3996,37 @@ def test_subslice_placement_group_worker_id():
         == "0"
     )
     assert (
+        ss_multi.get_torchtpu_env_vars(
+            worker_id=0, slicebuilder_addresses="10.0.0.1:8471,10.0.0.2:8471"
+        ).get("TPU_WORKER_ID")
+        == "0"
+    )
+    assert (
         ss_multi.get_jax_env_vars(
             worker_id="1", worker_hostnames="10.0.0.1,10.0.0.2"
         ).get("TPU_WORKER_ID")
         == "1"
     )
+    assert (
+        ss_multi.get_torchtpu_env_vars(
+            worker_id="1", slicebuilder_addresses="10.0.0.1:8471,10.0.0.2:8471"
+        ).get("TPU_WORKER_ID")
+        == "1"
+    )
+
+    # Multi-host bounds and type validation
     with pytest.raises(ValueError, match="out of bounds"):
         ss_multi.get_jax_env_vars(worker_id=2, worker_hostnames="10.0.0.1,10.0.0.2")
+    with pytest.raises(ValueError, match="out of bounds"):
+        ss_multi.get_torchtpu_env_vars(
+            worker_id=2, slicebuilder_addresses="10.0.0.1:8471,10.0.0.2:8471"
+        )
     with pytest.raises(ValueError, match="must be an integer"):
         ss_multi.get_jax_env_vars(worker_id="bar", worker_hostnames="10.0.0.1,10.0.0.2")
+    with pytest.raises(ValueError, match="must be an integer"):
+        ss_multi.get_torchtpu_env_vars(
+            worker_id="bar", slicebuilder_addresses="10.0.0.1:8471,10.0.0.2:8471"
+        )
 
 
 if __name__ == "__main__":
